@@ -1,0 +1,333 @@
+"""In-memory store —— for tests, dry runs and "nothing hits disk" scenarios. Semantics match SqliteStore.
+
+Note: internal containers always use an underscore prefix so they do not collide with the
+method names in the :class:`~pyattacker.store.base.Store` protocol (``pipelines`` / ``events`` / ``artifacts`` / ``tasks``).
+"""
+
+from __future__ import annotations
+
+import base64
+import dataclasses
+import json
+import time
+from typing import Any, Iterator, Mapping
+
+from ..artifact import Artifact
+from .base import AttemptRecord, EventRecord, PipelineRecord, RunRecord, TaskRecord
+
+__all__ = ["MemoryStore"]
+
+
+class MemoryStore:
+    def __init__(self, *, journal: str = "full") -> None:
+        self.journal = journal
+        self._runs: dict[str, RunRecord] = {}
+        self._pipelines: dict[str, PipelineRecord] = {}
+        self._artifacts: dict[tuple[str, int], Artifact] = {}
+        self._tasks: dict[str, TaskRecord] = {}
+        self._resources: dict[tuple[str, str], dict[str, Any]] = {}
+        self._attempts: list[AttemptRecord] = []
+        self._events: list[EventRecord] = []
+        self._event_id = 0
+
+    # ------------------------------------------------------------------ runs
+    def start_run(self, run: RunRecord) -> RunRecord:
+        run.heartbeat_at = run.started_at
+        self._runs[run.run_id] = run
+        return run
+
+    def heartbeat(self, run_id: str, ts: float | None = None) -> None:
+        run = self._runs.get(run_id)
+        if run is not None:
+            run.heartbeat_at = ts or time.time()
+
+    def finish_run(self, run_id: str, status: str, ended_at: float | None = None) -> None:
+        run = self._runs.get(run_id)
+        if run is not None:
+            run.status = status
+            run.ended_at = ended_at or time.time()
+
+    def get_run(self, run_id: str) -> RunRecord | None:
+        return self._runs.get(run_id)
+
+    # ------------------------------------------------------------- pipelines
+    def get_pipeline(self, pipeline_id: str) -> PipelineRecord | None:
+        return self._pipelines.get(pipeline_id)
+
+    def upsert_pipeline(self, record: PipelineRecord) -> None:
+        self._pipelines[record.pipeline_id] = record
+
+    def finish_pipeline(
+        self,
+        pipeline_id: str,
+        state: str,
+        *,
+        n_tasks_done: int | None = None,
+        error: BaseException | None = None,
+        failed_task: str | None = None,
+        traceback: str | None = None,
+    ) -> None:
+        record = self._pipelines.get(pipeline_id)
+        if record is None:
+            return
+        record.state = state
+        record.finished_at = time.time()
+        if n_tasks_done is not None:
+            record.n_tasks_done = n_tasks_done
+        if error is not None:
+            record.error_type = type(error).__name__
+            record.error_message = str(error)[:2000]
+            record.traceback = traceback
+            record.failed_task = failed_task
+
+    def interrupt_stale(self, *, stale_after_s: float = 30.0, keep_run_id: str | None = None) -> int:
+        now = time.time()
+        count = 0
+        for record in self._pipelines.values():
+            if record.state != "running" or record.run_id == keep_run_id:
+                continue
+            run = self._runs.get(record.run_id)
+            stale = (
+                run is None
+                or run.status != "running"
+                or (run.heartbeat_at is not None and now - run.heartbeat_at > stale_after_s)
+            )
+            if stale:
+                record.state = "interrupted"
+                count += 1
+        for task in self._tasks.values():
+            if task.state == "running":
+                run = self._runs.get(task.run_id)
+                if run is None or run.status != "running":
+                    task.state = "interrupted"
+        return count
+
+    # ------------------------------------------------------------- artifacts
+    def put_artifact(self, artifact: Artifact) -> Artifact:
+        stored = artifact
+        if self.journal != "full" and artifact.payload is not None:
+            stored = dataclasses.replace(artifact, payload=None)
+        self._artifacts[(stored.pipeline_id, stored.seq)] = stored
+        return stored
+
+    def get_artifact(self, pipeline_id: str, seq: int) -> Artifact | None:
+        return self._artifacts.get((pipeline_id, seq))
+
+    def mark_final(self, pipeline_id: str, seq: int) -> None:
+        key = (pipeline_id, seq)
+        artifact = self._artifacts.get(key)
+        if artifact is not None:
+            self._artifacts[key] = dataclasses.replace(artifact, is_final=True)
+
+    def artifacts(self, pipeline_id: str) -> list[Artifact]:
+        items = [a for (pid, _), a in self._artifacts.items() if pid == pipeline_id]
+        return sorted(items, key=lambda a: a.seq)
+
+    # ----------------------------------------------------------------- tasks
+    def record_task(self, record: TaskRecord) -> None:
+        self._tasks[record.task_run_id] = record
+
+    def tasks(
+        self, pipeline_id: str | None = None, *, run_id: str | None = None, limit: int | None = None
+    ) -> list[TaskRecord]:
+        items = [
+            t
+            for t in self._tasks.values()
+            if (pipeline_id is None or t.pipeline_id == pipeline_id) and (run_id is None or t.run_id == run_id)
+        ]
+        items.sort(key=lambda t: (t.pipeline_id, t.seq))
+        return items[:limit] if limit else items
+
+    def record_attempt(self, record: AttemptRecord) -> AttemptRecord:
+        record.attempt_id = len(self._attempts) + 1
+        self._attempts.append(record)
+        return record
+
+    def attempts(
+        self,
+        *,
+        run_id: str | None = None,
+        pipeline_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[AttemptRecord]:
+        items = [
+            a
+            for a in self._attempts
+            if (run_id is None or a.run_id == run_id) and (pipeline_id is None or a.pipeline_id == pipeline_id)
+        ]
+        return items[-limit:] if limit else items
+
+    # ---------------------------------------------------------------- events
+    def emit_event(self, event: EventRecord) -> None:
+        self._event_id += 1
+        event.event_id = self._event_id
+        self._events.append(event)
+
+    def upsert_resource(
+        self,
+        pool: str,
+        resource_id: str,
+        kind: str,
+        spec: Mapping[str, Any],
+        state: str,
+        stats: Mapping[str, Any],
+        *,
+        published_by: str = "",
+    ) -> None:
+        self._resources[(pool, resource_id)] = {
+            "pool": pool,
+            "resource_id": resource_id,
+            "kind": kind,
+            "spec": dict(spec),
+            "state": state,
+            "stats": dict(stats),
+            "published_by": published_by,
+            "updated_at": time.time(),
+        }
+
+    def resources(self, pool: str | None = None) -> list[dict[str, Any]]:
+        return [
+            dict(item)
+            for (p, _), item in self._resources.items()
+            if pool is None or p == pool
+        ]
+
+    # ----------------------------------------------------------- query views
+    def pipelines(
+        self, *, run_id: str | None = None, state: str | None = None, limit: int | None = None
+    ) -> list[PipelineRecord]:
+        items = [
+            p
+            for p in self._pipelines.values()
+            if (run_id is None or p.run_id == run_id) and (state is None or p.state == state)
+        ]
+        items.sort(key=lambda p: p.created_at)
+        return items[:limit] if limit else items
+
+    def events(
+        self, *, pipeline_id: str | None = None, run_id: str | None = None, limit: int = 200
+    ) -> list[EventRecord]:
+        items = [
+            e
+            for e in self._events
+            if (pipeline_id is None or e.pipeline_id == pipeline_id)
+            and (run_id is None or e.run_id == run_id)
+        ]
+        return items[-limit:]
+
+    def all_events(self) -> list[EventRecord]:
+        return list(self._events)
+
+    def stats(self, run_id: str | None = None) -> dict[str, Any]:
+        pipes = self.pipelines(run_id=run_id)
+        by_state: dict[str, int] = {}
+        task_counts: dict[str, int] = {}
+        attempts_by_task: dict[str, int] = {}
+        durations: list[float] = []
+        for p in pipes:
+            by_state[p.state] = by_state.get(p.state, 0) + 1
+            if p.started_at and p.finished_at:
+                durations.append((p.finished_at - p.started_at) * 1000.0)
+        relevant = [t for t in self._tasks.values() if run_id is None or t.run_id == run_id]
+        for t in relevant:
+            task_counts[t.name] = task_counts.get(t.name, 0) + 1
+            attempts_by_task[t.name] = attempts_by_task.get(t.name, 0) + t.attempts_used
+        durations.sort()
+
+        def pct(p: float) -> float | None:
+            if not durations:
+                return None
+            idx = min(len(durations) - 1, int(p * (len(durations) - 1)))
+            return round(durations[idx], 3)
+
+        return {
+            "pipelines": {
+                "total": len(pipes),
+                "by_state": by_state,
+                "duration_ms": {"p50": pct(0.5), "p95": pct(0.95), "max": pct(1.0)},
+            },
+            "tasks": {"by_name": task_counts, "attempts_by_name": attempts_by_task},
+            "attempts_total": sum(t.attempts_used for t in relevant),
+            "events_total": sum(
+                1 for e in self._events if run_id is None or e.run_id == run_id
+            ),
+        }
+
+    def errors(self, *, run_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        out = [
+            {
+                "pipeline_id": p.pipeline_id,
+                "name": p.name,
+                "failed_task": p.failed_task,
+                "error_type": p.error_type,
+                "error_message": p.error_message,
+                "when": p.finished_at,
+            }
+            for p in self.pipelines(run_id=run_id)
+            if p.state == "failed"
+        ]
+        return out[-limit:]
+
+    def export_rows(self, *, run_id: str | None = None) -> Iterator[dict[str, Any]]:
+        for p in self.pipelines(run_id=run_id):
+            yield {
+                "pipeline_id": p.pipeline_id,
+                "key": p.key,
+                "name": p.name,
+                "run_id": p.run_id,
+                "state": p.state,
+                "tags": p.tags,
+                "n_tasks_done": p.n_tasks_done,
+                "n_tasks_total": p.n_tasks_total,
+                "attempts_total": p.attempts_total,
+                "started_at": p.started_at,
+                "finished_at": p.finished_at,
+                "duration_ms": (
+                    round((p.finished_at - p.started_at) * 1000.0, 3)
+                    if p.started_at and p.finished_at
+                    else None
+                ),
+                "failed_task": p.failed_task,
+                "error_type": p.error_type,
+                "error_message": p.error_message,
+                "tasks": [
+                    {
+                        "name": t.name,
+                        "seq": t.seq,
+                        "state": t.state,
+                        "attempts_used": t.attempts_used,
+                        "duration_ms": t.duration_ms,
+                        "error_class": t.error_class,
+                        "error_type": t.error_type,
+                        "error_message": t.error_message,
+                        "output_artifact_id": t.output_artifact_id,
+                    }
+                    for t in self.tasks(p.pipeline_id)
+                ],
+                "artifacts": [
+                    {
+                        "task": a.task_name,
+                        "seq": a.seq,
+                        "type": a.type_name,
+                        "codec": a.codec,
+                        "digest": a.digest,
+                        "is_final": a.is_final,
+                        "payload": _decode_payload(a),
+                    }
+                    for a in self.artifacts(p.pipeline_id)
+                ],
+            }
+
+    def close(self) -> None:
+        return None
+
+
+def _decode_payload(artifact: Artifact) -> Any:
+    if artifact.payload is None:
+        return None
+    if artifact.codec == "json":
+        try:
+            return json.loads(artifact.payload.decode("utf-8"))
+        except Exception:  # pragma: no cover - defensive
+            return base64.b64encode(artifact.payload).decode("ascii")
+    return base64.b64encode(artifact.payload).decode("ascii")

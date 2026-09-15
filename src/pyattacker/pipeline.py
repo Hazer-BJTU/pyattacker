@@ -1,0 +1,216 @@
+"""Pipeline —— a linearly chained sequence of tasks; the unit of **completion** and the unit of **resume**.
+
+* ``a | b | c`` builds a chain; construction time validates that adjacent tasks' artifact types chain.
+* ``template.map(seeds)`` expands dataset rows into pipelines that are **semantically fully independent**.
+* ``pipeline_key`` is determined by (task-chain fingerprint + seed content + repeat index) —— content-addressed,
+  hence naturally idempotent: re-running the same sample never produces a second pipeline, and resume skips it.
+* The task-chain fingerprint includes each task's **source digest** by default: changing task code is the same
+  as swapping the pipeline, so old checkpoints are never reused by mistake (disable with ``include_code=False``).
+"""
+
+from __future__ import annotations
+
+import inspect
+import typing
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+
+from .artifact import DEFAULT_REGISTRY, CodecRegistry, canonical_json, digest_of
+from .errors import PipelineBuildError
+from .task import TaskSpec
+
+__all__ = ["Chain", "PipelineTemplate", "PipelineSpec", "pipeline"]
+
+
+@dataclass(frozen=True)
+class Chain:
+    tasks: tuple[TaskSpec, ...]
+
+    def __or__(self, other: Any) -> "Chain":
+        if isinstance(other, TaskSpec):
+            return Chain(self.tasks + (other,))
+        if isinstance(other, Chain):
+            return Chain(self.tasks + other.tasks)
+        raise PipelineBuildError(f"pipelines can only be composed from TaskSpec or Chain, got {type(other).__name__}")
+
+    def __len__(self) -> int:
+        return len(self.tasks)
+
+    def __iter__(self) -> Iterator[TaskSpec]:
+        return iter(self.tasks)
+
+    def __getitem__(self, index: int) -> TaskSpec:
+        return self.tasks[index]
+
+
+def _compatible(produced: Any, accepted: Any) -> bool:
+    if produced is Any or accepted is Any:
+        return True
+    if produced is inspect.Parameter.empty or accepted is inspect.Parameter.empty:
+        return True
+    if produced == accepted:
+        return True
+    origin_p, origin_a = typing.get_origin(produced), typing.get_origin(accepted)
+    if origin_p is not None or origin_a is not None:
+        return str(produced) == str(accepted)
+    try:
+        if isinstance(produced, type) and isinstance(accepted, type):
+            return issubclass(produced, accepted)
+    except TypeError:  # pragma: no cover - defensive
+        return False
+    return False
+
+
+def _validate_chain(tasks: Sequence[TaskSpec]) -> None:
+    if not tasks:
+        raise PipelineBuildError("pipeline cannot be empty")
+    for left, right in zip(tasks, tasks[1:]):
+        if not _compatible(left.returns, right.accepts):
+            raise PipelineBuildError(
+                f"artifact types do not chain: task {left.name!r} produces "
+                f"{getattr(left.returns, '__name__', left.returns)}, "
+                f"but task {right.name!r} requires {getattr(right.accepts, '__name__', right.accepts)}"
+            )
+
+
+@dataclass(frozen=True)
+class PipelineTemplate:
+    """Static definition of a pipeline (without seed data)."""
+
+    name: str
+    tasks: tuple[TaskSpec, ...]
+    tags: dict[str, Any] = field(default_factory=dict)
+    spec_digest: str = ""
+    registry: CodecRegistry = field(default=DEFAULT_REGISTRY, compare=False, repr=False)
+
+    # ------------------------------------------------------- construction
+    @property
+    def chain(self) -> Chain:
+        return Chain(self.tasks)
+
+    @property
+    def n_tasks(self) -> int:
+        return len(self.tasks)
+
+    def task_names(self) -> list[str]:
+        return [t.name for t in self.tasks]
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "tasks": self.task_names(),
+            "tags": dict(self.tags),
+            "spec_digest": self.spec_digest,
+        }
+
+    # ------------------------------------------------------------ binding
+    def bind(self, seed: Any, *, key: str | None = None, repeat: int = 0) -> "PipelineSpec":
+        encoded = self.registry.dump(seed)
+        if key is None:
+            key = digest_of(
+                canonical_json({"spec": self.spec_digest, "seed": encoded.digest, "repeat": repeat})
+            )
+        return PipelineSpec(
+            template=self,
+            pipeline_id=key,
+            key=key,
+            seed=seed,
+            seed_digest=encoded.digest,
+            repeat=repeat,
+            spec_digest=self.spec_digest,
+        )
+
+    def map(
+        self,
+        seeds: Iterable[Any],
+        *,
+        repeats: int = 1,
+        key_of: Callable[[Any], str] | None = None,
+    ) -> Iterator["PipelineSpec"]:
+        """Expand seeds into a stream of pipelines. ``repeats>1`` serves pass@k / self-consistency sampling."""
+        repeats = max(1, int(repeats))
+        for index, seed in enumerate(seeds):
+            base_key = key_of(seed) if key_of is not None else None
+            for repeat in range(repeats):
+                explicit = None
+                if base_key is not None:
+                    explicit = base_key if repeats == 1 else f"{base_key}#{repeat}"
+                yield self.bind(seed, key=explicit, repeat=repeat)
+
+
+@dataclass(frozen=True)
+class PipelineSpec:
+    """A schedulable pipeline instance bound to a seed."""
+
+    template: PipelineTemplate
+    pipeline_id: str
+    key: str
+    seed: Any
+    seed_digest: str
+    repeat: int = 0
+    spec_digest: str = ""
+
+    @property
+    def name(self) -> str:
+        return self.template.name
+
+    @property
+    def tasks(self) -> tuple[TaskSpec, ...]:
+        return self.template.tasks
+
+    @property
+    def n_tasks(self) -> int:
+        return len(self.template.tasks)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging
+        return f"<PipelineSpec {self.name} id={self.pipeline_id[:12]} tasks={self.n_tasks}>"
+
+
+def compute_spec_digest(tasks: Sequence[TaskSpec], *, include_code: bool = True) -> str:
+    payload = [t.fingerprint() for t in tasks]
+    if not include_code:
+        for item in payload:
+            item.pop("code", None)
+    return digest_of(canonical_json(payload))
+
+
+def pipeline(
+    name: str,
+    *tasks_or_chain: Any,
+    tags: Mapping[str, Any] | None = None,
+    include_code: bool = True,
+    registry: CodecRegistry | None = None,
+) -> PipelineTemplate:
+    """Declare a pipeline: ``pipeline("qa", fetch | ask | judge | metrics)``."""
+    if not tasks_or_chain:
+        raise PipelineBuildError("pipeline needs at least one task")
+    if len(tasks_or_chain) == 1:
+        head = tasks_or_chain[0]
+        if isinstance(head, Chain):
+            items = head.tasks
+        elif isinstance(head, TaskSpec):
+            items = (head,)
+        else:
+            raise PipelineBuildError(f"pipeline accepts only tasks or a chain, got {type(head).__name__}")
+    else:
+        items = tuple(tasks_or_chain)
+        for item in items:
+            if not isinstance(item, TaskSpec):
+                raise PipelineBuildError(
+                    f"pipeline members must be tasks, got {type(item).__name__}; the multi-argument form cannot mix in a chain"
+                )
+    _validate_chain(items)
+    return PipelineTemplate(
+        name=name,
+        tasks=tuple(items),
+        tags=dict(tags or {}),
+        spec_digest=compute_spec_digest(items, include_code=include_code),
+        registry=registry or DEFAULT_REGISTRY,
+    )
+
+
+def with_retry(spec: TaskSpec, **retry: Any) -> TaskSpec:
+    """Convenience: override one task's retry parameters in place within a chain, e.g. ``with_retry(ask, max_attempts=4)``."""
+    from dataclasses import replace as _replace
+
+    return _replace(spec, retry=_replace(spec.retry, **retry))

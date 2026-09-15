@@ -1,0 +1,363 @@
+"""Resource acquisition strategies (M2) and the metrics they feed.
+
+Covers `sticky`, `quota_aware`, `least_busy`, `failover`, pool wait-time metrics, the slow-wait
+event, and the targeted-wakeup predicate. The wakeup *path* is exercised by
+`test_lease_safety.py::test_backoff_algorithm_waits_for_release`; here we test the decision
+logic that decides who gets woken.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from pyattacker import (
+    Failover,
+    Immediate,
+    LeastBusy,
+    Pool,
+    QuotaAware,
+    Resource,
+    Sticky,
+    Wait,
+)
+from pyattacker.errors import ResourceUnavailable
+from pyattacker.resource import _Waiter
+
+from helpers import run
+
+
+class _Ctx:
+    """Minimal task-context stand-in: the algorithms only need ``meta`` and ``_untrack``."""
+
+    def __init__(self) -> None:
+        self.meta: dict = {}
+        self.task_name = "test"
+
+    def _untrack(self, lease) -> None:  # pragma: no cover - nothing to untrack here
+        return None
+
+    def emit(self, *args, **kwargs) -> None:  # pragma: no cover
+        return None
+
+    def holds_from(self, pool) -> bool:
+        return False
+
+    def held_resource_ids(self, pool) -> set:
+        return set()
+
+
+def _quota_pool(algorithm="quota_aware") -> Pool:
+    return Pool(
+        "apis",
+        [
+            Resource.create("llm", id="small", capacity=1, options={"quota": {"tokens": 100}}),
+            Resource.create("llm", id="large", capacity=1, options={"quota": {"tokens": 10_000}}),
+        ],
+        algorithm=algorithm,
+    )
+
+
+# --------------------------------------------------------------------- sticky
+def test_sticky_keeps_a_pipeline_on_the_same_resource():
+    async def _case():
+        pool = Pool(
+            "s",
+            [
+                Resource.create("llm", id="a", capacity=4),
+                Resource.create("llm", id="b", capacity=4),
+            ],
+            algorithm=Sticky(),
+        )
+        ctx = _Ctx()
+        picked = []
+        for _ in range(3):
+            lease = await pool.acquire(ctx=ctx)
+            picked.append(lease.resource.id)
+            lease.release_now()
+        assert picked == ["a", "a", "a"]  # one pipeline, one endpoint: prefix caches stay warm
+        assert ctx.meta["sticky"]["s"] == "a"
+
+        other = _Ctx()
+        lease = await pool.acquire(ctx=other)
+        assert lease.resource.id == "b"  # affinity never leaks across pipelines
+        assert other.meta["sticky"]["s"] == "b"
+        lease.release_now()
+
+    run(_case())
+
+
+def test_sticky_falls_back_when_the_preferred_resource_disappears():
+    async def _case():
+        pool = Pool(
+            "s",
+            [
+                Resource.create("llm", id="a", capacity=1),
+                Resource.create("llm", id="b", capacity=1),
+            ],
+            algorithm=Sticky(),
+        )
+        ctx = _Ctx()
+        first = await pool.acquire(ctx=ctx)
+        assert first.resource.id == "a"
+        first.release_now()
+
+        pool.revoke("a", reason="endpoint went away")
+        lease = await pool.acquire(ctx=ctx)
+        assert lease.resource.id == "b"
+        assert ctx.meta["sticky"]["s"] == "b"
+        lease.release_now()
+
+    run(_case())
+
+
+# --------------------------------------------------------------- quota_aware
+def test_quota_aware_prefers_the_resource_with_the_most_headroom():
+    async def _case():
+        pool = _quota_pool()
+        ctx = _Ctx()
+
+        lease = await pool.acquire(ctx=ctx)
+        assert lease.resource.id == "large"  # 10_000 tokens of headroom beats 100
+        lease.report(usage={"tokens": 9_800})  # ... until it doesn't
+        lease.release_now()
+
+        second = await pool.acquire(ctx=ctx)
+        assert second.resource.id == "small"
+        second.release_now()
+
+    run(_case())
+
+
+def test_quota_aware_ranks_unknown_quota_last():
+    async def _case():
+        pool = Pool(
+            "apis",
+            [
+                Resource.create("llm", id="no-quota", capacity=1),
+                Resource.create("llm", id="metered", capacity=1, options={"quota": {"tokens": 500}}),
+            ],
+            algorithm=QuotaAware(),
+        )
+        lease = await pool.acquire()
+        assert lease.resource.id == "metered"
+        lease.release_now()
+
+    run(_case())
+
+
+def test_quota_aware_is_a_preference_not_a_hard_limit():
+    """When everything is exhausted the best candidate is still handed out: refusing to work is worse."""
+
+    async def _case():
+        pool = _quota_pool()
+        ctx = _Ctx()
+        for _ in range(2):  # exhaust whichever resource is offered first
+            lease = await pool.acquire(ctx=ctx)
+            lease.report(usage={"tokens": 50_000})
+            lease.release_now()
+
+        # Both are far past quota, yet a lease still comes back: quota is a preference.
+        lease = await pool.acquire(ctx=ctx)
+        assert lease.resource.id in {"small", "large"}
+        lease.release_now()
+
+    run(_case())
+
+
+def test_quota_aware_score_is_monotonic_in_remaining_quota():
+    algo = QuotaAware(metric="tokens")
+    resource = Resource.create("llm", id="r", options={"quota": {"tokens": 1000}})
+
+    class _Stats:
+        def __init__(self, used: float) -> None:
+            self.usage = {"tokens": used}
+
+    scores = [algo.score(resource, _Stats(used)) for used in (0, 400, 900, 1000, 2000)]
+    assert scores == sorted(scores, reverse=True)
+    assert scores[0][0] == pytest.approx(1.0) and scores[0][1] == pytest.approx(1000)
+    assert scores[-1][0] < scores[-2][0] < 0
+    # equal ratio -> the resource with more absolute headroom wins
+    big = Resource.create("llm", id="big", options={"quota": {"tokens": 100_000}})
+    assert algo.score(big, _Stats(0)) > algo.score(resource, _Stats(0))
+
+
+# ---------------------------------------------------------------- least_busy
+def test_least_busy_picks_the_idlest_resource():
+    async def _case():
+        pool = Pool(
+            "apis",
+            [
+                Resource.create("llm", id="busy", capacity=4),
+                Resource.create("llm", id="idle", capacity=4),
+            ],
+            algorithm=LeastBusy(),
+        )
+        first = await pool.acquire()
+        assert first.resource.id == "busy"
+        # make "busy" genuinely busier, then ask again
+        pool.try_acquire(where=lambda r: r.id == "busy")
+        second = await pool.acquire()
+        assert second.resource.id == "idle"
+        for lease in (first, second):
+            lease.release_now()
+
+    run(_case())
+
+
+# ------------------------------------------------------------------ failover
+def test_failover_walks_to_the_next_pool():
+    async def _case():
+        primary = Pool("primary", [Resource.create("llm", id="p1", capacity=1)], algorithm="immediate")
+        backup = Pool("backup", [Resource.create("llm", id="b1", capacity=1)], algorithm="immediate")
+        ctx = _Ctx()
+        ctx.pools = {"primary": primary, "backup": backup}
+
+        holder = primary.try_acquire()  # saturate the primary pool
+        assert holder is not None
+
+        lease = await primary.acquire(ctx=ctx, algorithm=Failover(pools=["primary", "backup"]))
+        assert lease.resource.id == "b1"  # failed over instead of blocking
+        assert pool_name(lease) == "backup"
+        lease.release_now()
+        holder.release_now()
+
+    run(_case())
+
+
+def pool_name(lease) -> str:
+    return lease.pool.name
+
+
+def test_failover_reports_why_every_pool_failed():
+    async def _case():
+        primary = Pool("primary", [Resource.create("llm", id="p1", capacity=1)], algorithm="immediate")
+        ctx = _Ctx()
+        ctx.pools = {"primary": primary}
+        holder = primary.try_acquire()
+        assert holder is not None
+        # fallback=Immediate so a saturated pool raises instead of blocking forever
+        algo = Failover(pools=["primary", "missing"], fallback=Immediate())
+        with pytest.raises(ResourceUnavailable) as excinfo:
+            await primary.acquire(ctx=ctx, algorithm=algo)
+        assert "no resource available" in str(excinfo.value)
+        holder.release_now()
+
+    run(_case())
+
+
+# ------------------------------------------------------------------- metrics
+def test_wait_metrics_capture_time_spent_blocked():
+    async def _case():
+        pool = Pool(
+            "apis",
+            [Resource.create("llm", id="only", capacity=1)],
+            algorithm=Wait(),
+        )
+        holder = pool.try_acquire()
+        assert holder is not None
+        assert pool.stats().waits_total == 0
+
+        async def _release_soon():
+            await asyncio.sleep(0.02)
+            holder.release_now()
+
+        asyncio.create_task(_release_soon())
+        lease = await pool.acquire(timeout=5.0)
+        lease.release_now()
+
+        stats = pool.stats()
+        assert stats.waits_total == 1
+        assert stats.wait_ms_avg is not None and stats.wait_ms_avg > 0
+        assert stats.wait_ms_max is not None and stats.wait_ms_max >= stats.wait_ms_avg
+        assert stats.wait_ms_p50 is not None and stats.wait_ms_p95 is not None
+
+    run(_case())
+
+
+def test_slow_wait_emits_an_event():
+    async def _case():
+        seen: list = []
+        pool = Pool(
+            "apis",
+            [Resource.create("llm", id="only", capacity=1)],
+            algorithm=Wait(),
+            on_event=seen.append,
+        )
+        pool.slow_wait_ms = 0.001  # anything measurable counts as slow
+        holder = pool.try_acquire()
+        assert holder is not None
+
+        async def _release_soon():
+            await asyncio.sleep(0.01)
+            holder.release_now()
+
+        asyncio.create_task(_release_soon())
+        lease = await pool.acquire(timeout=5.0, kind="llm")
+        lease.release_now()
+
+        slow = [event for event in seen if event.kind == "acquire.slow_wait"]
+        assert len(slow) == 1
+        assert slow[0].data["waited_ms"] > 0
+        assert slow[0].data["selector"] == {"kind": "llm"}
+
+    run(_case())
+
+
+# ------------------------------------------------------- targeted wakeups
+def test_waiter_matching_is_selector_and_predicate_aware():
+    llm = Resource.create("llm", id="a", tags={"tier": "gold"}, options={"model": "gpt-4o"})
+    judge = Resource.create("judge", id="j", tags={"tier": "bronze"})
+
+    assert _Waiter(selector={}, where=None).matches(llm) is True
+    assert _Waiter(selector={"kind": "llm"}, where=None).matches(llm) is True
+    assert _Waiter(selector={"kind": "judge"}, where=None).matches(llm) is False
+    assert _Waiter(selector={"tier": "gold"}, where=None).matches(llm) is True
+    assert _Waiter(selector={"model": "gpt-4o"}, where=None).matches(llm) is True
+    assert _Waiter(selector={"tier": "bronze"}, where=None).matches(llm) is False
+    assert _Waiter(selector={}, where=lambda r: r.id == "j").matches(llm) is False
+    assert _Waiter(selector={}, where=lambda r: r.id == "j").matches(judge) is True
+
+
+async def _settle(times: int = 5) -> None:
+    """Let scheduled waiters actually resume (wait_for needs more than one loop turn)."""
+    for _ in range(times):
+        await asyncio.sleep(0)
+
+
+def test_releasing_one_resource_wakes_only_matching_waiters():
+    """White-box on purpose: the whole point of targeted wakeups is *who* gets woken."""
+
+    async def _case():
+        pool = Pool(
+            "mixed",
+            [
+                Resource.create("llm", id="a", capacity=1),
+                Resource.create("judge", id="j", capacity=1),
+            ],
+            algorithm=Wait(),
+        )
+        # Saturate both resources first, otherwise wait_slot returns immediately.
+        held_llm = pool.try_acquire(kind="llm")
+        held_judge = pool.try_acquire(kind="judge")
+        assert held_llm is not None and held_judge is not None
+
+        llm_waiter = asyncio.create_task(pool.wait_slot(5.0, selector={"kind": "llm"}))
+        judge_waiter = asyncio.create_task(pool.wait_slot(5.0, selector={"kind": "judge"}))
+        await _settle()
+        assert len(pool._waiters) == 2, "both waiters should be registered"
+
+        held_llm.release_now()
+        await _settle()
+
+        assert await asyncio.wait_for(llm_waiter, 1.0) is True
+        assert not judge_waiter.done(), "an llm release must not resolve a judge waiter"
+        assert len(pool._waiters) == 1
+        assert pool._waiters[0].event.is_set() is False, "the judge waiter must not even be woken"
+
+        held_judge.release_now()
+        assert await asyncio.wait_for(judge_waiter, 1.0) is True
+        assert len(pool._waiters) == 0
+
+    run(_case())

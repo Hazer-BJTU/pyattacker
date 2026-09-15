@@ -1,0 +1,16 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+runs/
+*.db
+*.db-wal
+*.db-shm
+.pyattacker/
+
+.scratch/

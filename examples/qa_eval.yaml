@@ -1,0 +1,58 @@
+# Declarative example: composition and resources live here, logic stays in Python (`use: module:attr`).
+# Run it with: uv run pyattacker run -c examples/qa_eval.yaml --progress
+
+run:
+  store: runs/qa_eval.db
+  journal: full          # only "full" keeps artifact payloads -> only then can resume reuse a checkpoint
+  concurrency: 16
+  label: qa_eval_demo
+  heartbeat_s: 5
+  stop_after_failures: 200   # safety net: stop burning budget once too much is failing
+
+pools:
+  apis:
+    kind: llm
+    algorithm: backoff       # back off when the pool is saturated
+    # pool-level defaults; a single resource may override them
+    capacity: 2
+    degrade_after: 3         # 3 consecutive failures -> temporarily circuit-broken
+    dead_after: 8            # 8 consecutive failures -> declared dead
+    cooldown_s: 10
+    resources:
+      - id: api-1
+        capacity: 4
+        tags: { tier: a }
+        options: { model: gpt-4o, base_url: "https://api-a.example/v1", api_key: "${OPENAI_KEY:-sk-demo}" }
+      - id: api-2
+        capacity: 4
+        tags: { tier: b }
+        options: { model: gpt-4o, base_url: "https://api-b.example/v1", api_key: "${OPENAI_KEY:-sk-demo}" }
+  judges:
+    kind: llm
+    algorithm: wait
+    resources:
+      - { id: judge-1, capacity: 1, options: { model: gpt-4o-mini } }
+
+pipeline:
+  name: qa_eval
+  tags: { bench: demo }
+  tasks:
+    - use: pyattacker.tasks:echo                       # fetch (here it just passes the seed through)
+    - use: pyattacker.tasks:simulate_llm               # simulated model call (swap in your own task for real traffic)
+      resource: apis
+      algorithm: backoff
+      timeout_s: 30
+      kwargs: { latency_ms: 5, fail_rate: 0.15, tokens: 64, model: gpt-4o }
+      # NOTE: YAML 1.1 parses a bare `on` as boolean true, so the key must be quoted
+      retry: { max_attempts: 4, base: 0.2, factor: 2, cap: 5, "on": [RetryableError, TimeoutError] }
+    - use: pyattacker.tasks:simulate_llm               # grade with a second model
+      resource: judges
+      kwargs: { latency_ms: 3, fail_rate: 0.05, tokens: 16 }
+      retry: { max_attempts: 3, base: 0.2, "on": [RetryableError] }
+
+# Seed source: each seed becomes one independent pipeline. A JSONL file works too:
+# source: { kind: jsonl, path: examples/data.jsonl, limit: 100, key_field: qid, repeats: 1 }
+source:
+  kind: range
+  n: 60
+  repeats: 1
