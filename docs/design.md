@@ -412,10 +412,17 @@ s3       = "my_pkg.s3:open_store"           # keyed by URI scheme
 ```
 
 Then `use: my_judge`, `algorithm: my_algo` and `store: "s3://bucket/runs.db"` simply work.
-Two rules keep this from becoming a liability: **built-ins resolve first**, so a plugin can never
-shadow `echo` or `wait`; and **a broken plugin is recorded, not raised** — `pyattacker plugins`
-lists what loaded and what failed, and the healthy plugins keep working. A complete example lives
-in `examples/plugin_package/`.
+Three rules keep this from becoming a liability:
+
+* **built-ins resolve first**, so a plugin can never shadow `echo` or `wait`;
+* **a broken plugin is recorded, not raised** — `pyattacker plugins` lists what loaded and what
+  failed, and the healthy plugins keep working. Nothing a plugin does may escape into
+  `Runner.__init__`, which is where codec plugins are installed;
+* **a codec plugin that claims a payload wins over an earlier registration**, so a specialised
+  codec is not dead code behind the JSON catch-all. An explicit `for_types=` mapping still beats
+  the scan, because naming the type is a stronger statement than "I can encode this".
+
+A complete example lives in `examples/plugin_package/`.
 
 **Artifact backends** decide where payload bytes live. `inline` (default) keeps them in the store;
 `file:///data/blobs` spills anything above a threshold into content-addressed files; `null` keeps the

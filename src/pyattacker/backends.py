@@ -132,20 +132,23 @@ class FileBackend:
                 raise
         return f"file://{target}"
 
-    def get(self, ref: str) -> bytes | None:
+    def resolve(self, ref: str) -> str:
+        """Turn a reference into a path: ``file:///abs/path`` or a path relative to ``root``."""
         path = ref[len("file://") :] if ref.startswith("file://") else ref
         if not os.path.isabs(path):
             path = os.path.join(self.root, path)
+        return path
+
+    def get(self, ref: str) -> bytes | None:
         try:
-            with open(path, "rb") as handle:
+            with open(self.resolve(ref), "rb") as handle:
                 return handle.read()
         except FileNotFoundError:
             return None
 
     def delete(self, ref: str) -> bool:
-        path = ref[len("file://") :] if ref.startswith("file://") else ref
         try:
-            os.unlink(path)
+            os.unlink(self.resolve(ref))
             return True
         except OSError:
             return False

@@ -136,8 +136,16 @@ class CodecRegistry:
         self._rebuild: dict[str, type] = {}
 
     def register(self, codec: Codec, *, for_types: Iterable[type] = (), name: str | None = None) -> None:
+        """Register a codec. **Later registrations take precedence over earlier ones.**
+
+        ``codec_for`` falls back to asking each registered codec in turn, and the built-in JSON
+        codec accepts almost anything, so insertion order decides whether a specialised codec ever
+        gets a chance. Moving each new registration to the front makes the rule explicit: if you
+        register a codec that claims a payload, it wins. An explicit ``for_types`` mapping still
+        beats the scan, because naming the type is the strongest statement of intent.
+        """
         codec_name = name or codec.name
-        self._codecs[codec_name] = codec
+        self._codecs = {codec_name: codec, **{k: v for k, v in self._codecs.items() if k != codec_name}}
         for tp in for_types:
             self._by_type[tp] = codec_name
 

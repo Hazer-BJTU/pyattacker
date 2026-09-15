@@ -156,12 +156,29 @@ class PluginRegistry:
         return value
 
     def codec(self, name: str) -> Any | None:
+        """Load a codec plugin, normalizing a zero-argument class or factory into an instance.
+
+        Never raises: a plugin that cannot be built is recorded like any other load failure. This
+        matters more than it looks — ``install_codecs`` runs during ``Runner.__init__``, so an
+        exception here would take down the kernel rather than one plugin.
+        """
         value = self.load("codecs", name)
         if value is None:
             return None
-        if isinstance(value, type):
-            return value()
-        return value
+        # A class is callable *and* has the methods as attributes, so instance-ness cannot be
+        # probed with hasattr alone: a class must always be constructed first.
+        if isinstance(value, type) or (callable(value) and not hasattr(value, "dumps")):
+            try:
+                produced = value()
+            except Exception as exc:
+                self._errors[f"codecs:{name}"] = f"cannot build codec: {exc}"
+                return None
+        else:
+            produced = value
+        if not hasattr(produced, "dumps"):
+            self._errors[f"codecs:{name}"] = f"{type(produced).__name__} is not a codec"
+            return None
+        return produced
 
     def store_factory(self, spec: str) -> Callable[..., Any] | None:
         """A store plugin is keyed by URI scheme: ``s3://bucket/key`` looks up ``s3``."""
@@ -206,13 +223,15 @@ class PluginRegistry:
         """
         installed: list[str] = []
         for name in self.names("codecs"):
-            codec = self.codec(name)  # normalizes classes to instances, records failures
-            if codec is None:
-                continue
             try:
+                codec = self.codec(name)  # normalizes classes/factories, records failures
+                if codec is None:
+                    continue
                 registry.register(codec, name=name)
                 installed.append(name)
             except Exception as exc:
+                # Belt and braces: this runs while a Runner is being constructed, so *nothing*
+                # a plugin does may escape into the caller.
                 self._errors[f"codecs:{name}"] = f"{type(exc).__name__}: {exc}"
         return installed
 

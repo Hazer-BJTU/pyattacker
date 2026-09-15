@@ -290,6 +290,15 @@ class _WidgetCodec:
         return _Widget(data.decode("utf-8"))
 
 
+class _NeedyCodec:
+    """Looks like a codec class, but its constructor needs an argument."""
+
+    name = "needy"
+
+    def __init__(self, required: Any) -> None:  # pragma: no cover - never reached when the bug is fixed
+        self.required = required
+
+
 def test_install_codecs_registers_instances_and_records_failures():
     upper = FakeEntryPoint("upper", "pkg.codec:_UpperCodec", lambda: _UpperCodec())
     broken = FakeEntryPoint("broken", "pkg.codec:broken", lambda: _explode("cannot build"))
@@ -319,6 +328,16 @@ def test_install_codecs_instantiates_a_zero_arg_codec_class():
     encoded = codecs.dump(_Widget("x"))  # must use the plugin codec, not json/bytes
     assert encoded.codec == "widget"
     assert encoded.data == b"widget!"
+
+
+def test_install_codecs_records_a_codec_class_that_cannot_be_instantiated():
+    entry = FakeEntryPoint("needy", "pkg.codec:_NeedyCodec", lambda: _NeedyCodec)
+    registry = _fake_registry({"pyattacker.codecs": {"needy": entry}})
+
+    # A broken plugin must be recorded and skipped, never propagated (plugins.py module contract).
+    assert registry.install_codecs(CodecRegistry()) == []
+    assert "codecs:needy" in registry.errors
+    assert "required" in registry.errors["codecs:needy"]  # the cause is reported, not swallowed
 
 
 # ------------------------------------------------------- integration with the kernel

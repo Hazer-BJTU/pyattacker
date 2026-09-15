@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import pytest
 from helpers import run  # noqa: F401  (single shared test entry point, kept for consistency)
 
-from pyattacker import Artifact, CodecRegistry, canonical_json, digest_of
+from pyattacker import Artifact, CodecRegistry, JsonCodec, canonical_json, digest_of
 from pyattacker.errors import ArtifactCodecError
 
 
@@ -65,6 +65,47 @@ def test_bytes_use_dedicated_codec():
     assert encoded.codec == "bytes"
     assert encoded.type_name == "bytes"
     assert reg.load(encoded) == b"\x00\x01binary"
+
+
+def test_later_codec_registrations_take_precedence_over_the_json_fallback():
+    """A specialised codec must be able to claim a payload the built-in JSON codec also accepts."""
+
+    class RowsCodec:
+        name = "rows"
+
+        def can_encode(self, obj):
+            return isinstance(obj, list) and all(isinstance(item, str) for item in obj)
+
+        def dumps(self, obj):
+            return ",".join(obj).encode()
+
+        def loads(self, data):
+            return data.decode().split(",")
+
+    reg = CodecRegistry()
+    assert reg.codec_for(["a", "b"]).name == "json"  # the default wins while it is alone
+
+    reg.register(RowsCodec())
+    encoded = reg.dump(["a", "b"])
+    assert encoded.codec == "rows"
+    assert reg.load(encoded) == ["a", "b"]
+
+    # naming the type explicitly is a stronger statement than "I can encode this", so it wins
+    class MyList(list):
+        pass
+
+    reg.register(CodecRegistry()._codecs["json"], for_types=(MyList,), name="json")
+    assert reg.dump(MyList(["a"])).codec == "json"
+
+
+def test_re_registering_a_name_moves_it_to_the_front_without_duplicating():
+    reg = CodecRegistry()
+    first = JsonCodec()
+    second = JsonCodec()
+    reg.register(first, name="json")
+    reg.register(second, name="json")
+    assert list(reg._codecs).count("json") == 1
+    assert reg._codecs["json"] is second
 
 
 def test_artifact_encoded_requires_payload():
