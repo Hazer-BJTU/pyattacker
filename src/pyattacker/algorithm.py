@@ -218,12 +218,13 @@ def _remember_affinity(ctx: Any, pool_name: str, resource_id: str) -> None:
 
 @dataclass
 class Sticky:
-    """Prefer the resource this pipeline already used.
+    """Prefer the resource this attempt already used.
 
     Useful when the provider gives you something for free by staying on one endpoint:
     prompt/prefix caches, warm connections, sticky sessions. The affinity lives on the task
-    context, so it survives retries and later tasks of the same pipeline but never leaks
-    between pipelines.
+    context, which is created per **attempt**, so it holds for every acquire inside one attempt
+    (including a loop that leases and returns several times) and never leaks between pipelines.
+    A retry or the next task starts a fresh context and may land elsewhere.
     """
 
     name: str = "sticky"

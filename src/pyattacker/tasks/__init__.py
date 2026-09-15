@@ -10,7 +10,7 @@ import asyncio
 import inspect
 import json
 import random
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -168,13 +168,18 @@ def fanout(
 
     The task model is unary and linear on purpose; when a step genuinely branches (three judges,
     k samples, several metrics), this keeps the branch inside one task instead of turning the
-    pipeline into a DAG. Two consequences, both deliberate:
+    pipeline into a DAG. Three consequences, all deliberate:
 
     * **Retry granularity is the group.** If one branch fails, the whole fan-out is retried; the
       children's own retry policies are not applied branch by branch. The group therefore adopts
       the most forgiving child policy unless you pass ``retry=``.
     * **Branches share the parent's context**, so their leases and events are recorded under the
       fan-out task. That is what keeps a single, complete record per step.
+    * **The group spec is the only one the Runner ever sees** (the children are called as plain
+      functions), so ``resource``, ``algorithm`` and ``timeout_s`` are lifted onto it from the
+      children — but only when every child agrees on the value. Disagreeing children leave the
+      group unset, which means the pool's default is used and the timeout is decided by the group.
+      Note the timeout becomes a *group* deadline: it bounds all branches together.
 
     ``on_error="raise"`` (default) fails the task if any branch fails, like any other exception.
     ``on_error="collect"`` never raises and returns ``{child_name: {"ok": bool, ...}}`` instead.
@@ -226,8 +231,25 @@ def fanout(
         _impl,
         name=name or "fanout",
         retry=policy,
-        resource=specs[0].resource if len({spec.resource for spec in specs}) == 1 else None,
+        **_agreed(specs, "resource"),
+        **_agreed(specs, "algorithm"),
+        **_agreed(specs, "timeout_s"),
     )
+
+
+def _agreed(specs: Sequence[TaskSpec], attr: str) -> dict[str, Any]:
+    """Lift ``attr`` onto the group spec when every child carries the same non-``None`` value.
+
+    ``fanout`` invokes the child *functions*, so the Runner never sees a child :class:`TaskSpec`:
+    anything the children declare has to be re-stated on the group to have any effect. Agreement is
+    required because the group can only mean one thing -- with mixed values, doing nothing is more
+    honest than silently picking one child's policy.
+    """
+    values = [getattr(spec, attr) for spec in specs]
+    first = values[0]
+    if first is None or any(value != first for value in values):
+        return {}
+    return {attr: first}
 
 
 def shell_run(

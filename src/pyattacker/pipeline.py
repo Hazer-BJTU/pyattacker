@@ -54,6 +54,20 @@ def _compatible(produced: Any, accepted: Any) -> bool:
         return True
     origin_p, origin_a = typing.get_origin(produced), typing.get_origin(accepted)
     if origin_p is not None or origin_a is not None:
+        # One side parameterised, the other bare (`dict[str, Any]` -> `dict`): the bare form is
+        # simply less specific, so ordinary subclass rules decide. Two parameterised forms stay
+        # strict (`list[int]` -> `list[str]` is still rejected), because comparing element types
+        # via str() is the only thing that keeps that check meaningful without evaluating them.
+        if origin_p is not None and origin_a is None and isinstance(accepted, type):
+            try:
+                return issubclass(origin_p, accepted)
+            except TypeError:  # pragma: no cover - defensive
+                return False
+        if origin_a is not None and origin_p is None and isinstance(produced, type):
+            try:
+                return issubclass(origin_a, produced)
+            except TypeError:  # pragma: no cover - defensive
+                return False
         return str(produced) == str(accepted)
     try:
         if isinstance(produced, type) and isinstance(accepted, type):

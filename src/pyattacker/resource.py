@@ -374,6 +374,9 @@ class Pool:
 
         This is the single allocation point: :meth:`try_acquire` is ``select(None)``, and the
         quota-aware / least-busy / sticky algorithms are all just different ``key`` functions.
+
+        Raises :class:`ResourceUnavailable` if the chosen resource's client factory fails; a
+        resource without a usable client is never handed out.
         """
         now = self.clock.now()
         candidates = self._candidates(selector, where, now, only_available=True)
@@ -398,7 +401,10 @@ class Pool:
         ctx: Any = None,
         **selector: Any,
     ) -> "Lease | None":
-        """Try to acquire a lease synchronously. Returns ``None`` if nothing is available; never blocks."""
+        """Try to acquire a lease synchronously. Returns ``None`` if nothing is available; never blocks.
+
+        Like :meth:`select`, it raises :class:`ResourceUnavailable` when the resource's client factory fails.
+        """
         return self.select(None, where=where, ctx=ctx, **selector)
 
     def note_wait(self, lease: "Lease", waited_ms: float, *, selector: Mapping[str, Any] | None = None) -> None:
@@ -426,7 +432,29 @@ class Pool:
         slot.stats.leases += 1
         slot.stats.waits += 1 if waited_ms > 0 else 0
         slot.stats.wait_ms_total += waited_ms
-        if slot.client is None and slot.resource.factory is not None and slot.client_error is None:
+        if slot.client is None and slot.resource.factory is not None:
+            if slot.client_error is not None:
+                # The factory already failed for this resource. Handing out a lease whose
+                # ``client`` is None would surface much later as an AttributeError inside user
+                # code, so keep refusing it *and* keep counting: the retry loop then reaches
+                # dead_after and the circuit breaker retires the resource for good.
+                slot.stats.active -= 1
+                slot.stats.failed += 1
+                slot.stats.consecutive_failures += 1
+                if slot.stats.consecutive_failures >= slot.resource.dead_after:
+                    slot.state = ResourceState.DEAD
+                    self._emit(
+                        "resource.dead",
+                        resource_id=slot.resource.id,
+                        data={
+                            "consecutive_failures": slot.stats.consecutive_failures,
+                            "error": slot.client_error,
+                        },
+                    )
+                    self._notify()
+                raise ResourceUnavailable(
+                    f"factory previously failed for resource {slot.resource.id}: {slot.client_error}"
+                )
             try:
                 slot.client = slot.resource.factory(slot.resource)
             except Exception as exc:  # factory failed → resource unusable; let the caller retry / switch pools

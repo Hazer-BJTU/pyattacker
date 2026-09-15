@@ -366,3 +366,50 @@ def test_releasing_one_resource_wakes_only_matching_waiters():
         assert len(pool._waiters) == 0
 
     run(_case())
+
+
+# ------------------------------------------------------- client factory failures
+def test_factory_failure_never_hands_out_a_clientless_lease():
+    """A broken factory must fail loudly, not hand out a lease whose ``client`` is None.
+
+    Regression: the old guard skipped the factory once it had failed, so the *next* lease on that
+    resource returned ``client=None`` and the user's code blew up with an AttributeError deep in a
+    request instead of a clear ResourceUnavailable.
+    """
+    attempts = {"n": 0}
+
+    def broken_factory(resource):
+        attempts["n"] += 1
+        raise OSError("cannot reach the provider")
+
+    async def _case():
+        pool = Pool("apis", [Resource.create("llm", id="api-1", factory=broken_factory)])
+        for _ in range(2):
+            with pytest.raises(ResourceUnavailable) as excinfo:
+                await pool.acquire()
+            assert "factory" in str(excinfo.value)
+        assert attempts["n"] == 1, "the factory must not be retried on every lease"
+        assert pool.snapshot()[0]["failed"] == 2, "every refused lease counts against the resource"
+
+    run(_case())
+
+
+def test_repeated_factory_failures_eventually_kill_the_resource():
+    def broken_factory(resource):
+        raise OSError("nope")
+
+    async def _case():
+        pool = Pool(
+            "apis",
+            [Resource.create("llm", id="api-1", factory=broken_factory, dead_after=2, degrade_after=1)],
+        )
+        for _ in range(2):
+            with pytest.raises(ResourceUnavailable):
+                await pool.acquire()
+        assert pool.snapshot()[0]["state"] == "dead"
+        # A dead resource is no longer a candidate: the pool is now simply empty.
+        with pytest.raises(ResourceUnavailable) as excinfo:
+            await pool.acquire(algorithm="immediate")
+        assert "no resource available" in str(excinfo.value)
+
+    run(_case())

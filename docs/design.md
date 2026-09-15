@@ -448,8 +448,11 @@ to loopback and has no authentication — it exposes your payloads, so treat it 
 **Fan-out**: `fanout(a, b, ...)` runs several tasks on the *same* input concurrently **inside one
 task**, which is how a genuinely branching step is expressed without turning pipelines into a DAG.
 The tradeoff is explicit: retry granularity becomes the group, and the group adopts the most
-forgiving child policy. First-class `Parallel`/`Gather` nodes remain deliberately out of scope —
-the unary task model is what keeps the kernel (and its recovery story) small.
+forgiving child policy. Because the Runner only ever sees the group spec, `resource`, `algorithm`
+and `timeout_s` are lifted onto it from the children — but only when every child agrees on them,
+since one group cannot mean two different policies. First-class `Parallel`/`Gather` nodes remain
+deliberately out of scope — the unary task model is what keeps the kernel (and its recovery story)
+small.
 
 ---
 

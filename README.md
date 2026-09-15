@@ -10,6 +10,9 @@ batched concurrent requests, the "which rows already ran" resume logic, retry an
 details of every request for later review. pyattacker extracts these concerns into a kernel that
 **does not touch the network** — you write the tasks, and it handles the rest.
 
+**New here?** The step-by-step tutorial goes from a five-line program to a sharded, resumable model
+evaluation, and every snippet in it is executed by the test suite: [`docs/tutorial.md`](docs/tutorial.md).
+
 ```bash
 uv sync
 uv run pyattacker demo            # run once with zero configuration to verify the installation
@@ -206,7 +209,9 @@ authentication and binds to loopback: treat it as a debug view.
 
 **Branching inside a step** — `fanout(a, b)` runs several tasks on the same input concurrently and
 returns `{task_name: value}`. Retry granularity becomes the group, which is the honest price of not
-turning pipelines into a DAG.
+turning pipelines into a DAG. The group is the only spec the Runner sees, so `resource`, `algorithm` and
+`timeout_s` are inherited from the children when all of them agree (a `timeout_s` then bounds the whole
+group).
 
 ## Examples
 
@@ -241,6 +246,9 @@ uv run ruff check            # lint (configuration lives in pyproject.toml, with
 uv run pyattacker demo       # end-to-end smoke test
 uv build                     # sdist + wheel
 ```
+
+Tutorial: [`docs/tutorial.md`](docs/tutorial.md) — fourteen runnable steps from "one task" to "sharded
+evaluation", each one executed by the test suite.
 
 Design document: [`docs/design.md`](docs/design.md) (conceptual model, the six core invariants, data model,
 known tradeoffs, milestones).

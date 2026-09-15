@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from pyattacker import Retrying, pipeline, task
+from pyattacker import Retrying, fanout, pipeline, task
 from pyattacker.errors import PipelineBuildError
 
 
@@ -144,3 +144,54 @@ def test_retry_spec_is_part_of_task_fingerprint():
     strict = dataclasses.replace(ask, retry=Retrying(max_attempts=1))
     loose = dataclasses.replace(ask, retry=Retrying(max_attempts=5))
     assert pipeline("r1", fetch | strict).spec_digest != pipeline("r2", fetch | loose).spec_digest
+
+
+# ------------------------------------------------- bare vs parameterised container annotations
+@task("emit_mapping")
+def emit_mapping(seed: dict) -> dict[str, int]:
+    return {"n": seed["n"]}
+
+
+@task("consume_bare_dict")
+def consume_bare_dict(row: dict) -> dict:
+    return row
+
+
+@task("emit_bare_dict")
+def emit_bare_dict(seed: dict) -> dict:
+    return dict(seed)
+
+
+@task("consume_mapping")
+def consume_mapping(row: dict[str, int]) -> dict[str, int]:
+    return row
+
+
+@task("emit_int_list")
+def emit_int_list(seed: dict) -> list[int]:
+    return [seed["n"]]
+
+
+@task("consume_str_list")
+def consume_str_list(items: list[str]) -> list[str]:
+    return items
+
+
+def test_parameterised_container_satisfies_bare_annotation():
+    """``dict[str, Any]`` (what fan-out returns) must chain into a task annotated ``row: dict``."""
+    assert pipeline("generic_to_bare", emit_mapping | consume_bare_dict).n_tasks == 2
+
+
+def test_bare_container_satisfies_parameterised_annotation():
+    assert pipeline("bare_to_generic", emit_bare_dict | consume_mapping).n_tasks == 2
+
+
+def test_fanout_chains_into_a_plain_dict_task():
+    """Regression: the fan-out spec is annotated ``dict[str, Any]``, which used to fail this check."""
+    group = fanout(emit_mapping, emit_bare_dict, name="group")
+    assert pipeline("with_fanout", fetch | group | consume_bare_dict).n_tasks == 3
+
+
+def test_incompatible_parameterised_containers_are_still_rejected():
+    with pytest.raises(PipelineBuildError):
+        pipeline("bad_generics", emit_int_list | consume_str_list)

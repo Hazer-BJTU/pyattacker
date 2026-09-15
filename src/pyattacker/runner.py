@@ -10,7 +10,8 @@ Key points:
 * **Where the lease guarantee lands**: every attempt — whether it succeeds,
   fails, times out, or is cancelled — calls ``ctx.reclaim_now()`` synchronously
   in ``finally``; before the task record is written there is one more fallback check.
-* Retry sleeps currently occupy a worker slot (see the known tradeoffs in docs/design.md).
+* **Retry backoff does not hold a worker**: a pipeline waiting out its backoff is parked in a delay
+  queue, so ``concurrency`` counts attempts in flight rather than pipelines sitting idle.
 """
 
 from __future__ import annotations

@@ -552,3 +552,21 @@ def test_fanout_requires_branches_and_valid_on_error():
         fanout()
     with pytest.raises(ValueError, match="on_error must be 'raise' or 'collect'"):
         fanout(echo, on_error="nonsense")
+
+
+def test_fanout_lifts_what_the_children_agree_on_onto_the_group():
+    """The Runner only ever sees the group spec, so the children's declarations must reach it."""
+    a = build_task_spec(echo.fn, name="a", resource="apis", algorithm="least_busy", timeout_s=5)
+    b = build_task_spec(echo.fn, name="b", resource="apis", algorithm="least_busy", timeout_s=5)
+    group = fanout(a, b, name="group")
+    assert group.resource == "apis"
+    assert group.algorithm == "least_busy"
+    assert group.timeout_s == 5
+
+
+def test_fanout_leaves_disagreements_unset():
+    a = build_task_spec(echo.fn, name="a", resource="apis", algorithm="least_busy")
+    b = build_task_spec(echo.fn, name="b", resource="judges", algorithm="immediate")
+    group = fanout(a, b, name="group")
+    assert group.resource is None, "two different pools cannot be expressed by one group"
+    assert group.algorithm is None, "picking one child's policy silently would be worse than none"
