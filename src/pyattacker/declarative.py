@@ -14,9 +14,10 @@ import json
 import os
 import re
 import sys
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any
 
 from . import errors as _errors
 from .algorithm import resolve_algorithm
@@ -94,7 +95,11 @@ def _resolve_exc(name: str) -> type[BaseException]:
 
 
 def resolve_target(use: str) -> Any:
-    """``"pkg.mod:attr"``; built-in shorthands such as ``"flaky"`` are also accepted."""
+    """Resolve a ``use:`` value.
+
+    Order: built-in shorthand (``"flaky"``) -> installed plugin (the ``pyattacker.tasks`` entry
+    point group) -> explicit ``"pkg.mod:attr"``. Built-ins win, so a plugin can never shadow one.
+    """
     if ":" in use:
         module_name, _, attr = use.partition(":")
         try:
@@ -107,7 +112,15 @@ def resolve_target(use: str) -> Any:
         return target
     if use in BUILTIN_TASKS:
         return BUILTIN_TASKS[use]
-    raise ConfigError(f"cannot resolve use: {use!r} (built-ins: {sorted(BUILTIN_TASKS)})")
+    from .plugins import PLUGINS
+
+    plugin = PLUGINS.task(use)
+    if plugin is not None:
+        return plugin
+    raise ConfigError(
+        f"cannot resolve use: {use!r} (built-ins: {sorted(BUILTIN_TASKS)}; "
+        f"installed task plugins: {PLUGINS.names('tasks')}; or write 'module:attribute')"
+    )
 
 
 _RETRY_FIELDS = set(Retrying.__dataclass_fields__)
@@ -220,12 +233,17 @@ class DeclarativeSpec:
         key_field = self.source.get("key_field")
         key_of = None
         if key_field:
-            key_of = lambda seed: f"{self.template.name}:{seed[key_field]}"  # noqa: E731
-        count = 0
-        for spec in self.template.map(self.seeds(), repeats=repeats, key_of=key_of):
-            if limit is not None and count >= limit:
+
+            def explicit_key(seed: Any) -> str:
+                return f"{self.template.name}:{seed[key_field]}"
+
+            key_of = explicit_key
+
+        for count, spec in enumerate(
+            self.template.map(self.seeds(), repeats=repeats, key_of=key_of), start=1
+        ):
+            if limit is not None and count > limit:
                 return
-            count += 1
             yield spec
 
     def describe(self) -> dict[str, Any]:

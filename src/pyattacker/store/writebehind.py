@@ -20,7 +20,8 @@ genuinely unfinished.
 from __future__ import annotations
 
 import time
-from typing import Any, Iterator, Mapping
+from collections.abc import Iterator, Mapping
+from typing import Any
 
 from ..artifact import Artifact
 from .base import AttemptRecord, EventRecord, PipelineRecord, RunRecord, Store, TaskRecord

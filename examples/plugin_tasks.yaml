@@ -1,0 +1,33 @@
+# Declarative config that uses the example plugin package (see examples/plugin_package/).
+# Install it first:  uv pip install -e examples/plugin_package
+# Then:              uv run pyattacker run -c examples/plugin_tasks.yaml
+
+run:
+  store: runs/plugin_demo.db
+  journal: full
+  concurrency: 8
+  label: plugin_demo
+
+pools:
+  apis:
+    kind: llm
+    # `least_loaded` comes from the plugin's pyattacker.algorithms entry point
+    algorithm: least_loaded
+    resources:
+      - { id: api-1, capacity: 2, options: { model: gpt-4o } }
+      - { id: api-2, capacity: 2, options: { model: gpt-4o } }
+
+pipeline:
+  name: plugin_demo
+  tasks:
+    - { use: pyattacker.tasks:echo }                    # built-in: built-ins always win
+    - use: pyattacker.tasks:simulate_llm                # built-in factory, takes kwargs
+      resource: apis
+      kwargs: { latency_ms: 4, fail_rate: 0.1, tokens: 32 }
+      retry: { max_attempts: 3, base: 0.1, "on": [RetryableError] }
+    - { use: uppercase_answer, kwargs: { field: text } } # plugin factory task
+    - { use: word_count }                                # plugin task
+
+source:
+  kind: range
+  n: 20

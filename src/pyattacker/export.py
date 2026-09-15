@@ -20,7 +20,8 @@ import csv
 import dataclasses
 import json
 import os
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from typing import Any
 
 from .errors import ConfigError
 from .store.base import Store
@@ -192,12 +193,14 @@ def write_rows(
     fmt = fmt.lower()
     if fmt not in FORMATS:
         raise ConfigError(f"unknown format {fmt!r}; available: {list(FORMATS)}")
+    # Not a context manager on purpose: the same handle is written from three branches below and
+    # closed once in `finally`.
     handle = None
     close = False
     if path is not None:
         text = str(path)
         os.makedirs(os.path.dirname(os.path.abspath(text)) or ".", exist_ok=True)
-        handle = open(text, "w", encoding="utf-8", newline="")
+        handle = open(text, "w", encoding="utf-8", newline="")  # noqa: SIM115 (closed in `finally`)
         close = True
     else:  # pragma: no cover - the CLI always passes a path
         import sys
@@ -212,7 +215,7 @@ def write_rows(
             return count
 
         if fmt == "json":
-            handle.write('{"title": %s, "rows": [' % json.dumps(title or "", ensure_ascii=False))
+            handle.write(f'{{"title": {json.dumps(title or "", ensure_ascii=False)}, "rows": [')
             first = True
             for row in rows:
                 if not first:
@@ -236,7 +239,7 @@ def write_rows(
             buffered.append(row)
             if len(buffered) >= max(1, header_rows):
                 break
-        writer = csv.DictWriter(handle, fieldnames=header + ["extra"], extrasaction="ignore")
+        writer = csv.DictWriter(handle, fieldnames=[*header, "extra"], extrasaction="ignore")
         writer.writeheader()
         for row in buffered:
             writer.writerow(_csv_row(row, seen))

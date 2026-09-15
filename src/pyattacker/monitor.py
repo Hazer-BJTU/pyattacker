@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Callable, Mapping
+from collections.abc import Callable, Mapping
+from typing import Any
 
 __all__ = ["render_snapshot", "watch", "read_snapshot"]
 
@@ -20,7 +21,7 @@ _EMPTY = "·"
 def _bar(value: int, total: int, width: int = 20) -> str:
     if total <= 0:
         return _EMPTY * width
-    filled = int(round(width * value / total))
+    filled = round(width * value / total)
     return _BAR * filled + _EMPTY * (width - filled)
 
 

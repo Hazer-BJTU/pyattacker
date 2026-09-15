@@ -18,7 +18,8 @@ The contract that makes this work:
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable, Iterator, TypeVar
+from collections.abc import Iterable, Iterator
+from typing import Any, TypeVar
 
 from .artifact import digest_of
 from .errors import ConfigError

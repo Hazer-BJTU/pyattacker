@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from helpers import run
 
 from pyattacker import (
     Failover,
@@ -24,8 +25,6 @@ from pyattacker import (
 )
 from pyattacker.errors import ResourceUnavailable
 from pyattacker.resource import _Waiter
-
-from helpers import run
 
 
 class _Ctx:
@@ -263,8 +262,11 @@ def test_wait_metrics_capture_time_spent_blocked():
             await asyncio.sleep(0.02)
             holder.release_now()
 
-        asyncio.create_task(_release_soon())
-        lease = await pool.acquire(timeout=5.0)
+        releaser = asyncio.create_task(_release_soon())
+        try:
+            lease = await pool.acquire(timeout=5.0)
+        finally:
+            await releaser
         lease.release_now()
 
         stats = pool.stats()
@@ -293,8 +295,11 @@ def test_slow_wait_emits_an_event():
             await asyncio.sleep(0.01)
             holder.release_now()
 
-        asyncio.create_task(_release_soon())
-        lease = await pool.acquire(timeout=5.0, kind="llm")
+        releaser = asyncio.create_task(_release_soon())
+        try:
+            lease = await pool.acquire(timeout=5.0, kind="llm")
+        finally:
+            await releaser
         lease.release_now()
 
         slow = [event for event in seen if event.kind == "acquire.slow_wait"]

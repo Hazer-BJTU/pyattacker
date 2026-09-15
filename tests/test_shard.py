@@ -86,7 +86,7 @@ def test_shard_index_spreads_many_keys_evenly():
 
     assert sum(counts) == 400
     assert all(count > 0 for count in counts)
-    assert 80 <= min(counts) and max(counts) <= 120  # 100 expected per shard, well within +-20%
+    assert min(counts) >= 80 and max(counts) <= 120  # 100 expected per shard, well within +-20%
 
 
 def test_shard_index_is_content_addressed_and_stable_across_processes():

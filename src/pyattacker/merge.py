@@ -15,8 +15,9 @@ Statistics are recomputed from the merged rows rather than summed per store, for
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from .export import write_rows
 from .store.base import Store

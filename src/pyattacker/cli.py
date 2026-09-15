@@ -13,8 +13,9 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from . import __version__
 from .declarative import load_spec
@@ -23,8 +24,10 @@ from .export import FORMATS, ROW_KINDS, export_store, export_stores
 from .merge import merge_reports
 from .monitor import read_snapshot, render_snapshot, watch
 from .pipeline import pipeline
+from .plugins import PLUGINS, list_plugins
 from .resource import Pool, Resource
 from .runner import RunConfig, Runner
+from .server import StatsServer
 from .shard import parse_shard, shard_env, shard_paths, shard_specs, shard_store_path
 from .store import SqliteStore
 from .tasks import echo, simulate_llm
@@ -48,11 +51,14 @@ _RUN_KEYS = {
 }
 
 
-def _open_readonly(path: str) -> SqliteStore:
-    """Open an existing store read-only; give a human-readable error when the file is missing."""
+def _open_readonly(path: str, backend: Any = None) -> SqliteStore:
+    """Open an existing store read-only; give a human-readable error when the file is missing.
+
+    ``backend`` matters for reads too: payloads spilled out of the database are hydrated through it.
+    """
     if not Path(path).exists():
         raise ConfigError(f"store does not exist: {path} (run 'run' or 'demo' first to create one)")
-    return SqliteStore(path, read_only=True)
+    return SqliteStore(path, read_only=True, backend=backend)
 
 
 def _table(rows: Sequence[Sequence[Any]], header: Sequence[str]) -> str:
@@ -101,6 +107,8 @@ def _cmd_run(args: argparse.Namespace, *, resume: bool = False) -> int:
         run_cfg["stop_after_failures"] = args.stop_after_failures
     if args.retry_succeeded:
         run_cfg["retry_succeeded"] = True
+    if args.artifact_backend:
+        run_cfg["artifact_backend"] = args.artifact_backend
     meta = dict(run_cfg.get("meta") or {})
     if shard is not None:
         meta["shard"] = f"{shard[0]}/{shard[1]}"
@@ -290,7 +298,7 @@ def _cmd_report(args: argparse.Namespace) -> int:
     paths = list(args.store)
     if len(paths) > 1:
         return _report_merged(paths, args)
-    store = _open_readonly(paths[0])
+    store = _open_readonly(paths[0], args.artifact_backend)
     try:
         run_id = args.run_id or _latest_run_id(store)
         if run_id is None:
@@ -319,7 +327,7 @@ def _cmd_report(args: argparse.Namespace) -> int:
 
 def _report_merged(paths: list[str], args: argparse.Namespace) -> int:
     """A report over several shards: rows are de-duplicated first, then statistics recomputed."""
-    stores = [_open_readonly(path) for path in paths]
+    stores = [_open_readonly(path, args.artifact_backend) for path in paths]
     try:
         merged = merge_reports(stores, run_id=args.run_id)
     finally:
@@ -363,7 +371,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
     if len(paths) > 1 and args.rows == "pipelines":
         # Several shards: merging is what makes the file usable (the same pipeline can appear in
         # more than one shard after a shard-count change), so it is not optional here.
-        stores = [_open_readonly(path) for path in paths]
+        stores = [_open_readonly(path, args.artifact_backend) for path in paths]
         try:
             merged = merge_reports(stores, run_id=args.run_id)
             count = merged.export(args.output, fmt=args.format)
@@ -373,7 +381,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
         print(f"exported {count} merged pipelines from {len(paths)} stores → {args.output}")
         return 0
 
-    stores = [_open_readonly(path) for path in paths]
+    stores = [_open_readonly(path, args.artifact_backend) for path in paths]
     try:
         if len(stores) == 1:
             count = export_store(
@@ -387,6 +395,50 @@ def _cmd_export(args: argparse.Namespace) -> int:
         for store in stores:
             store.close()
     print(f"exported {count} {args.rows} rows ({args.format}) → {args.output}")
+    return 0
+
+
+# ------------------------------------------------------------------- serve
+def _cmd_serve(args: argparse.Namespace) -> int:
+    """Read-only HTTP view of a store: a dashboard for humans, JSON for everything else."""
+    if not Path(args.store).exists():
+        raise ConfigError(f"store does not exist: {args.store} (run something first)")
+    server = StatsServer(args.store, host=args.host, port=args.port, run_id=args.run_id).start()
+    print(f"serving {args.store} at {server.url}  (read-only; Ctrl-C to stop)")
+    print(f"  {server.url}/            dashboard")
+    print(f"  {server.url}/stats       JSON snapshot")
+    print(f"  {server.url}/events?limit=50")
+    try:
+        server.wait()
+    except KeyboardInterrupt:  # pragma: no cover - interactive
+        pass
+    finally:
+        server.stop()
+    return 0
+
+
+# ----------------------------------------------------------------- plugins
+def _cmd_plugins(args: argparse.Namespace) -> int:
+    """What is installed right now, and what failed to load."""
+    rows = list_plugins()
+    if args.json:
+        print(json.dumps({"plugins": rows, "errors": PLUGINS.errors}, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        groups = ", ".join(sorted({f"pyattacker.{g}" for g in ("tasks", "algorithms", "codecs", "stores")}))
+        print("no plugins installed")
+        print(f"declare one with an entry-point group such as: {groups}")
+        print('example:  [project.entry-points."pyattacker.tasks"]')
+        print('          my_judge = "my_pkg.tasks:my_judge"')
+        return 0
+    print(
+        _table(
+            [[r["group"], r["name"], r["target"], "ok" if r["ok"] else "FAILED"] for r in rows],
+            ["group", "name", "target", "status"],
+        )
+    )
+    for key, message in PLUGINS.errors.items():
+        print(f"  ! {key}: {message}", file=sys.stderr)
     return 0
 
 
@@ -435,7 +487,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         ),
     )
     with runner:
-        report = runner.run(template.map(({"i": i, "q": f"question-{i}"} for i in range(args.pipelines))))
+        report = runner.run(template.map({"i": i, "q": f"question-{i}"} for i in range(args.pipelines)))
         print(report.summary())
         print("\nFinal resource pool state:")
         print(
@@ -474,6 +526,12 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--strict-leases", action="store_true", help="treat leaked leases as a task failure")
     parser.add_argument("--stop-after-failures", type=int, default=None)
     parser.add_argument("--no-signals", action="store_true")
+    parser.add_argument(
+        "--artifact-backend",
+        default=None,
+        metavar="SPEC",
+        help="where artifact payloads live: inline (default), null, file:///path, or a JSON spec",
+    )
     parser.add_argument("--progress", action="store_true", help="print live progress from a second connection")
     parser.add_argument(
         "--shard",
@@ -522,6 +580,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--run-id", default=None)
     p_report.add_argument("--errors", type=int, default=10)
     p_report.add_argument("--json", action="store_true")
+    p_report.add_argument("--artifact-backend", default=None, metavar="SPEC")
     p_report.set_defaults(func=_cmd_report)
 
     p_watch = sub.add_parser("watch", help="live monitoring (a separate process can watch the same store)")
@@ -538,7 +597,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--run-id", default=None, help="export only pipelines touched by one run")
     p_export.add_argument("--rows", choices=list(ROW_KINDS), default="pipelines")
     p_export.add_argument("--format", choices=list(FORMATS), default="jsonl", dest="format")
+    p_export.add_argument("--artifact-backend", default=None, metavar="SPEC")
     p_export.set_defaults(func=_cmd_export)
+
+    p_serve = sub.add_parser("serve", help="serve a read-only HTTP view of a store")
+    p_serve.add_argument("store")
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8787)
+    p_serve.add_argument("--run-id", default=None)
+    p_serve.set_defaults(func=_cmd_serve)
+
+    p_plugins = sub.add_parser("plugins", help="list installed plugins (entry points)")
+    p_plugins.add_argument("--json", action="store_true")
+    p_plugins.set_defaults(func=_cmd_plugins)
 
     p_validate = sub.add_parser("validate", help="validate a declarative config and print a summary")
     p_validate.add_argument("-c", "--config", required=True)

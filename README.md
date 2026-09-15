@@ -11,7 +11,7 @@ details of every request for later review. pyattacker extracts these concerns in
 ```bash
 uv sync
 uv run pyattacker demo            # run once with zero configuration to verify the installation
-uv run pytest                     # the whole suite, zero network, about a second
+uv run pytest                     # the whole suite, zero network, a few seconds
 ```
 
 ## Core Model
@@ -147,6 +147,8 @@ uv run pyattacker run      -c examples/qa_eval.yaml --progress
 uv run pyattacker watch    runs/demo.db          # open another process to monitor it live
 uv run pyattacker report   runs/demo.db --errors 20
 uv run pyattacker export   runs/demo.db out.jsonl
+uv run pyattacker serve    runs/demo.db          # HTTP dashboard + JSON endpoints
+uv run pyattacker plugins                        # installed plugins
 ```
 
 Exit codes: `0` all succeeded / `1` some failed / `2` config error / `130` interrupted.
@@ -158,18 +160,67 @@ state of each task, the full attempt history (including **every retry decision**
 `{retry, reason, delay_s, error_class}`), intermediate and final artifacts, and the structured event stream.
 `pyattacker report/watch` consumes these facts directly.
 
+## Extending It
+
+**Plugins** are ordinary `importlib.metadata` entry points — install a package and its names become
+usable from any config:
+
+```toml
+[project.entry-points."pyattacker.tasks"]
+my_judge = "my_pkg.tasks:my_judge"        # a TaskSpec, or a factory returning one
+[project.entry-points."pyattacker.algorithms"]
+my_algo  = "my_pkg.algo:MyAlgorithm"
+[project.entry-points."pyattacker.stores"]
+s3       = "my_pkg.s3:open_store"         # keyed by URI scheme: store = "s3://bucket/runs.db"
+```
+
+```bash
+uv run pyattacker plugins                 # what is installed, and what failed to load
+```
+
+Built-ins resolve first (a plugin cannot shadow `echo`), and a plugin that raises on import is
+recorded rather than fatal. A complete worked example: `examples/plugin_package/`.
+
+**Large payloads** can live outside the database:
+
+```bash
+uv run pyattacker run -c examples/qa_eval.yaml --artifact-backend file:///data/blobs
+# or, in the config:  artifact_backend = { kind = "file", root = "/data/blobs", min_bytes = 262144 }
+```
+
+Files are content-addressed, written atomically, and hydrated back on read — so a resumed run
+reuses spilled checkpoints transparently. `null` keeps digests and drops bytes; `inline` (default)
+keeps everything in the store.
+
+**A zero-dependency monitoring endpoint**:
+
+```bash
+uv run pyattacker serve runs/qa.db        # http://127.0.0.1:8787
+# /  dashboard   /stats  /events  /pipelines  /resources  /errors   (JSON)
+```
+
+It opens a fresh read-only connection per request, so it runs happily beside a live run. It has no
+authentication and binds to loopback: treat it as a debug view.
+
+**Branching inside a step** — `fanout(a, b)` runs several tasks on the same input concurrently and
+returns `{task_name: value}`. Retry granularity becomes the group, which is the honest price of not
+turning pipelines into a DAG.
+
 ## Out of Scope
 
 Network requests (you write the openai/anthropic protocols yourself), **semantic reduction** (accuracy / pass@k
-and other cross-pipeline aggregation), DAG orchestration, service-ification, distributed scheduling. See
-sections 1 and 11 of [`docs/design.md`](docs/design.md).
+and other cross-pipeline aggregation), DAG orchestration (a pipeline is a linear chain; branch inside a task with
+`fanout`), a serving gateway (the only HTTP surface is the read-only debug endpoint above), and distributed
+scheduling (scale out with `--shard`). See sections 1 and 11 of [`docs/design.md`](docs/design.md).
 
 ## Development
 
 ```bash
 uv sync                      # create the venv + install dependencies (the only core dependency is pyyaml)
-uv run pytest                # 107 tests, all zero-network, finishing in < 1s
+uv run pytest                # the whole suite: zero network, a few seconds
+uv run ruff check            # lint (configuration lives in pyproject.toml, with reasons for each exception)
 uv run pyattacker demo       # end-to-end smoke test
+uv build                     # sdist + wheel
 ```
 
 Design document: [`docs/design.md`](docs/design.md) (conceptual model, the six core invariants, data model,

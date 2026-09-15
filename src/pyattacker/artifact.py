@@ -13,9 +13,10 @@ import base64
 import dataclasses
 import hashlib
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterable, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from .errors import ArtifactCodecError
 
@@ -217,11 +218,17 @@ class Artifact:
     payload: bytes | None
     created_at: float
     is_final: bool = False
+    blob_ref: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
 
     @property
     def available(self) -> bool:
-        """Whether the payload is stored alongside the record (False when journal=summary)."""
+        """Whether the bytes are reachable right now.
+
+        Stores hydrate ``payload`` from the artifact backend on read, so this is False only when
+        the payload was deliberately dropped (``journal=summary``, a ``null`` backend) or is
+        genuinely missing — which is exactly the signal resume needs to rerun the pipeline.
+        """
         return self.payload is not None
 
     def encoded(self) -> Encoded:

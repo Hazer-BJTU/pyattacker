@@ -19,7 +19,7 @@ import asyncio
 import heapq
 import itertools
 from dataclasses import dataclass, field
-from typing import Any, Generic, Iterator, TypeVar
+from typing import Any, Generic, TypeVar
 
 __all__ = ["DelayQueue", "interruptible_sleep"]
 

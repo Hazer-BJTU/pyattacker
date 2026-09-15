@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Coroutine, Sequence
+from collections.abc import Coroutine
+from typing import Any
 
 from pyattacker import Pool, Resource
 

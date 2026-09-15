@@ -9,18 +9,14 @@ from __future__ import annotations
 import asyncio
 import json
 
-import pytest
-
 from pyattacker import (
     FatalError,
     RetryableError,
     Retrying,
     Runner,
-    SqliteStore,
     pipeline,
     task,
 )
-from pyattacker.runner import RunConfig
 from pyattacker.tasks import flaky
 
 # ------------------------------------------------------------------ counters

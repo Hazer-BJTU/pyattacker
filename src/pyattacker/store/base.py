@@ -12,8 +12,9 @@ Conventions:
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from ..artifact import Artifact
 
@@ -221,6 +222,7 @@ def open_store(
     batch_size: int = 128,
     flush_interval: float = 1.0,
     clock: Any = None,
+    backend: Any = None,
 ) -> Store:
     """``open_store("runs.db")`` / ``open_store(":memory:")`` / ``open_store(store_instance)``.
 
@@ -231,17 +233,24 @@ def open_store(
     if isinstance(spec, Store):
         return spec
 
+    from ..plugins import PLUGINS
     from .writebehind import WriteBehindStore
 
-    if spec is None or spec == ":memory:" or spec == "memory":
+    factory = PLUGINS.store_factory(str(spec))
+    if factory is not None:
+        # A store plugin owns its URI scheme (s3://, gs://, ...) and its own durability story;
+        # the framework only asks it to satisfy the Store protocol.
+        store: Store = factory(str(spec), journal=journal)
+        file_backed = True
+    elif spec is None or spec == ":memory:" or spec == "memory":
         from .memory import MemoryStore
 
-        store: Store = MemoryStore(journal=journal)
+        store = MemoryStore(journal=journal, backend=backend)
         file_backed = False
     else:
         from .sqlite import SqliteStore
 
-        store = SqliteStore(str(spec), journal=journal)
+        store = SqliteStore(str(spec), journal=journal, backend=backend)
         file_backed = True
 
     # An explicit True always wraps (predictable), while "auto" only wraps when batching can

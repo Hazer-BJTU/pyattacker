@@ -16,11 +16,13 @@ This is also where the **lease safety contract** lives (the single most importan
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import random
 import typing
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, AsyncIterator, Callable, Mapping, Sequence
+from typing import Any
 
 from .artifact import DEFAULT_REGISTRY, CodecRegistry, digest_of
 from .errors import (
@@ -29,7 +31,6 @@ from .errors import (
     RetryableError,
     error_class_of,
     is_retryable_class,
-    retry_after_of,
 )
 from .resource import Lease, Pool, Resource
 
@@ -62,9 +63,7 @@ class Retrying:
         klass = error_class or error_class_of(exc)
         if self.retry_classified and is_retryable_class(klass):
             return True
-        if self.retry_unknown and klass == "unknown":
-            return True
-        return False
+        return bool(self.retry_unknown and klass == "unknown")
 
     def delay_for(self, attempt: int, rng: random.Random, retry_after: float | None = None) -> float:
         """Backoff duration after the given attempt fails (``attempt`` starts at 1)."""
@@ -181,10 +180,8 @@ def build_task_spec(
     reg = registry or DEFAULT_REGISTRY
     for tp in (accepts, returns):
         if isinstance(tp, type) and tp.__module__ != "builtins":
-            try:
+            with contextlib.suppress(Exception):  # an unregisterable annotation is not fatal
                 reg.register_type(tp)
-            except Exception:
-                pass
 
     return TaskSpec(
         name=name or getattr(fn, "__name__", "task"),
@@ -246,7 +243,7 @@ class _LeaseGuard:
     * ``await guard`` —— the escape hatch; the lease is still tracked by ctx and force-reclaimed when the task ends.
     """
 
-    __slots__ = ("ctx", "pool", "algorithm", "timeout", "where", "selector", "lease")
+    __slots__ = ("algorithm", "ctx", "lease", "pool", "selector", "timeout", "where")
 
     def __init__(
         self,
@@ -293,25 +290,25 @@ class TaskContext:
     """The only entry point through which a running task interacts with the framework."""
 
     __slots__ = (
-        "run_id",
+        "_emit_cb",
+        "_history",
+        "_leases",
+        "attempt",
+        "bus",
+        "clock",
+        "default_algorithm",
+        "default_pool",
+        "meta",
         "pipeline_id",
         "pipeline_key",
         "pipeline_name",
-        "task_name",
-        "seq",
-        "attempt",
-        "clock",
-        "bus",
         "pools",
-        "rng",
         "registry",
+        "rng",
+        "run_id",
         "seed",
-        "meta",
-        "default_pool",
-        "default_algorithm",
-        "_leases",
-        "_history",
-        "_emit_cb",
+        "seq",
+        "task_name",
     )
 
     def __init__(
@@ -431,10 +428,8 @@ class TaskContext:
         }
 
     def _untrack(self, lease: Lease) -> None:
-        try:
+        with contextlib.suppress(ValueError):
             self._leases.remove(lease)
-        except ValueError:
-            pass
 
     def lease_log(self) -> list[dict[str, Any]]:
         """**All** leases used by this attempt (including returned ones), for detailed logging."""
@@ -480,7 +475,5 @@ class TaskContext:
         payload.setdefault("task", self.task_name)
         payload.setdefault("seq", self.seq)
         payload.setdefault("attempt", self.attempt)
-        try:
+        with contextlib.suppress(Exception):  # a failed event record must not affect scheduling
             self._emit_cb(kind, payload)
-        except Exception:  # a failed event record must not affect scheduling
-            pass

@@ -20,10 +20,10 @@ from pathlib import Path
 from pyattacker import (
     Pool,
     Resource,
-    SqliteStore,
     RetryableError,
     Retrying,
     Runner,
+    SqliteStore,
     export_store,
     merge_reports,
     pipeline,

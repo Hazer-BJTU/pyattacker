@@ -396,6 +396,50 @@ can record its own provenance.
 CSV takes its header from the first `header_rows` rows and folds anything introduced later into an `extra`
 column, which keeps memory flat without silently dropping fields.
 
+### 6.4 Plugins, Backends and the Monitoring Endpoint (M4)
+
+**Plugins** are plain `importlib.metadata` entry points — no registry file, no import-time magic:
+
+```toml
+[project.entry-points."pyattacker.tasks"]
+my_judge = "my_pkg.tasks:my_judge"          # a TaskSpec, or a factory returning one
+[project.entry-points."pyattacker.algorithms"]
+my_algo  = "my_pkg.algo:MyAlgorithm"
+[project.entry-points."pyattacker.codecs"]
+my_codec = "my_pkg.codec:MyCodec"
+[project.entry-points."pyattacker.stores"]
+s3       = "my_pkg.s3:open_store"           # keyed by URI scheme
+```
+
+Then `use: my_judge`, `algorithm: my_algo` and `store: "s3://bucket/runs.db"` simply work.
+Two rules keep this from becoming a liability: **built-ins resolve first**, so a plugin can never
+shadow `echo` or `wait`; and **a broken plugin is recorded, not raised** — `pyattacker plugins`
+lists what loaded and what failed, and the healthy plugins keep working. A complete example lives
+in `examples/plugin_package/`.
+
+**Artifact backends** decide where payload bytes live. `inline` (default) keeps them in the store;
+`file:///data/blobs` spills anything above a threshold into content-addressed files; `null` keeps the
+digest and drops the bytes. The store keeps `digest`/`size`/`codec` in its own row plus an opaque
+`blob_ref`, and hydrates `payload` back on read — so an artifact is still one object to everything
+upstream, and content addressing means identical payloads collapse into one file and a shared
+backend can safely serve many runs.
+
+```toml
+[run]
+artifact_backend = { kind = "file", root = "/data/blobs", min_bytes = 262144 }
+```
+
+**Monitoring endpoint**: `pyattacker serve runs/qa.db` starts a zero-dependency, read-only HTTP view
+(fresh read-only connection per request, so it can run beside a live run). `/stats`, `/events`,
+`/pipelines`, `/resources`, `/errors` are JSON; `/` is a small auto-refreshing dashboard. It binds
+to loopback and has no authentication — it exposes your payloads, so treat it as a debug view.
+
+**Fan-out**: `fanout(a, b, ...)` runs several tasks on the *same* input concurrently **inside one
+task**, which is how a genuinely branching step is expressed without turning pipelines into a DAG.
+The tradeoff is explicit: retry granularity becomes the group, and the group adopts the most
+forgiving child policy. First-class `Parallel`/`Gather` nodes remain deliberately out of scope —
+the unary task model is what keeps the kernel (and its recovery story) small.
+
 ---
 
 ## 7. Module Structure
@@ -416,9 +460,12 @@ src/pyattacker/
   merge.py        join N shard stores: de-duplicate by pipeline_id, recompute statistics (M3)
   export.py       row shapes (pipelines/tasks/attempts/events/artifacts) and formats (jsonl/json/csv) (M3)
   declarative.py  YAML/TOML → pools + pipeline + source (including ${ENV} expansion)
-  cli.py          run/resume/report/watch/export/validate/demo (+ --shard / --shards)
+  plugins.py      entry-point discovery for tasks/algorithms/codecs/stores (M4)
+  backends.py     where artifact payloads live: inline / content-addressed files / null (M4)
+  server.py       read-only HTTP view of a store: /stats, /events, /pipelines (M4)
+  cli.py          run/resume/report/watch/export/serve/plugins/validate/demo (+ --shard / --shards)
   __main__.py     `python -m pyattacker`, used by the shard children
-  tasks/          built-in utility tasks: mock.* / shell.run / file.write_jsonl / jsonl_source
+  tasks/          built-in utility tasks: mock.* / fanout / shell.run / file.write_jsonl / jsonl_source
 ```
 
 The dependency direction is strictly one-way: `errors → artifact → task → pipeline → resource/algorithm → store → runner → cli`,
@@ -459,7 +506,14 @@ depends on them.
    *recomputes* statistics from the merged rows. It reports how many rows it folded so the number is never
    hidden.
 10. **A pipeline is a linear chain**: the kernel is implemented in terms of "nodes + dependency edges", so
-    adding `Parallel/Gather` is just syntactic sugar, but v1 does not expose it.
+    adding `Parallel/Gather` is just syntactic sugar, but it is deliberately not exposed. Use `fanout(...)`
+    inside a task instead: branches stay one step in the record, at the cost of group-level retry granularity.
+11. **A `null` backend costs you recovery granularity**: dropping payloads means intermediate artifacts
+    cannot be reused, so `resume` reruns the whole pipeline — the same tradeoff as `journal=summary`.
+    A missing blob file behaves the same way, on purpose: `available` goes false and the work is redone.
+12. **The HTTP endpoint is unauthenticated and loopback-only by default.** It is a debug view over your
+    run's payloads, not a service. Put it behind your own proxy if you need one, and think before binding
+    it to a public interface.
 
 ---
 
@@ -488,21 +542,34 @@ depends on them.
   merged `report`/`export`, and the `ConfigError` when a shard has nowhere to write.
 * `tests/test_export.py` — every row shape and every format, including the CSV `extra` column for keys that
   appear after `header_rows`, and `merge_reports` folding duplicate `pipeline_id`s by best-state/latest-finish.
+* `tests/test_plugins.py` — discovery and resolution with an injected entry-point provider (no installation
+  needed): built-ins win, a raising plugin is recorded instead of propagated, `use:`/`algorithm:`/store-scheme
+  resolution all reach plugins.
+* `tests/test_server.py` — the HTTP endpoint over real loopback requests: JSON shapes, limits, 404s, and that
+  a run started while the server is up shows up in `/stats`.
+* `tests/test_backends.py` — spilling above a threshold, hydration on read, content-addressed de-duplication,
+  `journal=summary` keeping nothing anywhere, and **resume through a spilled checkpoint**.
+* `tests/test_packaging.py` — the version in `pyproject.toml` matches the running package, no accidental
+  dependencies, every module imports, and every promised name is exported.
 * `tests/test_artifact.py` / `test_store.py` / `test_declarative.py` / `test_cli.py` — codecs,
   store semantics and consistency between the two stores, config parsing, CLI end to end.
 
 All time-related logic (backoff, circuit-break cooldown) goes through an injectable `Clock`, and tests use
 `tests/helpers.py::FakeClock` to turn time into a controllable variable, making them both deterministic and fast.
-The suite is 140 tests and finishes in about a second, so there is no excuse for not running it.
+The suite is 242 tests and finishes in a few seconds, so there is no excuse for not running it.
+`ruff check` is clean under the configuration in `pyproject.toml`, where every ignored rule carries a
+reason — a lint exception should be an argument, not an accident.
 
-**Implemented (M0 + M1 + M2 + M3)**: the full kernel for the five concepts, in-memory/SQLite stores, task-level
+**Implemented (M0 – M4, i.e. everything planned for 0.1.0)**: the full kernel for the five concepts, in-memory/SQLite stores, task-level
 checkpoint and recovery, retry and error classification, the resource pool state machine and publish/subscribe,
 7 acquisition algorithms, the declarative layer, the CLI, the built-in mock utility tasks, delayed continuations
 (backoff without holding a worker), write-behind batching of attempts/events, per-resource targeted wakeups,
-pool wait-time metrics, deterministic sharding with merged reports, and five row shapes in three export formats.
+pool wait-time metrics, deterministic sharding with merged reports, five row shapes in three export formats,
+entry-point plugins, external artifact backends, a fan-out helper, and a read-only HTTP monitoring endpoint.
 
-**Not implemented (M4)**: an HTTP monitoring endpoint, entry-point plugins, `Parallel`/`Gather` syntactic
-sugar, attachments (external backends for large artifacts).
+**Left for later (post-0.1.0)**: a distributed scheduler, Parquet export, blob garbage collection
+(`FileBackend` is content-addressed, so orphan blobs are safe but never removed), and first-class
+`Parallel`/`Gather` nodes — the last one only if the unary task model proves too limiting in practice.
 
 ---
 
@@ -514,7 +581,7 @@ sugar, attachments (external backends for large artifacts).
 | **M1 Persistence and recovery** ✅ | all SQLite tables, task-level checkpoint, resume, structured events, SIGINT | resume after SIGKILL without re-sending earlier tasks |
 | **M2 Smarter resources and retries** ✅ | write-behind, backoff that yields the worker, per-resource targeted wakeups, quota-aware algorithms, finer `acquire` metrics | backoff is observable when the pool is saturated, and can be replayed from `events` |
 | **M3 Scale and ergonomics** ✅ | `--shard i/N` + `--shards N`, merged reports, shard utilities, multi-shape/multi-format export | multiple processes run the same dataset |
-| **M4 Ecosystem** | entry-point plugins, HTTP monitoring endpoint, optional extras, PyPI 0.1.0 | third parties can publish task packages |
+| **M4 Ecosystem** ✅ | entry-point plugins, external artifact backends, fan-out helper, HTTP monitoring endpoint, 0.1.0 packaging | third parties can publish task packages |
 
 ---
 

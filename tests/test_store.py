@@ -518,7 +518,7 @@ def test_export_rows_decodes_payload_for_full_journal(store):
     store.upsert_pipeline(_pipeline("p1", state="succeeded", created_at=1000.0))
     store.put_artifact(_artifact(seq=0, value={"nested": {"ok": [1, 2]}}, task="ask"))
 
-    artifact_row = list(store.export_rows())[0]["artifacts"][0]
+    artifact_row = next(iter(store.export_rows()))["artifacts"][0]
     assert artifact_row["payload"] == {"nested": {"ok": [1, 2]}}
     assert artifact_row["type"] == "dict"
     assert artifact_row["codec"] == "json"
@@ -531,7 +531,7 @@ def test_export_rows_payload_is_none_with_summary_journal(kind, tmp_path):
         backend.upsert_pipeline(_pipeline("p1", state="succeeded", created_at=1000.0))
         backend.put_artifact(_artifact(seq=0, value={"secret": 1}, task="ask"))
 
-        artifact_row = list(backend.export_rows())[0]["artifacts"][0]
+        artifact_row = next(iter(backend.export_rows()))["artifacts"][0]
         assert artifact_row["payload"] is None  # summary mode: the payload is not persisted, so the export cannot conjure one
         assert artifact_row["digest"] == _artifact(seq=0, value={"secret": 1}, task="ask").digest
     finally:

@@ -13,10 +13,10 @@ three primitives: ``pool.try_acquire()`` (synchronous attempt),
 
 from __future__ import annotations
 
-import asyncio
 import random
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, Sequence, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from .errors import AcquireTimeout, PoolNotFound, ResourceUnavailable
 from .resource import Lease, Pool
@@ -154,9 +154,7 @@ class LeastBusy:
 
     async def acquire(self, pool, *, ctx=None, where=None, timeout=None, selector=None) -> Lease:
         def pick(resource: Any) -> bool:
-            if where is not None and not where(resource):
-                return False
-            return True
+            return where is None or bool(where(resource))
 
         lease = pool.try_acquire(where=pick, ctx=ctx, **(selector or {}))
         if lease is not None:
@@ -303,15 +301,31 @@ def resolve_algorithm(spec: Any) -> AcquireAlgorithm:
     if spec is None:
         return Wait()
     if isinstance(spec, str):
-        cls = ALGORITHMS.get(spec)
-        if cls is None:
-            raise PoolNotFound(f"unknown acquire algorithm: {spec!r}, choices: {sorted(ALGORITHMS)}")
-        return cls()
+        if spec in ALGORITHMS:
+            return ALGORITHMS[spec]()
+        from .plugins import PLUGINS
+
+        plugin = PLUGINS.algorithm(spec)
+        if plugin is not None:
+            return plugin
+        raise PoolNotFound(
+            f"unknown acquire algorithm: {spec!r}, choices: {sorted(ALGORITHMS)} "
+            f"+ installed plugins {PLUGINS.names('algorithms')}"
+        )
     if isinstance(spec, dict):
         params = dict(spec)
         name = params.pop("name", "wait")
         cls = ALGORITHMS.get(name)
         if cls is None:
+            from .plugins import PLUGINS
+
+            plugin = PLUGINS.algorithm(name)
+            if plugin is not None:
+                if params:
+                    raise PoolNotFound(
+                        f"algorithm plugin {name!r} does not take parameters: {sorted(params)}"
+                    )
+                return plugin
             raise PoolNotFound(f"unknown acquire algorithm: {name!r}, choices: {sorted(ALGORITHMS)}")
         if "fallback" in params and isinstance(params["fallback"], (str, dict)):
             params["fallback"] = resolve_algorithm(params["fallback"])

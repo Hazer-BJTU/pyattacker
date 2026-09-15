@@ -6,11 +6,10 @@ import dataclasses
 from dataclasses import dataclass
 
 import pytest
+from helpers import run  # noqa: F401  (single shared test entry point, kept for consistency)
 
 from pyattacker import Artifact, CodecRegistry, canonical_json, digest_of
 from pyattacker.errors import ArtifactCodecError
-
-from helpers import run  # noqa: F401  (single shared test entry point, kept for consistency)
 
 
 @dataclass

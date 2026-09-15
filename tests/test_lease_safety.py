@@ -15,12 +15,11 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from helpers import FakeClock, make_pool, run
 
 from pyattacker import Pool, Resource, RetryableError, Runner, pipeline, task
 from pyattacker.runner import RunConfig
 from pyattacker.tasks import leaky
-
-from helpers import FakeClock, make_pool, run
 
 
 @task("acq.ok", resource="apis")
@@ -40,7 +39,7 @@ async def acquire_then_boom(seed, ctx):
 async def acquire_in_loop(seed, ctx):
     seen = []
     for _ in range(5):
-        async with ctx.acquire() as lease:
+        async with ctx.acquire():
             seen.append(ctx._resolve_pool(None).stats().active)
             await ctx.clock.sleep(0)
     return {"active_during_loop": seen}
@@ -231,8 +230,11 @@ def test_backoff_algorithm_waits_for_release():
             await asyncio.sleep(0.03)
             holder.release_now()
 
-        asyncio.create_task(_release_soon())
-        lease = await pool.acquire(timeout=5.0)
+        releaser = asyncio.create_task(_release_soon())
+        try:
+            lease = await pool.acquire(timeout=5.0)
+        finally:
+            await releaser
         assert lease is not None
         lease.release_now()
         assert pool.stats().active == 0

@@ -7,17 +7,19 @@ Real model requests (openai / anthropic protocols) are up to the user —— the
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import random
+from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any
 
 from ..errors import FatalError, RetryableError
-from ..resource import Resource
 from ..task import Retrying, TaskSpec, build_task_spec, task
 
 __all__ = [
     "echo",
+    "fanout",
     "flaky",
     "delay",
     "boom",
@@ -156,6 +158,78 @@ def simulate_llm(
 
 
 # ---------------------------------------------------------- general helpers
+def fanout(
+    *specs: TaskSpec,
+    name: str | None = None,
+    on_error: str = "raise",
+    retry: Retrying | None = None,
+) -> TaskSpec:
+    """Run several tasks on the *same* input, concurrently, inside one task.
+
+    The task model is unary and linear on purpose; when a step genuinely branches (three judges,
+    k samples, several metrics), this keeps the branch inside one task instead of turning the
+    pipeline into a DAG. Two consequences, both deliberate:
+
+    * **Retry granularity is the group.** If one branch fails, the whole fan-out is retried; the
+      children's own retry policies are not applied branch by branch. The group therefore adopts
+      the most forgiving child policy unless you pass ``retry=``.
+    * **Branches share the parent's context**, so their leases and events are recorded under the
+      fan-out task. That is what keeps a single, complete record per step.
+
+    ``on_error="raise"`` (default) fails the task if any branch fails, like any other exception.
+    ``on_error="collect"`` never raises and returns ``{child_name: {"ok": bool, ...}}`` instead.
+    """
+    if not specs:
+        raise ValueError("fanout needs at least one task")
+    if on_error not in ("raise", "collect"):
+        raise ValueError(f"on_error must be 'raise' or 'collect', got {on_error!r}")
+
+    policy = retry or max((spec.retry for spec in specs), key=lambda r: r.max_attempts)
+
+    async def _impl(value: Any, ctx: Any) -> dict[str, Any]:
+        async def _one(spec: TaskSpec) -> Any:
+            try:
+                produced = spec(value, ctx)
+                return await produced if inspect.isawaitable(produced) else produced
+            except Exception as exc:  # collected here; the group decides what to do with it
+                ctx.emit("fanout.branch_failed", branch=spec.name, error=f"{type(exc).__name__}: {exc}")
+                return exc
+
+        results = await asyncio.gather(*(_one(spec) for spec in specs))
+        failures = {
+            spec.name: result
+            for spec, result in zip(specs, results, strict=True)
+            if isinstance(result, BaseException)
+        }
+        ctx.emit(
+            "fanout.done",
+            branches=len(specs),
+            failed=len(failures),
+            failed_branches=sorted(failures),
+        )
+        if on_error == "collect":
+            return {
+                spec.name: (
+                    {"ok": False, "error": f"{type(result).__name__}: {result}"}
+                    if isinstance(result, BaseException)
+                    else {"ok": True, "value": result}
+                )
+                for spec, result in zip(specs, results, strict=True)
+            }
+        if failures:
+            first = next(iter(failures.values()))
+            raise first  # keep the original class so the retry policy classifies it correctly
+        return {spec.name: result for spec, result in zip(specs, results, strict=True)}
+
+    _impl.__name__ = name or "fanout"
+    return build_task_spec(
+        _impl,
+        name=name or "fanout",
+        retry=policy,
+        resource=specs[0].resource if len({spec.resource for spec in specs}) == 1 else None,
+    )
+
+
 def shell_run(
     command: str | list[str],
     *,
@@ -230,6 +304,7 @@ def seed_factory(
 
 BUILTIN_TASKS = {
     "echo": echo,
+    "fanout": fanout,
     "flaky": flaky,
     "delay": delay,
     "boom": boom,

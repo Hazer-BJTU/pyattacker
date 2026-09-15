@@ -16,6 +16,7 @@ Key points:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import inspect
 import json
@@ -28,8 +29,9 @@ import threading
 import time
 import traceback as tb_mod
 from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 
 from .algorithm import AcquireAlgorithm, resolve_algorithm
 from .artifact import (
@@ -97,6 +99,9 @@ class RunConfig:
     write_behind: bool | None = None
     write_batch: int = 128
     flush_interval: float = 1.0
+    # Where artifact payloads live: None/"inline" keeps them in the store; "file:///data/blobs"
+    # (or {"kind": "file", "root": ..., "min_bytes": ...}) spills large ones to disk.
+    artifact_backend: Any = None
     meta: dict[str, Any] = field(default_factory=dict)
 
 
@@ -260,6 +265,11 @@ class Runner:
         self.clock = clock or _RealClock()
         self.bus = bus or Bus(clock=self.clock)
         self.registry = registry or DEFAULT_REGISTRY
+        # Codec plugins register lazily, on the first Runner: importing pyattacker must not go
+        # looking at every installed distribution.
+        from .plugins import PLUGINS
+
+        PLUGINS.install_codecs(self.registry)
         self.pools: dict[str, Pool] = {}
         for pool in pools:
             self.add_pool(pool)
@@ -270,6 +280,7 @@ class Runner:
             batch_size=config.write_batch,
             flush_interval=config.flush_interval,
             clock=self.clock,
+            backend=config.artifact_backend,
         )
         self._stopping = threading.Event()
         self._stop_reason: str | None = None
@@ -292,10 +303,8 @@ class Runner:
 
         def _sink(event: ResourceEvent) -> None:
             if previous is not None:
-                try:
+                with contextlib.suppress(Exception):  # another sink's failure is not ours
                     previous(event)
-                except Exception:
-                    pass
             self._on_resource_event(event)
 
         pool.on_event = _sink
@@ -406,6 +415,7 @@ class Runner:
                     "concurrency": cfg.concurrency,
                     "journal": cfg.journal,
                     "write_behind": bool(getattr(self.store, "batch_size", 0)),
+                    "artifact_backend": getattr(getattr(self.store, "backend", None), "name", None),
                     **cfg.meta,
                 },
                 notes=cfg.notes,
@@ -1144,8 +1154,9 @@ class Runner:
     def _install_signals(self):
         try:
             loop = asyncio.get_running_loop()
-            previous = loop.add_signal_handler  # noqa: F841  (probe whether it is supported)
-        except (RuntimeError, NotImplementedError, AttributeError):  # pragma: no cover
+            if not hasattr(loop, "add_signal_handler"):  # some loops (e.g. Windows) cannot
+                return None
+        except RuntimeError:  # pragma: no cover - no running loop
             return None
         if threading.current_thread() is not threading.main_thread():  # pragma: no cover
             return None

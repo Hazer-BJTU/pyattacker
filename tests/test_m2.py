@@ -16,13 +16,10 @@ import asyncio
 import sqlite3
 import time
 
-import pytest
-
-from pyattacker import RetryableError, Retrying, Runner, SqliteStore, pipeline, task
-from pyattacker.errors import PyAttackerError
-from pyattacker.store.writebehind import WriteBehindStore
-
 from helpers import run
+
+from pyattacker import RetryableError, Retrying, Runner, pipeline, task
+from pyattacker.store.writebehind import WriteBehindStore
 
 
 @task("m2.flaky_once", retry=Retrying(max_attempts=2, base=0.2, cap=0.2, jitter="none"))

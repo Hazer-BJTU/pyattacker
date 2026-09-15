@@ -11,9 +11,11 @@
 from __future__ import annotations
 
 import inspect
+import itertools
 import typing
-from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any
 
 from .artifact import DEFAULT_REGISTRY, CodecRegistry, canonical_json, digest_of
 from .errors import PipelineBuildError
@@ -28,9 +30,9 @@ class Chain:
 
     def __or__(self, other: Any) -> "Chain":
         if isinstance(other, TaskSpec):
-            return Chain(self.tasks + (other,))
+            return Chain((*self.tasks, other))
         if isinstance(other, Chain):
-            return Chain(self.tasks + other.tasks)
+            return Chain((*self.tasks, *other.tasks))
         raise PipelineBuildError(f"pipelines can only be composed from TaskSpec or Chain, got {type(other).__name__}")
 
     def __len__(self) -> int:
@@ -64,7 +66,7 @@ def _compatible(produced: Any, accepted: Any) -> bool:
 def _validate_chain(tasks: Sequence[TaskSpec]) -> None:
     if not tasks:
         raise PipelineBuildError("pipeline cannot be empty")
-    for left, right in zip(tasks, tasks[1:]):
+    for left, right in itertools.pairwise(tasks):
         if not _compatible(left.returns, right.accepts):
             raise PipelineBuildError(
                 f"artifact types do not chain: task {left.name!r} produces "
@@ -129,7 +131,7 @@ class PipelineTemplate:
     ) -> Iterator["PipelineSpec"]:
         """Expand seeds into a stream of pipelines. ``repeats>1`` serves pass@k / self-consistency sampling."""
         repeats = max(1, int(repeats))
-        for index, seed in enumerate(seeds):
+        for seed in seeds:
             base_key = key_of(seed) if key_of is not None else None
             for repeat in range(repeats):
                 explicit = None

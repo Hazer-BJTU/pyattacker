@@ -16,6 +16,7 @@ __all__ = [
     "ConfigError",
     "PipelineBuildError",
     "ArtifactCodecError",
+    "PluginError",
     "ResourceError",
     "ResourceUnavailable",
     "AcquireTimeout",
@@ -41,6 +42,14 @@ class ConfigError(PyAttackerError):
 
 class PipelineBuildError(PyAttackerError):
     """The pipeline is invalid at construction time (for example, adjacent tasks' artifact types do not chain)."""
+
+
+class PluginError(PyAttackerError):
+    """A plugin entry point is unknown, or could not be loaded.
+
+    Loading failures are normally *recorded* rather than raised (see ``pyattacker.plugins``); this
+    is raised for programmer errors such as asking for an unknown plugin group.
+    """
 
 
 class ArtifactCodecError(PyAttackerError):

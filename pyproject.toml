@@ -1,6 +1,6 @@
 [project]
 name = "pyattacker"
-version = "0.0.1"
+version = "0.1.0"
 description = "Artifact-centric, resumable async task orchestration: pipeline / task / resource pool."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,8 +19,7 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
-[project.optional-dependencies]
-yaml = ["pyyaml>=6.0"]
+# No [project.urls]: fill in the real repository/homepage before publishing to PyPI.
 
 [project.scripts]
 pyattacker = "pyattacker.cli:main"
@@ -28,7 +27,25 @@ pyattacker = "pyattacker.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "ruff>=0.6",
 ]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["examples/plugin_package"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+# Deliberate style decisions, not oversights:
+#   E501  long lines are allowed up to `line-length`; prose in docstrings is not wrapped by a tool
+#   BLE001/S110  event sinks and best-effort cleanup must never take the scheduler down
+#   RUF022  __all__ is grouped by concept (core objects, algorithms, stores, ...), not alphabetised
+#   UP037  quoted annotations stay quoted where they document a forward reference
+#   B008  dataclass defaults calling a factory (field(default_factory=...)) are the normal idiom here
+#   UP042  (str, Enum) is deliberate: `str(member)` stays "ResourceState.READY" in logs, while the
+#         wire format uses `.value` explicitly
+ignore = ["E501", "BLE001", "S110", "RUF022", "UP037", "B008", "PYI036", "PYI034", "UP042"]
 
 [build-system]
 requires = ["hatchling"]

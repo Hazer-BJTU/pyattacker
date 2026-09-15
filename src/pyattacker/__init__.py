@@ -38,11 +38,18 @@ from .algorithm import (
     Wait,
     resolve_algorithm,
 )
-from .artifact import Artifact, CodecRegistry, canonical_json, digest_of
+from .artifact import (
+    Artifact,
+    BytesCodec,
+    Codec,
+    CodecRegistry,
+    Encoded,
+    JsonCodec,
+    canonical_json,
+    digest_of,
+)
+from .backends import ArtifactBackend, FileBackend, InlineBackend, NullBackend, resolve_backend
 from .declarative import load_spec
-from .export import FORMATS, ROW_KINDS, export_store, export_stores, iter_rows
-from .merge import MergedReport, merge_reports
-from .shard import in_shard, parse_shard, shard_index, shard_specs, shard_store_path
 from .errors import (
     AcquireTimeout,
     ArtifactCodecError,
@@ -51,6 +58,7 @@ from .errors import (
     FatalError,
     LeaseLeakError,
     PipelineBuildError,
+    PluginError,
     PoolNotFound,
     PyAttackerError,
     ResourceUnavailable,
@@ -58,15 +66,21 @@ from .errors import (
     RunInterrupted,
     error_class_of,
 )
+from .export import FORMATS, ROW_KINDS, export_store, export_stores, iter_rows
+from .merge import MergedReport, merge_reports
 from .pipeline import Chain, PipelineSpec, PipelineTemplate, compute_spec_digest, pipeline, with_retry
+from .plugins import PLUGINS, PluginRegistry, list_plugins
 from .resource import Bus, Lease, Pool, Resource, ResourceEvent, ResourceState
-from .runner import RunConfig, RunReport, Runner
+from .runner import RunConfig, Runner, RunReport
+from .server import StatsServer
+from .shard import in_shard, parse_shard, shard_index, shard_specs, shard_store_path
 from .store import AttemptRecord, EventRecord, MemoryStore, PipelineRecord, SqliteStore, open_store
-from .task import Retrying, TaskContext, TaskSpec, task
+from .task import Retrying, TaskContext, TaskSpec, build_task_spec, task
 from .tasks import (
     boom,
     delay,
     echo,
+    fanout,
     flaky,
     jsonl_source,
     leaky,
@@ -76,7 +90,7 @@ from .tasks import (
     write_jsonl,
 )
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 __all__ = [
     "__version__",
@@ -95,13 +109,18 @@ __all__ = [
     "Retrying",
     "TaskSpec",
     "TaskContext",
+    "build_task_spec",
     "Chain",
     "PipelineSpec",
     "PipelineTemplate",
     "compute_spec_digest",
     "with_retry",
     "Artifact",
+    "Codec",
     "CodecRegistry",
+    "JsonCodec",
+    "BytesCodec",
+    "Encoded",
     "canonical_json",
     "digest_of",
     # algorithms
@@ -135,8 +154,21 @@ __all__ = [
     "export_stores",
     "ROW_KINDS",
     "FORMATS",
+    # plugins
+    "PLUGINS",
+    "PluginRegistry",
+    "list_plugins",
+    # artifact backends
+    "ArtifactBackend",
+    "InlineBackend",
+    "FileBackend",
+    "NullBackend",
+    "resolve_backend",
+    # monitoring endpoint
+    "StatsServer",
     # built-in tasks
     "echo",
+    "fanout",
     "flaky",
     "delay",
     "boom",
@@ -150,6 +182,7 @@ __all__ = [
     "PyAttackerError",
     "ConfigError",
     "PipelineBuildError",
+    "PluginError",
     "ArtifactCodecError",
     "ResourceUnavailable",
     "AcquireTimeout",

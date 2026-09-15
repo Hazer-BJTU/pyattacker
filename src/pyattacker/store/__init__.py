@@ -12,8 +12,8 @@ from .base import (
     open_store,
 )
 from .memory import MemoryStore
-from .writebehind import WriteBehindStore, wrap_write_behind
 from .sqlite import SqliteStore
+from .writebehind import WriteBehindStore, wrap_write_behind
 
 __all__ = [
     "Store",

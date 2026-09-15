@@ -479,7 +479,7 @@ def test_pipelines_repeats_and_key_field_dedupe_semantics(tmp_path):
     spec = load_spec(cfg)
     specs = list(spec.pipelines())
 
-    assert len(specs) == 6  # 3 lines × repeats=2
+    assert len(specs) == 6  # 3 lines x repeats=2
     assert [s.key for s in specs] == [
         "qa:1#0",
         "qa:1#1",

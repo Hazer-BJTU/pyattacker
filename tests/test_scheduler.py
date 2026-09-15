@@ -8,16 +8,14 @@ is covered in test_runner.py.
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 
 import pytest
+from helpers import FakeClock, run
 
 from pyattacker import Artifact, MemoryStore
 from pyattacker.scheduler import DelayQueue, interruptible_sleep
 from pyattacker.store.base import AttemptRecord, EventRecord, PipelineRecord, TaskRecord
 from pyattacker.store.writebehind import WriteBehindStore, wrap_write_behind
-
-from helpers import FakeClock, run
 
 
 def _attempt(attempt_no: int = 1, **kwargs) -> AttemptRecord:
@@ -152,8 +150,11 @@ def test_interruptible_sleep_returns_early_only_when_woken():
             await asyncio.sleep(0.01)
             wake.set()
 
-        asyncio.create_task(_wake_soon())
-        assert await interruptible_sleep(clock, 5.0, wake) is True
+        waker = asyncio.create_task(_wake_soon())
+        try:
+            assert await interruptible_sleep(clock, 5.0, wake) is True
+        finally:
+            await waker
 
         wake.clear()
         assert await interruptible_sleep(clock, 0.01, wake) is False

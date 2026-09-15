@@ -20,14 +20,16 @@ Publish/subscribe and acquire are two separate channels:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import time
 from collections import deque
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, AsyncIterator, Callable, Iterable, Mapping, Sequence
+from typing import Any
 
-from .errors import AcquireTimeout, PoolNotFound, ResourceUnavailable
+from .errors import ResourceUnavailable
 
 __all__ = [
     "ResourceState",
@@ -200,7 +202,7 @@ class _Waiter:
 class _Slot:
     """Mutable state internal to a pool. Not public API."""
 
-    __slots__ = ("resource", "stats", "state", "blocked_until", "client", "client_error", "published_at")
+    __slots__ = ("blocked_until", "client", "client_error", "published_at", "resource", "state", "stats")
 
     def __init__(self, resource: Resource, published_at: float) -> None:
         self.resource = resource
@@ -679,10 +681,8 @@ class Pool:
         if self.bus is not None:
             self.bus.publish("resource", **event.as_dict())
         if self.on_event is not None:
-            try:
+            with contextlib.suppress(Exception):  # a failed event record must not affect scheduling
                 self.on_event(event)
-            except Exception:  # a failed event record must not affect scheduling
-                pass
 
     # ------------------------------------------------------------------ observability
     def stats(self, *, where: Callable[[Resource], bool] | None = None, **selector: Any) -> "PoolStats":
@@ -777,7 +777,7 @@ class PoolStats:
 class Lease:
     """A single resource lease. **Must be returned**; prefer ``async with ctx.acquire(...)``."""
 
-    __slots__ = ("pool", "slot", "ctx", "acquired_at", "released")
+    __slots__ = ("acquired_at", "ctx", "pool", "released", "slot")
 
     def __init__(self, *, pool: Pool, slot: _Slot, ctx: Any, acquired_at: float) -> None:
         self.pool = pool

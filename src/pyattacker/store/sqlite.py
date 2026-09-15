@@ -9,12 +9,15 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import dataclasses
 import json
 import os
 import sqlite3
 import time
+from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any
 
 from ..artifact import Artifact
 from .base import AttemptRecord, EventRecord, PipelineRecord, RunRecord, TaskRecord
@@ -119,7 +122,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
     size INTEGER NOT NULL,
     payload BLOB,
     created_at REAL NOT NULL,
-    is_final INTEGER NOT NULL DEFAULT 0
+    is_final INTEGER NOT NULL DEFAULT 0,
+    blob_ref TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_pipeline ON artifacts(pipeline_id, seq);
 
@@ -158,10 +162,20 @@ def _dumps(obj: Any) -> str:
 
 
 class SqliteStore:
-    def __init__(self, path: str, *, journal: str = "full", read_only: bool = False) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        journal: str = "full",
+        read_only: bool = False,
+        backend: Any = None,
+    ) -> None:
         self.path = path
         self.journal = journal
         self.read_only = read_only
+        from ..backends import resolve_backend
+
+        self.backend = resolve_backend(backend)
         if path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
         if read_only:
@@ -176,7 +190,18 @@ class SqliteStore:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA busy_timeout=10000")
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns that older stores do not have.
+
+        ``CREATE TABLE IF NOT EXISTS`` silently skips existing tables, so a schema addition needs
+        an explicit upgrade step; without it, resuming an old store would fail at the first insert.
+        """
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(artifacts)")}
+        if "blob_ref" not in columns:
+            self._conn.execute("ALTER TABLE artifacts ADD COLUMN blob_ref TEXT")
 
     # ------------------------------------------------------------------ runs
     def start_run(self, run: RunRecord) -> RunRecord:
@@ -287,28 +312,24 @@ class SqliteStore:
 
     # ------------------------------------------------------------- artifacts
     def put_artifact(self, artifact: Artifact) -> Artifact:
-        payload = artifact.payload if self.journal == "full" else None
+        stored = _persist_form(artifact, self.journal, self.backend)
         self._conn.execute(
             "INSERT OR REPLACE INTO artifacts (artifact_id,pipeline_id,task_name,seq,type_name,codec,"
-            "digest,size,payload,created_at,is_final) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "digest,size,payload,created_at,is_final,blob_ref) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                artifact.id, artifact.pipeline_id, artifact.task_name, artifact.seq, artifact.type_name,
-                artifact.codec, artifact.digest, artifact.size, payload, artifact.created_at,
-                1 if artifact.is_final else 0,
+                stored.id, stored.pipeline_id, stored.task_name, stored.seq, stored.type_name,
+                stored.codec, stored.digest, stored.size, stored.payload, stored.created_at,
+                1 if stored.is_final else 0, stored.blob_ref,
             ),
         )
         self._conn.commit()
-        if payload is None and artifact.payload is not None:
-            import dataclasses
-
-            return dataclasses.replace(artifact, payload=None)
-        return artifact
+        return stored
 
     def get_artifact(self, pipeline_id: str, seq: int) -> Artifact | None:
         row = self._conn.execute(
             "SELECT * FROM artifacts WHERE pipeline_id=? AND seq=?", (pipeline_id, seq)
         ).fetchone()
-        return _to_artifact(row) if row else None
+        return _hydrate(_to_artifact(row), self.backend) if row else None
 
     def mark_final(self, pipeline_id: str, seq: int) -> None:
         self._conn.execute(
@@ -320,7 +341,7 @@ class SqliteStore:
         rows = self._conn.execute(
             "SELECT * FROM artifacts WHERE pipeline_id=? ORDER BY seq", (pipeline_id,)
         ).fetchall()
-        return [_to_artifact(r) for r in rows]
+        return [_hydrate(_to_artifact(r), self.backend) for r in rows]
 
     # ----------------------------------------------------------------- tasks
     def record_task(self, record: TaskRecord) -> None:
@@ -582,10 +603,8 @@ class SqliteStore:
             }
 
     def close(self) -> None:
-        try:
+        with contextlib.suppress(Exception):  # pragma: no cover - defensive
             self._conn.close()
-        except Exception:  # pragma: no cover - defensive
-            pass
 
 
 # ------------------------------------------------------------ row mapping
@@ -649,7 +668,32 @@ def _to_artifact(row: sqlite3.Row) -> Artifact:
         seq=row["seq"], type_name=row["type_name"], codec=row["codec"], digest=row["digest"],
         size=row["size"], payload=bytes(payload) if payload is not None else None,
         created_at=row["created_at"], is_final=bool(row["is_final"]),
+        # `in row` would test *values* (sqlite3.Row iterates values), so keys() is the only way
+        # to ask about a column name on an older row shape.
+        blob_ref=row["blob_ref"] if "blob_ref" in row.keys() else None,  # noqa: SIM118 (values vs keys)
     )
+
+
+def _persist_form(artifact: Artifact, journal: str, backend: Any) -> Artifact:
+    """Decide what actually lands in the database: inline bytes, a blob reference, or neither."""
+    if journal != "full":
+        # `journal` is the authority on payload retention: summary/hash-only keeps no bytes
+        # anywhere, not even in the backend.
+        if artifact.payload is None:
+            return artifact
+        return dataclasses.replace(artifact, payload=None, blob_ref=None)
+    if artifact.payload is not None and backend.wants(artifact):
+        return dataclasses.replace(artifact, payload=None, blob_ref=backend.put(artifact))
+    return artifact
+
+
+def _hydrate(artifact: Artifact, backend: Any) -> Artifact:
+    """Fill `payload` back in from the backend so callers always see a complete artifact."""
+    if artifact.payload is None and artifact.blob_ref:
+        data = backend.get(artifact.blob_ref)
+        if data is not None:
+            return dataclasses.replace(artifact, payload=data)
+    return artifact
 
 
 def _decode_payload(artifact: Artifact) -> Any:

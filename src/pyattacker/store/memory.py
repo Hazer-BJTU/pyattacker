@@ -10,7 +10,8 @@ import base64
 import dataclasses
 import json
 import time
-from typing import Any, Iterator, Mapping
+from collections.abc import Iterator, Mapping
+from typing import Any
 
 from ..artifact import Artifact
 from .base import AttemptRecord, EventRecord, PipelineRecord, RunRecord, TaskRecord
@@ -19,8 +20,11 @@ __all__ = ["MemoryStore"]
 
 
 class MemoryStore:
-    def __init__(self, *, journal: str = "full") -> None:
+    def __init__(self, *, journal: str = "full", backend: Any = None) -> None:
         self.journal = journal
+        from ..backends import resolve_backend
+
+        self.backend = resolve_backend(backend)
         self._runs: dict[str, RunRecord] = {}
         self._pipelines: dict[str, PipelineRecord] = {}
         self._artifacts: dict[tuple[str, int], Artifact] = {}
@@ -104,14 +108,13 @@ class MemoryStore:
 
     # ------------------------------------------------------------- artifacts
     def put_artifact(self, artifact: Artifact) -> Artifact:
-        stored = artifact
-        if self.journal != "full" and artifact.payload is not None:
-            stored = dataclasses.replace(artifact, payload=None)
+        stored = _persist_form(artifact, self.journal, self.backend)
         self._artifacts[(stored.pipeline_id, stored.seq)] = stored
         return stored
 
     def get_artifact(self, pipeline_id: str, seq: int) -> Artifact | None:
-        return self._artifacts.get((pipeline_id, seq))
+        artifact = self._artifacts.get((pipeline_id, seq))
+        return None if artifact is None else _hydrate(artifact, self.backend)
 
     def mark_final(self, pipeline_id: str, seq: int) -> None:
         key = (pipeline_id, seq)
@@ -121,7 +124,7 @@ class MemoryStore:
 
     def artifacts(self, pipeline_id: str) -> list[Artifact]:
         items = [a for (pid, _), a in self._artifacts.items() if pid == pipeline_id]
-        return sorted(items, key=lambda a: a.seq)
+        return [_hydrate(a, self.backend) for a in sorted(items, key=lambda a: a.seq)]
 
     # ----------------------------------------------------------------- tasks
     def record_task(self, record: TaskRecord) -> None:
@@ -320,6 +323,28 @@ class MemoryStore:
 
     def close(self) -> None:
         return None
+
+
+def _persist_form(artifact: Artifact, journal: str, backend: Any) -> Artifact:
+    """Decide what actually lands in the store: inline bytes, a blob reference, or neither."""
+    if journal != "full":
+        # `journal` is the authority on payload retention: summary/hash-only keeps no bytes
+        # anywhere, not even in the backend.
+        if artifact.payload is None:
+            return artifact
+        return dataclasses.replace(artifact, payload=None, blob_ref=None)
+    if artifact.payload is not None and backend.wants(artifact):
+        return dataclasses.replace(artifact, payload=None, blob_ref=backend.put(artifact))
+    return artifact
+
+
+def _hydrate(artifact: Artifact, backend: Any) -> Artifact:
+    """Fill `payload` back in from the backend so callers always see a complete artifact."""
+    if artifact.payload is None and artifact.blob_ref:
+        data = backend.get(artifact.blob_ref)
+        if data is not None:
+            return dataclasses.replace(artifact, payload=data)
+    return artifact
 
 
 def _decode_payload(artifact: Artifact) -> Any:
