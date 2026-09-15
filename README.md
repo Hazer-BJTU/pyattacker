@@ -1,5 +1,7 @@
 # pyattacker
 
+[![CI](https://github.com/Hazer-BJTU/pyattacker/actions/workflows/ci.yml/badge.svg)](https://github.com/Hazer-BJTU/pyattacker/actions/workflows/ci.yml)
+
 > An async task orchestration framework centered on the **artifact**, using the **pipeline** as the unit of completion, and the **resource pool** as the only shared surface.
 > Few dependencies (the core is only the standard library + PyYAML), resumable, observable, built for "tens of thousands of mutually independent tasks".
 
@@ -205,6 +207,23 @@ authentication and binds to loopback: treat it as a debug view.
 **Branching inside a step** — `fanout(a, b)` runs several tasks on the same input concurrently and
 returns `{task_name: value}`. Retry granularity becomes the group, which is the honest price of not
 turning pipelines into a DAG.
+
+## Examples
+
+| Example | What it shows |
+|---|---|
+| [`examples/quickstart.py`](examples/quickstart.py) | the SDK in 60 lines: a custom client factory, retries, resume |
+| [`examples/llm_eval/`](examples/llm_eval/README.md) | a complete evaluation — prepare → 2-turn model call → 3 judges → reduce, in **two pipeline shapes**, with the checkpoint-granularity tradeoff *measured* (grouped re-sent 2 judge requests that had already succeeded; split re-sent 0) |
+| [`examples/sharded.py`](examples/sharded.py) | one dataset across N stores, then a merged report |
+| [`examples/plugin_package/`](examples/plugin_package/README.md) | a real installable plugin: tasks, an algorithm, a codec |
+| [`examples/qa_eval.yaml`](examples/qa_eval.yaml) | the declarative path, end to end |
+
+```bash
+uv run python examples/quickstart.py
+uv run python -m examples.llm_eval.demo
+uv run python examples/sharded.py
+uv run pyattacker run -c examples/qa_eval.yaml --limit 40
+```
 
 ## Out of Scope
 

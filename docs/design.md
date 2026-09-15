@@ -326,6 +326,10 @@ with Runner(store="runs/qa.db", pools=[pool], concurrency=64) as runner:
 Recovery: `runner.run(template.map(dataset_rows), resume=True)` — already successful pipelines are skipped, and
 failed ones continue from **the first task that produced no artifact**.
 
+A complete worked example — data preparation, a two-turn model call, three judges, a user-written
+reduction, in both a grouped and a per-judge pipeline shape, with the checkpoint cost measured
+rather than asserted — lives in `examples/llm_eval/`.
+
 ### 6.2 Declarative (simple tasks)
 
 The declarative form only describes **composition and resources**; the logic still lives in Python

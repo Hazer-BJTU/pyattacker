@@ -19,7 +19,11 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
-# No [project.urls]: fill in the real repository/homepage before publishing to PyPI.
+[project.urls]
+Homepage = "https://github.com/Hazer-BJTU/pyattacker"
+Repository = "https://github.com/Hazer-BJTU/pyattacker"
+Issues = "https://github.com/Hazer-BJTU/pyattacker/issues"
+Design = "https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/design.md"
 
 [project.scripts]
 pyattacker = "pyattacker.cli:main"
