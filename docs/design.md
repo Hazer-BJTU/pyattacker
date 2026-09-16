@@ -562,11 +562,13 @@ depends on them.
 * `tests/test_m2.py` — the M2 claims end to end through `Runner`: with `concurrency=1` another pipeline
   completes while one is parked for a retry (asserted from the event order, not from timing), a stopped run
   records parked pipelines as resumable, and a finished run leaves no buffered facts behind.
-* `tests/test_shard.py` — partitioning is total (every pipeline in exactly one shard), deterministic, and the
-  CLI paths agree: `--shard i/N` with explicit stores, `--shards N` spawning children, JSON summaries,
-  merged `report`/`export`, and the `ConfigError` when a shard has nowhere to write.
+* `tests/test_shard.py` — partitioning is total (every pipeline in exactly one shard), deterministic and
+  content-addressed/stable across processes, `parse_shard`/`shard_index`/`shard_env` validation, and
+  `--shards N` spawning real child processes with a retrying resource-pool pipeline merged cleanly across them.
 * `tests/test_export.py` — every row shape and every format, including the CSV `extra` column for keys that
-  appear after `header_rows`, and `merge_reports` folding duplicate `pipeline_id`s by best-state/latest-finish.
+  appear after `header_rows`, `merge_reports` folding duplicate `pipeline_id`s by best-state/latest-finish, and
+  the CLI's sharded paths: `run --shard i/N` with explicit stores, `--shards N`, JSON summaries, merged
+  `report`/`export` over shard stores, and the `ConfigError` when a shard has nowhere to write.
 * `tests/test_plugins.py` — discovery and resolution with an injected entry-point provider (no installation
   needed): built-ins win, a raising plugin is recorded instead of propagated, `use:`/`algorithm:`/store-scheme
   resolution all reach plugins.
@@ -578,10 +580,27 @@ depends on them.
   dependencies, every module imports, and every promised name is exported.
 * `tests/test_artifact.py` / `test_store.py` / `test_declarative.py` / `test_cli.py` — codecs,
   store semantics and consistency between the two stores, config parsing, CLI end to end.
+* `tests/test_errors.py` — `error_class_of`/`is_retryable_class`/`retry_after_of` as pure functions: every
+  `_STATUS_RULES` bracket, the `FatalError`/`TimeoutError`/`ConnectionError` branches, explicit `.error_class`
+  precedence, and extracting a server-suggested `retry_after` from both a direct attribute and response headers.
+* `tests/test_monitor.py` — the `watch` terminal renderer: progress-bar clamping/rounding, run-scoped vs.
+  store-wide snapshots, pool bars, and the leaked-leases/stopping indicators.
+* `tests/test_tasks.py` — `shell_run`: string vs. argv form; string commands reject `{value}` interpolation
+  outright, while argv commands pass the substituted value as one literal argument via
+  `create_subprocess_exec`, without implicit shell interpretation. (If the argv form's own command explicitly
+  invokes a shell or another interpreter, e.g. `["sh", "-c", ...]`, that interpreter's input-safety semantics
+  are the caller's responsibility — the guarantee here is "no *implicit* shell", not "safe with any program".)
+  The other built-in mock tasks are exercised incidentally wherever other test files need a stand-in task,
+  rather than in a dedicated file.
+* `tests/test_tutorial.py` — every code block in `docs/tutorial.md` marked as a complete program
+  (`# tutorial/<name>.py`) is extracted and actually run, so the tutorial cannot silently rot out of sync
+  with the real API.
 
 All time-related logic (backoff, circuit-break cooldown) goes through an injectable `Clock`, and tests use
 `tests/helpers.py::FakeClock` to turn time into a controllable variable, making them both deterministic and fast.
-The suite is 242 tests and finishes in a few seconds, so there is no excuse for not running it.
+The suite finishes in a few seconds — run `uv run pytest` to see the current count (this document intentionally
+does not hardcode it, since a specific number goes stale every time a test is added or removed) — so there is
+no excuse for not running it.
 `ruff check` is clean under the configuration in `pyproject.toml`, where every ignored rule carries a
 reason — a lint exception should be an argument, not an accident.
 

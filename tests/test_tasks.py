@@ -112,3 +112,19 @@ def test_check_raises_a_retryable_error_on_nonzero_exit():
 def test_check_false_returns_the_failed_result_instead_of_raising():
     result = _run_one(shell_run("exit 1", check=False), {"i": 0})
     assert result["returncode"] == 1
+
+
+def test_argv_command_that_itself_invokes_a_shell_is_outside_the_safety_guarantee(tmp_path):
+    """The argv form guarantees no *implicit* shell — it cannot make an explicitly-invoked
+    interpreter safe. If the caller's own program is `sh -c ...`, that shell parses the
+    substituted value (JSON-encoded, so it arrives wrapped in double quotes) as shell syntax
+    again: command substitution still expands inside double quotes, so injection is possible just
+    like the rejected string-command case. This is a documented trust boundary, not a bug:
+    shell_run has no way to make an interpreter the caller chose to launch safe against its own
+    syntax."""
+    marker = tmp_path / "pwned_via_sh_c"
+    dangerous = f"foo$(touch {marker})bar"
+    result = _run_one(shell_run(["sh", "-c", "echo {value}"]), dangerous)
+
+    assert marker.exists()  # the injected `touch` really did run — the guarantee does not cover this
+    assert result["returncode"] == 0

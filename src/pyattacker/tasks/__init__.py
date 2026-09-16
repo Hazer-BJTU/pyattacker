@@ -279,6 +279,12 @@ def shell_run(
     when you need actual shell features (pipes, globbing, redirection, `&&`). Because of the
     above, a string command may **not** reference ``{value}`` at all — constructing one that does
     raises :class:`ConfigError` immediately, rather than silently running something unsafe.
+
+    The guarantee is "no *implicit* shell for the argv form", not "safe with any program": if an
+    argv command's own program is itself a shell or another interpreter (e.g.
+    ``["sh", "-c", "echo {value}"]``), that interpreter will parse the substituted argument as its
+    own syntax, and the usual injection risk applies again — that interpreter's input-safety rules
+    are then the caller's responsibility, not something this function can enforce.
     """
     # A literal substring check, not str.format()/Formatter parsing: neither a string command nor
     # an argv element should have to avoid unrelated brace syntax (a jq filter, a Python literal)
