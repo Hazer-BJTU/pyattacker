@@ -43,7 +43,14 @@ from .artifact import (
     CodecRegistry,
     digest_of,
 )
-from .errors import ConfigError, LeaseLeakError, PyAttackerError, error_class_of, retry_after_of
+from .errors import (
+    ConfigError,
+    LeaseLeakError,
+    PyAttackerError,
+    StoreUnavailable,
+    error_class_of,
+    retry_after_of,
+)
 from .pipeline import PipelineSpec
 from .resource import Bus, Pool, ResourceEvent
 from .scheduler import DelayQueue
@@ -293,6 +300,7 @@ class Runner:
         self._delays: DelayQueue[_RunState] = DelayQueue(clock=self.clock, name="retry")
         self._all_done: asyncio.Event | None = None
         self._hard_stop = False  # set when the caller cancelled us: do not wait for in-flight work
+        self._fatal_error: BaseException | None = None  # set when the store itself becomes untrustworthy
         self._live: dict[str, Any] = {"running": 0, "started_at": None}
 
     # ------------------------------------------------------------- pool wiring
@@ -397,6 +405,7 @@ class Runner:
         self._delays = DelayQueue(clock=self.clock, name="retry")
         self._all_done = asyncio.Event()
         self._hard_stop = False
+        self._fatal_error = None
         for pool in self.pools.values():
             pool.reset_waiters()
         self._live["started_at"] = started
@@ -481,6 +490,12 @@ class Runner:
                     restore_signals()
                 self._finalize_pools()
 
+        if self._fatal_error is not None:
+            # The store itself failed while recovering from an earlier framework surprise -- its
+            # durability guarantees are no longer trustworthy, so skip the normal finalization
+            # (finish_run/emit/stats all talk to that same store) and fail loudly and immediately
+            # instead of returning a report that might be built on an inconsistent read.
+            raise self._fatal_error
         ended = self.clock.now()
         status = "interrupted" if self._stopping.is_set() else "completed"
         self.store.finish_run(rid, status, ended_at=time.time())  # flushes first (write-behind)
@@ -630,6 +645,7 @@ class Runner:
             try:
                 if item is None:
                     return
+                state = None
                 self._live["running"] += 1
                 try:
                     # The queue carries two shapes: fresh PipelineSpec objects from the producer,
@@ -644,14 +660,88 @@ class Runner:
             except Exception as exc:  # framework-level surprise: record it, don't take down the run
                 self._counters["pipelines_failed"] += 1
                 self._counters["pipelines_done"] += 1
+                tb = tb_mod.format_exc()
+                try:
+                    pipeline_id = self._finish_pipeline_after_internal_error(item, state, exc, run_id, tb)
+                except Exception as recovery_exc:
+                    # The recovery path itself talks to the store (get_pipeline/upsert_pipeline/
+                    # finish_pipeline); if *that* fails too, the run's durability guarantees can
+                    # no longer be trusted. The original bug this whole path exists to prevent
+                    # was "an exception raised while handling an exception kills this worker
+                    # silently, and asyncio.gather(..., return_exceptions=True) at shutdown never
+                    # tells anyone" -- swallowing recovery_exc here would just reintroduce that
+                    # one level deeper. So this is deliberately fatal and explicit: stop the run
+                    # hard (do not wait for other in-flight work) and let run_async re-raise a
+                    # clear StoreUnavailable instead of hanging or silently losing this worker.
+                    self._fatal_error = StoreUnavailable(
+                        f"could not persist internal-error recovery for a pipeline: "
+                        f"{type(recovery_exc).__name__}: {recovery_exc}"
+                    )
+                    self._hard_stop = True
+                    self.stop("store_unavailable")
+                    self._check_all_done()
+                    raise
                 self._check_all_done()
                 self._emit(
                     "runner.internal_error",
-                    pipeline_id=getattr(state, "pipeline_id", None),
-                    data={"error": f"{type(exc).__name__}: {exc}", "traceback": tb_mod.format_exc()},
+                    pipeline_id=pipeline_id,
+                    data={"error": f"{type(exc).__name__}: {exc}", "traceback": tb},
                 )
             finally:
                 queue.task_done()
+
+    def _finish_pipeline_after_internal_error(
+        self, item: Any, state: "_RunState | None", exc: Exception, run_id: str, tb: str
+    ) -> str | None:
+        """Give a framework-level surprise the same terminal representation a task failure gets.
+
+        The worker's counters (``pipelines_failed``/``pipelines_done``) already treat this
+        pipeline as terminally failed; the persisted row must agree, or the final report (and
+        the CLI's exit code, which reads the persisted failed-count) can disagree with the
+        scheduler and silently call the run a success. Two shapes reach here:
+        ``state`` already exists (``_drive`` raised mid-flight — its row is durable, just still
+        ``"running"``), or it does not (``_open_pipeline`` itself raised, possibly before ever
+        calling ``upsert_pipeline``) — in which case a row is created first so the pipeline does
+        not simply vanish from the report.
+        """
+        if state is not None:
+            self.store.finish_pipeline(
+                state.pipeline_id,
+                "failed",
+                n_tasks_done=state.record.n_tasks_done,
+                error=exc,
+                failed_task=state.task_spec.name,
+                traceback=tb,
+            )
+            return state.pipeline_id
+        if not isinstance(item, PipelineSpec):
+            return None  # nothing identifiable to attach the failure to
+        # `state is None` only means _open_pipeline() never *returned* a _RunState -- it may
+        # already have restored an existing checkpoint (record.n_tasks_done) before raising,
+        # possibly before it ever reassigns record.run_id to the *current* run. Preserve the
+        # checkpoint either way (never rewind n_tasks_done back to 0 for an existing row), but
+        # always rebind run_id to this run: the final report is scoped by run_id (self.store
+        # .stats(run_id)), so a failure left attached to a stale run_id would silently vanish
+        # from the report of the run that actually encountered it.
+        record = self.store.get_pipeline(item.pipeline_id)
+        if record is None:
+            record = PipelineRecord(
+                pipeline_id=item.pipeline_id,
+                run_id=run_id,
+                name=item.name,
+                key=item.key,
+                tags=dict(item.template.tags),
+                n_tasks_total=item.n_tasks,
+                seed_digest=item.seed_digest,
+                spec_digest=item.spec_digest,
+                state="running",
+                started_at=time.time(),
+            )
+        else:
+            record.run_id = run_id
+        self.store.upsert_pipeline(record)
+        self.store.finish_pipeline(item.pipeline_id, "failed", error=exc, traceback=tb)
+        return item.pipeline_id
 
     # ------------------------------------------------------- pipeline execution
     def _open_pipeline(self, spec: PipelineSpec, run_id: str) -> _RunState | None:

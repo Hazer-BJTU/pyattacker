@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import textwrap
 from pathlib import Path
+from typing import ClassVar
 
 from pyattacker.cli import main
 
@@ -239,3 +240,159 @@ def test_config_errors_return_exit_code_two(tmp_path, capsys):
     )
     assert main(["run", "-c", str(no_use)]) == 2  # it fails during load_spec, so it never actually starts
     assert "use" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------- watch
+
+
+def test_watch_reads_an_existing_store_a_bounded_number_of_times(tmp_path, capsys):
+    rc, db = _run_demo(tmp_path, pipelines=4, fail_rate=0.0, db_name="watch.db")
+    assert rc == 0
+    capsys.readouterr()  # discard the demo run's own summary() output
+
+    rc = main(["watch", str(db), "--interval", "0", "--iterations", "2", "--no-clear"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.count("succeeded=4") == 2  # one render per iteration
+    assert "in-flight=0" in out
+
+
+def test_watch_missing_store_returns_config_error(tmp_path, capsys):
+    missing = tmp_path / "nope.db"
+
+    rc = main(["watch", str(missing), "--iterations", "1"])
+
+    assert rc == 2
+    assert "Config error" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------- plugins
+
+
+def test_plugins_reports_none_installed_by_default(capsys):
+    rc = main(["plugins"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no plugins installed" in out
+    assert "pyattacker.tasks" in out
+
+
+def test_plugins_json_output_is_parseable(capsys):
+    rc = main(["plugins", "--json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"plugins": [], "errors": {}}
+
+
+# ------------------------------------------------------------------------ serve
+
+
+class _FakeStatsServer:
+    """Records the wiring _cmd_serve does, without ever binding a real socket."""
+
+    instances: ClassVar[list["_FakeStatsServer"]] = []
+
+    def __init__(self, store, *, host="127.0.0.1", port=8787, run_id=None, errors=10):
+        self.store_spec = store
+        self.host = host
+        self.port = port
+        self.run_id = run_id
+        self.errors = errors
+        self.calls: list[str] = []
+        self.url = f"http://{host}:{port}"
+        type(self).instances.append(self)
+
+    def start(self):
+        self.calls.append("start")
+        return self
+
+    def wait(self):
+        self.calls.append("wait")
+
+    def stop(self):
+        self.calls.append("stop")
+
+
+def test_serve_wires_argparse_options_into_the_stats_server(tmp_path, capsys, monkeypatch):
+    """Through the real CLI entry point: verifies _cmd_serve's own wiring (host/port/run_id ->
+    StatsServer, and the start/wait/stop lifecycle), not just that StatsServer itself works.
+    """
+    rc, db = _run_demo(tmp_path, pipelines=3, fail_rate=0.0, db_name="serve.db")
+    assert rc == 0
+
+    _FakeStatsServer.instances = []
+    monkeypatch.setattr("pyattacker.cli.StatsServer", _FakeStatsServer)
+
+    rc = main(
+        [
+            "serve",
+            str(db),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "12345",
+            "--run-id",
+            "some-run",
+        ]
+    )
+
+    assert rc == 0
+    assert len(_FakeStatsServer.instances) == 1
+    fake = _FakeStatsServer.instances[0]
+    assert fake.store_spec == str(db)
+    assert fake.host == "127.0.0.1"
+    assert fake.port == 12345
+    assert fake.run_id == "some-run"
+    assert fake.calls == ["start", "wait", "stop"]
+
+    out = capsys.readouterr().out
+    assert f"serving {db} at {fake.url}" in out
+    assert f"{fake.url}/stats" in out
+
+
+def test_serve_binds_the_requested_port_and_stops_cleanly(tmp_path, capsys):
+    rc, db = _run_demo(tmp_path, pipelines=3, fail_rate=0.0, db_name="serve.db")
+    assert rc == 0
+
+    from pyattacker.server import StatsServer
+
+    # a real StatsServer, exercised the same way (start/fetch/stop), independent of _cmd_serve's own wiring
+    server = StatsServer(str(db), host="127.0.0.1", port=0).start()
+    try:
+        assert server.port > 0
+        import urllib.request
+
+        with urllib.request.urlopen(f"{server.url}/healthz", timeout=5.0) as response:
+            assert response.status == 200
+    finally:
+        server.stop()
+
+
+def test_serve_missing_store_returns_config_error(tmp_path, capsys):
+    missing = tmp_path / "nope.db"
+
+    rc = main(["serve", str(missing), "--port", "0"])
+
+    assert rc == 2
+    assert "Config error" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------- --progress
+
+
+def test_run_with_progress_flag_completes_without_error(tmp_path, capsys):
+    """``--progress`` opens a second read-only connection to the same store from a background
+    thread while the run is in flight; it must not raise and must not stop the run from finishing.
+    """
+    cfg = _write_config(tmp_path, "spec.yaml", VALID_CONFIG)
+    db = tmp_path / "progress.db"
+
+    rc = main(["run", "-c", str(cfg), "--store", str(db), "--progress"])
+
+    assert rc == 0
+    assert db.exists()
+    err = capsys.readouterr().err
+    assert "Traceback" not in err

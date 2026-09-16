@@ -26,6 +26,7 @@ __all__ = [
     "FatalError",
     "BudgetExceeded",
     "RunInterrupted",
+    "StoreUnavailable",
     "ERROR_CLASSES",
     "error_class_of",
     "retry_after_of",
@@ -109,6 +110,16 @@ class BudgetExceeded(PyAttackerError):
 
 class RunInterrupted(PyAttackerError):
     """The run was interrupted from outside (SIGINT / Runner.stop)."""
+
+
+class StoreUnavailable(PyAttackerError):
+    """The store itself failed while the framework was trying to record a terminal state.
+
+    Raised when even the internal-error recovery path (persisting a pipeline as ``failed``
+    after a framework-level surprise) cannot reach the store: at that point the run's own
+    durability guarantees can no longer be trusted, so the run stops instead of continuing on
+    unrecorded state.
+    """
 
 
 # --------------------------------------------------------------------------

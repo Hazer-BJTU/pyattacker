@@ -9,6 +9,9 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+from helpers import run
+
 from pyattacker import (
     FatalError,
     Pool,
@@ -16,6 +19,7 @@ from pyattacker import (
     RetryableError,
     Retrying,
     Runner,
+    StoreUnavailable,
     pipeline,
     task,
 )
@@ -296,6 +300,250 @@ def test_unknown_pool_fails_fast_without_running_task():
     row = next(iter(runner.store.export_rows()))
     assert row["error_type"] == "ConfigError"
     assert len(runner.store.attempts()) == 0  # not even an attempt should exist
+
+
+# --------------------------------------------------------------- internal errors
+def test_worker_records_internal_error_and_keeps_the_run_going():
+    """A framework-level surprise (not a task exception) must be recorded, not swallow the worker.
+
+    Regression: ``_worker``'s except-block read ``state`` to fill in ``pipeline_id`` on the
+    ``runner.internal_error`` event, but when the very first call inside the try (opening the
+    pipeline) is what raises, ``state`` was never assigned — the ``getattr(state, ...)`` then
+    raised ``UnboundLocalError`` *inside the exception handler itself*. That second exception
+    escaped ``_worker`` entirely; ``asyncio.gather(..., return_exceptions=True)`` swallowed it
+    silently, the worker task simply died, and with ``concurrency=1`` the run hung forever
+    waiting for a queue nothing was draining anymore.
+    """
+
+    async def _case():
+        runner = Runner(store=":memory:", concurrency=1, handle_signals=False)
+        calls = {"n": 0}
+        real_open = runner._open_pipeline
+
+        def flaky_open(spec, run_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("framework surprise")
+            return real_open(spec, run_id)
+
+        runner._open_pipeline = flaky_open
+        spec = pipeline("internal-error", flaky(0))
+        failing = next(iter(spec.map([{"i": 0}])))
+        report = await asyncio.wait_for(
+            runner.run_async(spec.map([{"i": 0}, {"i": 1}])), timeout=5.0
+        )
+
+        # the second pipeline still ran to completion: one worker dying does not take the run down.
+        # the first pipeline reaches a real terminal "failed" row, matching the scheduler's own
+        # pipelines_failed/pipelines_done counters -- it does not just vanish from the report.
+        assert report.stats["pipelines"]["by_state"] == {"succeeded": 1, "failed": 1}
+        record = runner.store.get_pipeline(failing.pipeline_id)
+        assert record.state == "failed"
+        assert record.error_type == "RuntimeError"
+        assert record.error_message == "framework surprise"
+
+        events = runner.store.events(limit=50)
+        internal = [e for e in events if e.kind == "runner.internal_error"]
+        assert len(internal) == 1
+        assert internal[0].pipeline_id == failing.pipeline_id  # identity preserved even though
+        # _open_pipeline raised before ever returning a _RunState for it
+        assert internal[0].data["error"] == "RuntimeError: framework surprise"
+        assert "Traceback" in internal[0].data["traceback"]
+
+    run(_case())
+
+
+def test_internal_error_after_state_exists_marks_the_pipeline_failed():
+    """Once ``state`` is bound, the persisted row must move out of "running" too.
+
+    Regression: the scheduler already counts this pipeline as failed+done, but the earlier fix
+    left the SQLite/Memory row itself stuck at ``state="running"`` forever -- an inconsistency
+    that would let the CLI report success (it reads the persisted failed count) even though the
+    scheduler had already decided the run contains a failure.
+    """
+
+    async def _case():
+        runner = Runner(store=":memory:", concurrency=1, handle_signals=False)
+
+        async def boom_drive(state):
+            raise RuntimeError("drive exploded")
+
+        runner._drive = boom_drive
+        spec = pipeline("internal-error-2", flaky(0))
+        failing = next(iter(spec.map([{"i": 0}])))
+        report = await asyncio.wait_for(runner.run_async(spec.map([{"i": 0}])), timeout=5.0)
+
+        assert report.stats["pipelines"]["by_state"] == {"failed": 1}
+        record = runner.store.get_pipeline(failing.pipeline_id)
+        assert record.state == "failed"
+        assert record.error_type == "RuntimeError"
+        assert record.error_message == "drive exploded"
+
+        events = runner.store.events(limit=50)
+        internal = next(e for e in events if e.kind == "runner.internal_error")
+        assert internal.pipeline_id == failing.pipeline_id
+        assert internal.data["error"] == "RuntimeError: drive exploded"
+
+    run(_case())
+
+
+def test_internal_error_report_never_looks_like_success():
+    """End-to-end version of the same guarantee, through the CLI's own success criterion.
+
+    ``_cmd_run`` returns exit code 1 whenever the persisted failed-pipeline count is nonzero;
+    this proves that count is nonzero after a framework-level (not task-level) failure, so a
+    caller relying on the exit code cannot be fooled into thinking the run fully succeeded.
+    """
+
+    async def _case():
+        runner = Runner(store=":memory:", concurrency=1, handle_signals=False)
+
+        def boom_open(spec, run_id):
+            raise RuntimeError("framework surprise")
+
+        runner._open_pipeline = boom_open
+        spec = pipeline("internal-error-3", flaky(0))
+        report = await asyncio.wait_for(runner.run_async(spec.map([{"i": 0}])), timeout=5.0)
+
+        failed = report.stats.get("pipelines", {}).get("by_state", {}).get("failed", 0)
+        assert failed == 1  # what _cmd_run checks to decide between exit code 0 and 1
+
+    run(_case())
+
+
+def test_internal_error_during_resume_does_not_roll_back_the_checkpoint():
+    """``state is None`` in the exception handler does not mean nothing was persisted yet.
+
+    Regression: ``_open_pipeline`` restores an existing checkpoint and re-persists it
+    (``record.n_tasks_done = start_index`` -> ``upsert_pipeline``) *before* it can still raise
+    later (e.g. in ``_pool_problem`` or artifact I/O) without ever returning a ``_RunState``. The
+    original internal-error fix unconditionally wrote ``n_tasks_done=0`` in that case, silently
+    rewinding a durable checkpoint back to the start and making a later resume re-run tasks that
+    had already completed successfully -- a violation of the task-level checkpoint guarantee.
+    """
+    CALLS.update(fetch=0, ask=0)
+    BEHAVIOR["ask_fails"] = True
+    runner = Runner(store=":memory:", concurrency=1, handle_signals=False)
+    spec = next(iter(TEMPLATE.map([{"q": "checkpoint-test"}])))
+
+    first = runner.run([spec])
+    assert first.stats["pipelines"]["by_state"] == {"failed": 1}
+    record = runner.store.get_pipeline(spec.pipeline_id)
+    assert record.state == "failed"
+    assert record.n_tasks_done == 1  # r.fetch's output is checkpointed; only r.ask failed
+
+    def boom_pool_problem(_spec):
+        raise RuntimeError("framework surprise, after the resumed checkpoint was re-persisted")
+
+    runner._pool_problem = boom_pool_problem
+    second = runner.run([spec], resume=True)
+
+    assert second.stats["pipelines"]["by_state"] == {"failed": 1}
+    resumed_record = runner.store.get_pipeline(spec.pipeline_id)
+    assert resumed_record.state == "failed"
+    assert resumed_record.n_tasks_done == 1  # ★ preserved, not rewound to 0
+    events = runner.store.events(pipeline_id=spec.pipeline_id, limit=200)
+    assert any(e.kind == "runner.internal_error" for e in events)
+
+    # a further resume continues past the checkpoint instead of re-running r.fetch
+    del runner._pool_problem
+    BEHAVIOR["ask_fails"] = False
+    CALLS.update(fetch=0, ask=0)
+    third = runner.run([spec], resume=True)
+    assert third.stats["pipelines"]["by_state"] == {"succeeded": 1}
+    assert CALLS["fetch"] == 0  # r.fetch was not re-run: its checkpoint survived the internal error
+    assert CALLS["ask"] == 1
+
+
+def test_internal_error_during_checkpoint_restore_reattributes_to_the_current_run():
+    """A framework failure *before* ``_open_pipeline`` rebinds ``record.run_id`` must still land
+    on the current run, not the stale run that originally produced the checkpoint.
+
+    Regression: an earlier fix preserved ``n_tasks_done`` on the existing row, but did nothing
+    about ``record.run_id`` -- if the failure happens before ``_open_pipeline`` ever reaches
+    ``record.run_id = run_id`` (e.g. inside ``get_artifact`` while restoring the checkpoint), the
+    row's ``run_id`` is left pointing at the *previous* run. Since the final report is scoped by
+    ``store.stats(run_id)``, that failure would silently disappear from the resume run's own
+    report even though the scheduler counted it as failed.
+    """
+    CALLS.update(fetch=0, ask=0)
+    BEHAVIOR["ask_fails"] = True
+    runner = Runner(store=":memory:", concurrency=1, handle_signals=False)
+    spec = next(iter(TEMPLATE.map([{"q": "checkpoint-restore-test"}])))
+
+    first = runner.run([spec])
+    assert first.stats["pipelines"]["by_state"] == {"failed": 1}
+    record = runner.store.get_pipeline(spec.pipeline_id)
+    assert record.state == "failed"
+    assert record.n_tasks_done == 1
+    run_a = record.run_id
+
+    real_get_artifact = runner.store.get_artifact
+
+    def boom_get_artifact(pipeline_id, seq):
+        if pipeline_id == spec.pipeline_id and seq == 0:  # the checkpoint-restore call specifically
+            raise RuntimeError("framework surprise, before record.run_id was rebound")
+        return real_get_artifact(pipeline_id, seq)
+
+    runner.store.get_artifact = boom_get_artifact
+    second = runner.run([spec], resume=True)
+    run_b = second.run_id
+    assert run_b != run_a
+
+    assert second.stats["pipelines"]["by_state"] == {"failed": 1}  # ★ visible in run B's own report
+    resumed_record = runner.store.get_pipeline(spec.pipeline_id)
+    assert resumed_record.state == "failed"
+    assert resumed_record.n_tasks_done == 1  # checkpoint still preserved
+    assert resumed_record.run_id == run_b  # ★ reattributed to the run that hit the failure
+
+    # a further resume still continues past the checkpoint
+    runner.store.get_artifact = real_get_artifact
+    BEHAVIOR["ask_fails"] = False
+    CALLS.update(fetch=0, ask=0)
+    third = runner.run([spec], resume=True)
+    assert third.stats["pipelines"]["by_state"] == {"succeeded": 1}
+    assert CALLS["fetch"] == 0
+    assert CALLS["ask"] == 1
+
+
+def test_internal_error_recovery_itself_failing_stops_the_run_instead_of_hanging():
+    """A double failure (the recovery path's own store calls also raise) must not reproduce the
+    original bug this whole recovery path exists to fix: an exception inside the exception
+    handler killing the worker silently, with the queue never draining at concurrency=1.
+
+    Regression: ``_finish_pipeline_after_internal_error`` talks to the store
+    (get_pipeline/upsert_pipeline/finish_pipeline); if any of those calls also raise, the new
+    exception previously propagated straight out of ``_worker`` uncaught -- the worker task died,
+    ``asyncio.gather(..., return_exceptions=True)`` at shutdown swallowed it, and with
+    concurrency=1 and more than one admitted pipeline the run hung forever
+    (pipelines_done < pipelines_admitted, nothing left to drain the queue).
+
+    The fix treats a failing recovery as fatal and deterministic: it hard-stops the run and
+    ``run_async`` raises a clear ``StoreUnavailable`` instead of hanging or losing the worker
+    silently.
+    """
+
+    async def _case():
+        runner = Runner(store=":memory:", concurrency=1, handle_signals=False)
+
+        def boom_open(spec, run_id):
+            raise RuntimeError("framework surprise")
+
+        def boom_get_pipeline(pipeline_id):
+            raise RuntimeError("store is also broken during recovery")
+
+        runner._open_pipeline = boom_open
+        runner.store.get_pipeline = boom_get_pipeline
+
+        spec = pipeline("double-fail", flaky(0))
+        # two admitted pipelines at concurrency=1: with the old bug, the first one's worker dies
+        # and the second is left stranded in the queue forever
+        with pytest.raises(StoreUnavailable, match="store is also broken during recovery"):
+            await asyncio.wait_for(
+                runner.run_async(spec.map([{"i": 0}, {"i": 1}])), timeout=5.0
+            )
+
+    run(_case())
 
 
 def test_events_form_a_structured_per_pipeline_log():

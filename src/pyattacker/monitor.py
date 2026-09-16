@@ -21,7 +21,7 @@ _EMPTY = "·"
 def _bar(value: int, total: int, width: int = 20) -> str:
     if total <= 0:
         return _EMPTY * width
-    filled = round(width * value / total)
+    filled = max(0, min(width, round(width * value / total)))
     return _BAR * filled + _EMPTY * (width - filled)
 
 
