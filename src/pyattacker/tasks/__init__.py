@@ -14,7 +14,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
-from ..errors import FatalError, RetryableError
+from ..errors import ConfigError, FatalError, RetryableError
 from ..task import Retrying, TaskSpec, build_task_spec, task
 
 __all__ = [
@@ -259,13 +259,50 @@ def shell_run(
     check: bool = True,
     name: str | None = None,
 ) -> TaskSpec:
-    """Run a subprocess (standard library) and return stdout/stderr as the result."""
+    """Run a subprocess (standard library) and return stdout/stderr as the result.
+
+    **Use the argv form to pass ``value`` to the command** —
+    ``command=["python", "postprocess.py", "--input", "{value}"]`` — which runs via
+    ``create_subprocess_exec`` and never involves a shell: the literal substring ``"{value}"`` in
+    each argv element is replaced with the upstream artifact (JSON-encoded), so it reaches the
+    child process as one literal argument no matter what characters it contains. The replacement
+    is a plain substring swap, not ``str.format()`` — other braces in an argument (a ``jq``
+    filter, a Python dict literal) are left alone and are never treated as placeholders. This is
+    required whenever ``value`` comes from an untrusted source (model/judge output, external
+    data), which is the common case in evaluation pipelines — no quoting scheme applied to a
+    single substitution can make it safe to insert into an arbitrary shell-syntax position
+    (unquoted, inside ``'...'``, inside ``"..."``, inside command substitution, ...), because that
+    safety depends on *where* in the template the substitution lands, which is up to whoever
+    wrote the template.
+
+    A plain string ``command`` is run through the system shell (``create_subprocess_shell``) for
+    when you need actual shell features (pipes, globbing, redirection, `&&`). Because of the
+    above, a string command may **not** reference ``{value}`` at all — constructing one that does
+    raises :class:`ConfigError` immediately, rather than silently running something unsafe.
+    """
+    # A literal substring check, not str.format()/Formatter parsing: neither a string command nor
+    # an argv element should have to avoid unrelated brace syntax (a jq filter, a Python literal)
+    # just because the framework also uses braces for its one placeholder.
+    if isinstance(command, str) and "{value}" in command:
+        raise ConfigError(
+            "shell_run: a string command may not interpolate {value} — there is no shell quoting "
+            "rule that stays safe regardless of where in the template the substitution lands. "
+            "Use the argv form instead: command=[..., '{value}', ...], which passes value as one "
+            "literal argument via create_subprocess_exec (no shell involved)."
+        )
 
     async def _impl(value: Any, ctx: Any) -> Any:
-        cmd = command.format(value=json.dumps(value, default=str)) if isinstance(command, str) else command
-        proc = await asyncio.create_subprocess_shell(
-            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
+        if isinstance(command, str):
+            cmd: str | list[str] = command
+            proc = await asyncio.create_subprocess_shell(
+                cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+        else:
+            encoded = json.dumps(value, default=str)
+            cmd = [part.replace("{value}", encoded) for part in command]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout_s)
         except TimeoutError:
