@@ -97,9 +97,14 @@ class TaskSpec:
             compatibility check at pipeline-build time — not enforced at runtime.
         takes_ctx: Whether ``fn`` takes a second ``(value, ctx)`` parameter; inferred from ``fn``'s
             positional-parameter count when the spec is built.
-        module / qualname / code_digest: Identify *this exact version* of the task's code; folded
-            into the pipeline's ``spec_digest`` so that changing a task's source invalidates old
-            checkpoints instead of silently reusing them (see ``pipeline.py`` module docstring).
+        module / qualname / code_digest: Normally identify this exact version of the task's code
+            (folded into the pipeline's ``spec_digest`` so that changing a task's source
+            invalidates old checkpoints instead of silently reusing them — see ``pipeline.py``
+            module docstring). Two things weaken that guarantee: ``pipeline(..., include_code=
+            False)`` drops ``code_digest`` from the fingerprint entirely, and when ``fn``'s
+            source cannot be inspected (e.g. dynamically defined), ``code_digest`` falls back to
+            digesting ``module:qualname``, which does not distinguish different implementations
+            behind the same name.
     """
 
     name: str

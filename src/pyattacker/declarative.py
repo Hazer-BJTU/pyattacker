@@ -225,7 +225,10 @@ class DeclarativeSpec:
             maps it onto :class:`~pyattacker.runner.RunConfig` fields.
         source: The raw ``source:`` section describing how to generate seeds (``kind``/``repeats``/
             ``key_field`` plus factory-specific keys); consumed by :meth:`seeds`/:meth:`pipelines`.
-        raw: The fully ``${VAR}``-expanded config, kept for :meth:`describe` and debugging.
+        raw: The config with ``${VAR}`` references expanded where resolvable; in non-strict mode
+            an unresolved reference is left as the literal ``${VAR}`` placeholder rather than
+            raising (see :func:`expand_env`) — this is *not* guaranteed to be fully expanded.
+            Kept for :meth:`describe` and debugging.
         unresolved_env: Names of ``${VAR}`` references that had no default and no environment
             value (only populated when ``load_spec`` was *not* called with ``strict_env=True``,
             since strict mode raises instead of collecting them).

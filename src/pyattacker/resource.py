@@ -9,8 +9,11 @@ Core invariants (must be preserved):
    interrupted by cancellation**. Task failure/cancellation/timeout never
    prevents a resource from being returned.
 3. A lease can be returned only once; returning it again is a harmless no-op.
-4. Every pool state change emits a :class:`ResourceEvent`, which feeds all of:
-   waiters, subscribers, the database event table, and monitoring snapshots.
+4. Every *explicit* pool mutation (add/revoke/lease/release/report/degrade) emits a
+   :class:`ResourceEvent`, which feeds all of: waiters, subscribers, the database event table,
+   and monitoring snapshots. The one exception is the lazy ``DEGRADED -> READY`` transition on
+   cooldown expiry (``_Slot.state_at``), which is a read-time recomputation, not a mutation
+   anyone actively performed, and does not emit an event.
 
 Publish/subscribe and acquire are two separate channels:
 * **pull**: ``await pool.acquire(...)`` —— wait + lease.
@@ -54,10 +57,14 @@ class ResourceState(str, Enum):
 
 @dataclass
 class ResourceStats:
-    """Running counters for one :class:`Resource` inside a pool. All fields are cumulative for the pool's lifetime.
+    """Running counters for one :class:`Resource` inside a pool.
+
+    Most fields are cumulative totals for the pool's lifetime (``leases``, ``ok``, ``failed``,
+    ``leaked``, ``waits``, ``wait_ms_total``, ``degraded_count``); a few are current-state instead
+    (``active``, ``consecutive_failures``, ``latency_ms_ema``, ``last_used_at``) — see each below.
 
     Attributes:
-        active: Leases currently held (0 <= active <= resource.capacity).
+        active: Leases currently held right now (0 <= active <= resource.capacity), not cumulative.
         leases: Total leases ever handed out.
         ok / failed: Outcomes reported via ``lease.report(ok=...)``.
         leaked: Leases force-reclaimed because a task ended without releasing them.
@@ -281,8 +288,9 @@ class Pool:
     """A group of like resources + a default acquire algorithm + a state event stream.
 
     Invariants: see the module docstring — every state change here is synchronous and
-    single-threaded-safe, every lease is returned exactly once, and every state change emits a
-    :class:`ResourceEvent`.
+    single-threaded-safe, every lease is returned exactly once, and every explicit mutation emits
+    a :class:`ResourceEvent` (the lazy cooldown-expiry transition is the one exception — see the
+    module docstring).
 
     Collaborators: :class:`Lease` (what ``acquire``/``select``/``try_acquire`` hand back),
     :class:`~pyattacker.algorithm.AcquireAlgorithm` (the pluggable "how to wait" strategy that

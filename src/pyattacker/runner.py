@@ -89,8 +89,10 @@ class RunConfig:
     """Everything that shapes one call to :meth:`Runner.run`/``run_async``.
 
     Invariants:
-    * Fully immutable-in-spirit: ``Runner.__init__`` only ever reads a snapshot of this via
-      ``dataclasses.replace`` when overrides are passed; it does not mutate a shared instance.
+    * Not mutated by ``Runner``: overrides go through ``dataclasses.replace``, producing a new
+      instance rather than changing the one passed in. That said, this is a plain mutable
+      dataclass — nothing stops a caller from mutating a shared instance themselves, so treat it
+      as owned by the ``Runner`` once passed in.
 
     Attributes:
         store: Where state lives — ``":memory:"``, a sqlite path, a store plugin URI, or an
@@ -100,8 +102,10 @@ class RunConfig:
         concurrency: Max attempts in flight at once — not max pipelines in flight, since a
             pipeline waiting out a retry backoff is parked and does not occupy a worker slot.
         run_id: Explicit run id; default is a timestamp+digest string.
-        resume: When true, ``interrupt_stale`` runs first and ``_open_pipeline`` restores any
-            existing checkpoint instead of starting from the seed.
+        resume: When true, ``run_async`` calls ``interrupt_stale`` before scheduling, so pipelines
+            abandoned by a dead run become resumable. It does *not* gate checkpoint restoration
+            itself: ``_open_pipeline`` restores an existing ``failed``/``interrupted`` pipeline's
+            checkpoint unconditionally, based on the stored record alone.
         retry_succeeded: When true, re-run pipelines already marked ``"succeeded"`` instead of
             skipping them (for re-evaluation passes over the same store).
         heartbeat_s: How often the run's heartbeat is written; drives ``stale_after_s`` staleness
@@ -114,7 +118,9 @@ class RunConfig:
         stop_after_failures / stop_after_s: Optional run-level budgets; once hit, the run stops
             admitting new pipelines and drains in-flight ones.
         handle_signals: Install SIGINT/SIGTERM handlers that call ``Runner.stop`` (main thread only).
-        seed: Mixed into the deterministic per-attempt RNG seed alongside pipeline id/seq/attempt.
+        seed: Currently unused by the scheduler — the per-attempt RNG is derived purely from
+            ``pipeline_id``/``seq``/``attempts_used`` (see ``Runner._execute_task``), not from
+            this field. Reserved for a future run-level seed mix-in.
         write_behind: ``None`` (auto) batches append-only facts (attempts + events) for file-backed
             stores only; state writes (pipelines/tasks) are always synchronous. See
             ``store/writebehind.py`` for the failure model of a batched write.
@@ -161,7 +167,9 @@ class RunReport:
 
     Attributes:
         run_id: The id this run was recorded under.
-        status: ``"completed"`` or ``"interrupted"`` (a stop condition, signal, or cancellation).
+        status: ``"completed"`` or ``"interrupted"`` (a stop condition or a SIGINT/SIGTERM signal).
+            An outer ``asyncio.CancelledError`` (the caller cancelling the ``run_async`` task
+            itself) is re-raised instead — that path never returns a ``RunReport`` at all.
         duration_ms: Wall-clock duration of the run loop (not counting store teardown).
         stats: The store's aggregate view for this run — pipeline/task counts by state, latency
             percentiles, etc. (see ``Store.stats``); this is what :meth:`to_dict` flattens.

@@ -49,8 +49,9 @@ class RunRecord:
             a stale heartbeat to detect an abandoned run (see ``interrupt_stale``).
         spec_digest: Digest of the run's ``meta`` config, for distinguishing otherwise-identical runs.
         code_version: The ``pyattacker`` package version that produced this run.
-        resume_of: run_id this run resumed from, when this run was started with ``resume=True``
-            and picked up an existing run's state; ``None`` for a fresh run.
+        resume_of: Reserved for run-level provenance; not currently set by ``Runner.run_async``
+            (which always constructs a fresh ``RunRecord`` without it). The actual "resumed from"
+            provenance tracked today lives per-pipeline, on ``PipelineRecord.resume_of``.
     """
 
     run_id: str
@@ -78,12 +79,13 @@ class PipelineRecord:
     ``Runner._open_pipeline``).
 
     Attributes:
-        pipeline_id: Content-addressed id (task-chain fingerprint + seed + repeat index); stable
-            across resumes/re-runs of the same logical pipeline.
+        pipeline_id / key: The pipeline's stable logical identity; ``PipelineTemplate.bind``
+            always assigns the same value to both, so ``key == pipeline_id`` always holds. That
+            value is content-addressed (task-chain fingerprint + seed + repeat index) by default,
+            or caller-defined when an explicit ``key_of`` was supplied to ``template.map`` — in
+            which case ``pipeline_id`` is no longer content-addressed either.
         run_id: The run currently "owning" this row — rebound on every resume to whichever run is
             touching it now, since stats/reports are scoped by run_id.
-        key: The pipeline's dedup key (usually equal to ``pipeline_id`` unless an explicit
-            ``key_of`` was supplied to ``template.map``).
         n_tasks_total / n_tasks_done: Total tasks in the chain / tasks completed so far — the
             resume cursor described above.
         seed_digest: Digest of the encoded seed value, for detecting a changed seed.
