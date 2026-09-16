@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from helpers import run
+from helpers import FakeClock, run
 
 from pyattacker import (
     Backoff,
@@ -415,6 +415,47 @@ def test_repeated_factory_failures_eventually_kill_the_resource():
         with pytest.raises(ResourceUnavailable) as excinfo:
             await pool.acquire(algorithm="immediate")
         assert "no resource available" in str(excinfo.value)
+
+    run(_case())
+
+
+def test_a_transient_factory_failure_recovers_after_cooldown():
+    """DEGRADED must be a genuine second chance, not just a delay before DEAD.
+
+    Regression: once `_lease` sees a stored `client_error`, it used to keep refusing the
+    resource forever without ever calling the factory again — so a resource that recovered
+    (e.g. a transient network blip during client construction) stayed unusable until it
+    accumulated enough failures to hit `dead_after`, even though the *next* factory call
+    would have succeeded.
+    """
+    calls = {"n": 0}
+
+    def flaky_factory(resource):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("transient")
+        return f"client-{calls['n']}"
+
+    async def _case():
+        clock = FakeClock()
+        pool = Pool(
+            "apis",
+            [Resource.create("llm", id="api-1", factory=flaky_factory, degrade_after=1, dead_after=5, cooldown_s=10.0)],
+            clock=clock,
+        )
+        with pytest.raises(ResourceUnavailable):
+            await pool.acquire(algorithm="immediate")
+        assert pool.snapshot()[0]["state"] == "degraded"
+
+        # still within cooldown: the resource is not yet a candidate
+        with pytest.raises(ResourceUnavailable):
+            await pool.acquire(algorithm="immediate")
+        assert calls["n"] == 1, "the factory must not be retried before cooldown expires"
+
+        clock.t += 10.0  # cooldown elapses
+        lease = await pool.acquire(algorithm="immediate")
+        assert lease.client == "client-2"
+        assert pool.snapshot()[0]["state"] == "ready"
 
     run(_case())
 

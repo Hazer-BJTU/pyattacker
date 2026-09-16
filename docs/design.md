@@ -172,6 +172,11 @@ Note: cooldown expiry does **not reset** `consecutive_failures` (it is cleared o
 Otherwise, when "degrade threshold < dead threshold" and the pool holds a single resource, every cooldown
 would wipe the counter and `DEAD` would never be reached.
 
+A resource whose `factory` raised follows the same state machine (`degrade_after`/`dead_after`/cooldown),
+and cooldown expiry *does* clear the resource's stored client error, so the factory is invoked again on
+the next lease attempt — DEGRADED is a genuine second chance for a transient factory failure, not merely
+a delay before DEAD.
+
 **Publish/subscribe** uses two channels with different semantics and different implementations:
 
 | Channel | API | Purpose |
