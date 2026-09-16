@@ -683,29 +683,30 @@ class Runner:
         if not isinstance(item, PipelineSpec):
             return None  # nothing identifiable to attach the failure to
         # `state is None` only means _open_pipeline() never *returned* a _RunState -- it may
-        # already have restored and re-persisted an existing checkpoint (record.n_tasks_done)
-        # before raising later on. Leave n_tasks_done untouched when a row already exists, so
-        # a framework-level surprise can never rewind a durable checkpoint back to 0 and cause
-        # a later resume to re-run tasks that had already completed.
+        # already have restored an existing checkpoint (record.n_tasks_done) before raising,
+        # possibly before it ever reassigns record.run_id to the *current* run. Preserve the
+        # checkpoint either way (never rewind n_tasks_done back to 0 for an existing row), but
+        # always rebind run_id to this run: the final report is scoped by run_id (self.store
+        # .stats(run_id)), so a failure left attached to a stale run_id would silently vanish
+        # from the report of the run that actually encountered it.
         record = self.store.get_pipeline(item.pipeline_id)
         if record is None:
-            self.store.upsert_pipeline(
-                PipelineRecord(
-                    pipeline_id=item.pipeline_id,
-                    run_id=run_id,
-                    name=item.name,
-                    key=item.key,
-                    tags=dict(item.template.tags),
-                    n_tasks_total=item.n_tasks,
-                    seed_digest=item.seed_digest,
-                    spec_digest=item.spec_digest,
-                    state="running",
-                    started_at=time.time(),
-                )
+            record = PipelineRecord(
+                pipeline_id=item.pipeline_id,
+                run_id=run_id,
+                name=item.name,
+                key=item.key,
+                tags=dict(item.template.tags),
+                n_tasks_total=item.n_tasks,
+                seed_digest=item.seed_digest,
+                spec_digest=item.spec_digest,
+                state="running",
+                started_at=time.time(),
             )
-            self.store.finish_pipeline(item.pipeline_id, "failed", n_tasks_done=0, error=exc, traceback=tb)
         else:
-            self.store.finish_pipeline(item.pipeline_id, "failed", error=exc, traceback=tb)
+            record.run_id = run_id
+        self.store.upsert_pipeline(record)
+        self.store.finish_pipeline(item.pipeline_id, "failed", error=exc, traceback=tb)
         return item.pipeline_id
 
     # ------------------------------------------------------- pipeline execution

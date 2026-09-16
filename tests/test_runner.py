@@ -453,6 +453,57 @@ def test_internal_error_during_resume_does_not_roll_back_the_checkpoint():
     assert CALLS["ask"] == 1
 
 
+def test_internal_error_during_checkpoint_restore_reattributes_to_the_current_run():
+    """A framework failure *before* ``_open_pipeline`` rebinds ``record.run_id`` must still land
+    on the current run, not the stale run that originally produced the checkpoint.
+
+    Regression: an earlier fix preserved ``n_tasks_done`` on the existing row, but did nothing
+    about ``record.run_id`` -- if the failure happens before ``_open_pipeline`` ever reaches
+    ``record.run_id = run_id`` (e.g. inside ``get_artifact`` while restoring the checkpoint), the
+    row's ``run_id`` is left pointing at the *previous* run. Since the final report is scoped by
+    ``store.stats(run_id)``, that failure would silently disappear from the resume run's own
+    report even though the scheduler counted it as failed.
+    """
+    CALLS.update(fetch=0, ask=0)
+    BEHAVIOR["ask_fails"] = True
+    runner = Runner(store=":memory:", concurrency=1, handle_signals=False)
+    spec = next(iter(TEMPLATE.map([{"q": "checkpoint-restore-test"}])))
+
+    first = runner.run([spec])
+    assert first.stats["pipelines"]["by_state"] == {"failed": 1}
+    record = runner.store.get_pipeline(spec.pipeline_id)
+    assert record.state == "failed"
+    assert record.n_tasks_done == 1
+    run_a = record.run_id
+
+    real_get_artifact = runner.store.get_artifact
+
+    def boom_get_artifact(pipeline_id, seq):
+        if pipeline_id == spec.pipeline_id and seq == 0:  # the checkpoint-restore call specifically
+            raise RuntimeError("framework surprise, before record.run_id was rebound")
+        return real_get_artifact(pipeline_id, seq)
+
+    runner.store.get_artifact = boom_get_artifact
+    second = runner.run([spec], resume=True)
+    run_b = second.run_id
+    assert run_b != run_a
+
+    assert second.stats["pipelines"]["by_state"] == {"failed": 1}  # ★ visible in run B's own report
+    resumed_record = runner.store.get_pipeline(spec.pipeline_id)
+    assert resumed_record.state == "failed"
+    assert resumed_record.n_tasks_done == 1  # checkpoint still preserved
+    assert resumed_record.run_id == run_b  # ★ reattributed to the run that hit the failure
+
+    # a further resume still continues past the checkpoint
+    runner.store.get_artifact = real_get_artifact
+    BEHAVIOR["ask_fails"] = False
+    CALLS.update(fetch=0, ask=0)
+    third = runner.run([spec], resume=True)
+    assert third.stats["pipelines"]["by_state"] == {"succeeded": 1}
+    assert CALLS["fetch"] == 0
+    assert CALLS["ask"] == 1
+
+
 def test_events_form_a_structured_per_pipeline_log():
     runner = Runner(store=":memory:", handle_signals=False)
     spec = next(iter(pipeline("log", flaky(1)).map([{"i": 0}])))
