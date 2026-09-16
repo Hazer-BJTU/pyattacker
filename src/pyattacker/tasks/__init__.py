@@ -10,6 +10,7 @@ import asyncio
 import inspect
 import json
 import random
+import shlex
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -259,13 +260,35 @@ def shell_run(
     check: bool = True,
     name: str | None = None,
 ) -> TaskSpec:
-    """Run a subprocess (standard library) and return stdout/stderr as the result."""
+    """Run a subprocess (standard library) and return stdout/stderr as the result.
+
+    **Prefer the argv form** — ``command=["python", "postprocess.py", "--input", "{value}"]`` —
+    which runs via ``create_subprocess_exec`` and never involves a shell: ``{value}`` (the
+    upstream artifact, JSON-encoded) is substituted per-argument, so it is passed to the child
+    process as one literal argument no matter what characters it contains. This is the safe
+    choice whenever ``value`` comes from an untrusted source (model/judge output, external
+    data), which is the common case in evaluation pipelines.
+
+    A plain string ``command`` is run through the system shell (``create_subprocess_shell``) for
+    when you actually need shell features (pipes, globbing, redirection). ``{value}`` is
+    substituted with :func:`shlex.quote` applied, which is safe against shell metacharacters for
+    that one substitution — but the rest of a template you write yourself is still your own
+    responsibility, and quoting cannot help if the template itself, not just ``{value}``, is
+    built from untrusted input.
+    """
 
     async def _impl(value: Any, ctx: Any) -> Any:
-        cmd = command.format(value=json.dumps(value, default=str)) if isinstance(command, str) else command
-        proc = await asyncio.create_subprocess_shell(
-            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
+        encoded = json.dumps(value, default=str)
+        if isinstance(command, str):
+            cmd: str | list[str] = command.format(value=shlex.quote(encoded))
+            proc = await asyncio.create_subprocess_shell(
+                cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+        else:
+            cmd = [part.format(value=encoded) for part in command]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout_s)
         except TimeoutError:
