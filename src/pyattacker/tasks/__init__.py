@@ -12,7 +12,6 @@ import json
 import random
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
-from string import Formatter
 from typing import Any
 
 from ..errors import ConfigError, FatalError, RetryableError
@@ -264,21 +263,27 @@ def shell_run(
 
     **Use the argv form to pass ``value`` to the command** —
     ``command=["python", "postprocess.py", "--input", "{value}"]`` — which runs via
-    ``create_subprocess_exec`` and never involves a shell: ``{value}`` (the upstream artifact,
-    JSON-encoded) is substituted per-argument, so it reaches the child process as one literal
-    argument no matter what characters it contains. This is required whenever ``value`` comes
-    from an untrusted source (model/judge output, external data), which is the common case in
-    evaluation pipelines — no quoting scheme applied to a single substitution can make it safe
-    to insert into an arbitrary shell-syntax position (unquoted, inside ``'...'``, inside
-    ``"..."``, inside command substitution, ...), because that safety depends on *where* in the
-    template the substitution lands, which is up to whoever wrote the template.
+    ``create_subprocess_exec`` and never involves a shell: the literal substring ``"{value}"`` in
+    each argv element is replaced with the upstream artifact (JSON-encoded), so it reaches the
+    child process as one literal argument no matter what characters it contains. The replacement
+    is a plain substring swap, not ``str.format()`` — other braces in an argument (a ``jq``
+    filter, a Python dict literal) are left alone and are never treated as placeholders. This is
+    required whenever ``value`` comes from an untrusted source (model/judge output, external
+    data), which is the common case in evaluation pipelines — no quoting scheme applied to a
+    single substitution can make it safe to insert into an arbitrary shell-syntax position
+    (unquoted, inside ``'...'``, inside ``"..."``, inside command substitution, ...), because that
+    safety depends on *where* in the template the substitution lands, which is up to whoever
+    wrote the template.
 
     A plain string ``command`` is run through the system shell (``create_subprocess_shell``) for
     when you need actual shell features (pipes, globbing, redirection, `&&`). Because of the
     above, a string command may **not** reference ``{value}`` at all — constructing one that does
     raises :class:`ConfigError` immediately, rather than silently running something unsafe.
     """
-    if isinstance(command, str) and any(field == "value" for _, field, _, _ in Formatter().parse(command)):
+    # A literal substring check, not str.format()/Formatter parsing: neither a string command nor
+    # an argv element should have to avoid unrelated brace syntax (a jq filter, a Python literal)
+    # just because the framework also uses braces for its one placeholder.
+    if isinstance(command, str) and "{value}" in command:
         raise ConfigError(
             "shell_run: a string command may not interpolate {value} — there is no shell quoting "
             "rule that stays safe regardless of where in the template the substitution lands. "
@@ -294,7 +299,7 @@ def shell_run(
             )
         else:
             encoded = json.dumps(value, default=str)
-            cmd = [part.format(value=encoded) for part in command]
+            cmd = [part.replace("{value}", encoded) for part in command]
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )

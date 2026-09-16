@@ -6,7 +6,9 @@ its position and run as a separate shell command. `shlex.quote()` on a single su
 turns out not to be enough — it is only safe when `{value}` lands as a whole, unquoted shell
 token, and shell_run has no way to guarantee where in a user-written template it lands (inside
 `'...'`, inside `"..."`, inside `$(...)`, ...). So string commands reject `{value}` outright, and
-only the argv form (no shell involved at all) may reference it.
+only the argv form (no shell involved at all) may reference it — via a literal `"{value}"`
+substring replacement, not `str.format()`, so unrelated braces (a jq filter, a Python dict
+literal) in another argv element are left alone.
 """
 
 from __future__ import annotations
@@ -53,7 +55,6 @@ def test_argv_command_runs_and_captures_output():
         "echo '{value}'",
         'echo "{value}"',
         "python -c 'print({value})'",
-        "echo {value!r}",
     ],
 )
 def test_string_command_rejects_value_interpolation_in_any_quoting_context(template):
@@ -63,7 +64,7 @@ def test_string_command_rejects_value_interpolation_in_any_quoting_context(templ
         shell_run(template)
 
 
-def test_string_command_with_other_placeholders_is_unaffected():
+def test_string_command_with_literal_braces_that_are_not_the_placeholder_is_unaffected():
     result = _run_one(shell_run("echo {not_value}"), {"i": 0})
     assert result["stdout"].strip() == "{not_value}"
 
@@ -85,6 +86,16 @@ def test_argv_command_is_safe_even_when_the_value_contains_command_substitution(
 
     assert not marker.exists()
     assert result["stdout"].strip() == json.dumps(dangerous)
+
+
+def test_argv_substitution_is_a_literal_swap_not_str_format():
+    """Another argv element's own braces (a jq filter, a Python dict literal) must be left
+    alone — only the exact substring "{value}" is a placeholder, never str.format() syntax."""
+    result = _run_one(
+        shell_run(["python3", "-c", "import sys; print(sys.argv[1], sys.argv[2])", '{"a": 1}', "{value}"]),
+        "hi",
+    )
+    assert result["stdout"].strip() == '{"a": 1} "hi"'
 
 
 def test_check_raises_a_retryable_error_on_nonzero_exit():
