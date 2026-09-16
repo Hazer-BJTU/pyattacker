@@ -14,6 +14,7 @@ import pytest
 from helpers import run
 
 from pyattacker import (
+    Backoff,
     Failover,
     Immediate,
     LeastBusy,
@@ -399,9 +400,12 @@ def test_repeated_factory_failures_eventually_kill_the_resource():
         raise OSError("nope")
 
     async def _case():
+        # degrade_after == dead_after: every failure goes straight through the DEAD check
+        # before the DEGRADED branch could kick in, so the resource stays a candidate for
+        # every attempt up to dead_after instead of getting cooled down after the first one.
         pool = Pool(
             "apis",
-            [Resource.create("llm", id="api-1", factory=broken_factory, dead_after=2, degrade_after=1)],
+            [Resource.create("llm", id="api-1", factory=broken_factory, dead_after=2, degrade_after=2)],
         )
         for _ in range(2):
             with pytest.raises(ResourceUnavailable):
@@ -411,5 +415,35 @@ def test_repeated_factory_failures_eventually_kill_the_resource():
         with pytest.raises(ResourceUnavailable) as excinfo:
             await pool.acquire(algorithm="immediate")
         assert "no resource available" in str(excinfo.value)
+
+    run(_case())
+
+
+@pytest.mark.parametrize("algorithm", [Wait(), Backoff(base=0.001, cap=0.01)])
+def test_wait_and_backoff_skip_a_broken_resource_instead_of_raising(algorithm):
+    """Regression for a pool with one broken resource and other healthy ones.
+
+    Previously, `Wait`/`Backoff` handed the *single* candidate `select()` picked straight to
+    `_lease`; if that candidate's factory failed, the `ResourceUnavailable` propagated out of
+    `acquire()` untouched even though other healthy resources were sitting idle. A pool must
+    keep serving out of its healthy resources regardless of which algorithm is used.
+    """
+
+    def broken_factory(resource):
+        raise OSError("cannot reach the provider")
+
+    async def _case():
+        pool = Pool(
+            "apis",
+            [
+                Resource.create("llm", id="bad", factory=broken_factory, capacity=4),
+                Resource.create("llm", id="good", capacity=4),
+            ],
+            algorithm=algorithm,
+        )
+        for _ in range(4):
+            lease = await pool.acquire()
+            assert lease.resource.id == "good"
+            lease.release_now()
 
     run(_case())
