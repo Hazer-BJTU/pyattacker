@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+from helpers import run
+
 from pyattacker import (
     FatalError,
     Pool,
@@ -296,6 +298,70 @@ def test_unknown_pool_fails_fast_without_running_task():
     row = next(iter(runner.store.export_rows()))
     assert row["error_type"] == "ConfigError"
     assert len(runner.store.attempts()) == 0  # not even an attempt should exist
+
+
+# --------------------------------------------------------------- internal errors
+def test_worker_records_internal_error_and_keeps_the_run_going():
+    """A framework-level surprise (not a task exception) must be recorded, not swallow the worker.
+
+    Regression: ``_worker``'s except-block read ``state`` to fill in ``pipeline_id`` on the
+    ``runner.internal_error`` event, but when the very first call inside the try (opening the
+    pipeline) is what raises, ``state`` was never assigned — the ``getattr(state, ...)`` then
+    raised ``UnboundLocalError`` *inside the exception handler itself*. That second exception
+    escaped ``_worker`` entirely; ``asyncio.gather(..., return_exceptions=True)`` swallowed it
+    silently, the worker task simply died, and with ``concurrency=1`` the run hung forever
+    waiting for a queue nothing was draining anymore.
+    """
+
+    async def _case():
+        runner = Runner(store=":memory:", concurrency=1, handle_signals=False)
+        calls = {"n": 0}
+        real_open = runner._open_pipeline
+
+        def flaky_open(spec, run_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("framework surprise")
+            return real_open(spec, run_id)
+
+        runner._open_pipeline = flaky_open
+        spec = pipeline("internal-error", flaky(0))
+        report = await asyncio.wait_for(
+            runner.run_async(spec.map([{"i": 0}, {"i": 1}])), timeout=5.0
+        )
+
+        # the second pipeline still ran to completion: one worker dying does not take the run down
+        assert report.stats["pipelines"]["by_state"] == {"succeeded": 1}
+        events = runner.store.events(limit=50)
+        internal = [e for e in events if e.kind == "runner.internal_error"]
+        assert len(internal) == 1
+        assert internal[0].pipeline_id is None  # the pipeline never even got a state object
+        assert internal[0].data["error"] == "RuntimeError: framework surprise"
+        assert "Traceback" in internal[0].data["traceback"]
+
+    run(_case())
+
+
+def test_internal_error_after_state_exists_still_reports_its_pipeline_id():
+    """Once ``state`` is bound, the event should carry the real ``pipeline_id`` (not None)."""
+
+    async def _case():
+        runner = Runner(store=":memory:", concurrency=1, handle_signals=False)
+
+        async def boom_drive(state):
+            raise RuntimeError("drive exploded")
+
+        runner._drive = boom_drive
+        spec = pipeline("internal-error-2", flaky(0))
+        report = await asyncio.wait_for(runner.run_async(spec.map([{"i": 0}])), timeout=5.0)
+
+        assert report.stats["pipelines"]["by_state"] == {"running": 1}  # opened, but never reached a terminal state
+        events = runner.store.events(limit=50)
+        internal = next(e for e in events if e.kind == "runner.internal_error")
+        assert internal.pipeline_id is not None
+        assert internal.data["error"] == "RuntimeError: drive exploded"
+
+    run(_case())
 
 
 def test_events_form_a_structured_per_pipeline_log():

@@ -26,6 +26,7 @@ import pytest
 
 from pyattacker import MemoryStore, Runner, SqliteStore, boom, echo, pipeline
 from pyattacker.server import StatsServer
+from pyattacker.tasks import delay
 
 _PATHS = ["/", "/stats", "/events", "/pipelines", "/resources", "/errors", "/healthz"]
 
@@ -365,6 +366,61 @@ def test_stop_releases_the_port_and_restart_works(tmp_path):
         assert _fetch_json(first, "/healthz") == (200, {"ok": True})
     finally:
         first.stop()
+
+
+# --------------------------------------------------------------------- concurrency
+def test_concurrent_requests_are_safe_alongside_a_live_writing_run(tmp_path):
+    """The documented core use case (design.md §4.6, server.py's own docstring): the server must
+    be safely readable *while* a run is actively writing to the same store, and it must survive
+    many requests arriving at once (each request opens its own short-lived read-only connection —
+    a bug that shared one connection across threads would show up here as corrupted/garbled JSON
+    or a crash, not just stale data).
+    """
+    import concurrent.futures
+
+    db = str(tmp_path / "concurrent.db")
+    SqliteStore(db).close()
+
+    runner = Runner(store=db, concurrency=4, handle_signals=False)
+    write_thread = threading.Thread(
+        target=runner.run,
+        args=(pipeline("srv-concurrent", delay(0.05)).map([{"i": i} for i in range(20)]),),
+        daemon=True,
+    )
+    write_thread.start()
+    try:
+        with StatsServer(db, port=0) as server:
+            results: list[tuple[int, Any]] = []
+            errors: list[Exception] = []
+
+            def _hit(path: str) -> None:
+                try:
+                    results.append(_fetch_json(server, path))
+                except Exception as exc:  # pragma: no cover - failure path, asserted on below
+                    errors.append(exc)
+
+            paths = ["/stats", "/events?limit=20"] * 15
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(_hit, paths))
+
+            assert not errors
+            assert len(results) == len(paths)
+            totals = [
+                status_body[1]["pipelines"]["total"]
+                for status_body in results
+                if "pipelines" in status_body[1]
+            ]
+            assert all(status == 200 for status, _ in results)
+            assert all(0 <= total <= 20 for total in totals)  # never negative, never more than admitted
+            # the run's own writes eventually land: a request issued after join() sees them all
+            write_thread.join(timeout=10.0)
+            assert not write_thread.is_alive()
+            _, final = _fetch_json(server, "/stats")
+            assert final["pipelines"]["total"] == 20
+            assert final["pipelines"]["by_state"] == {"succeeded": 20}
+    finally:
+        write_thread.join(timeout=10.0)
+        runner.close()
 
 
 def test_wait_returns_once_the_server_is_stopped(tmp_path):

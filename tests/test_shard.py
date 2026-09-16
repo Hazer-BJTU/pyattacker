@@ -13,10 +13,13 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 
 import pytest
 
-from pyattacker import ConfigError, digest_of, pipeline
+from pyattacker import ConfigError, SqliteStore, digest_of, pipeline
+from pyattacker.cli import main
+from pyattacker.merge import merge_reports
 from pyattacker.shard import (
     describe_shard,
     in_shard,
@@ -189,3 +192,88 @@ def test_describe_shard_round_trips_through_parse_shard():
     assert describe_shard(2, 4) == "2/4"
     assert parse_shard(describe_shard(2, 4)) == (2, 4)
     assert parse_shard(describe_shard(0, 1)) == (0, 1)
+
+
+# --------------------------------------------------- retry + resource pool + sharding (combined)
+
+_COMBINED_CONFIG = """
+pools:
+  apis:
+    kind: llm
+    capacity: 2
+    algorithm: backoff
+    resources:
+      - id: api-1
+        options: {model: gpt-4o}
+      - id: api-2
+        options: {model: gpt-4o}
+source:
+  kind: range
+  n: 12
+pipeline:
+  name: combo
+  tasks:
+    - use: pyattacker.tasks:simulate_llm
+      resource: apis
+      retry: {max_attempts: 4, base: 0.001, cap: 0.01}
+      kwargs: {fail_rate: 0.5, latency_ms: 1}
+run:
+  concurrency: 3
+"""
+
+
+def test_shards_with_retrying_resource_pool_pipelines_merge_cleanly(tmp_path, capsys):
+    """None of the three subsystems has ever been exercised together before this test:
+
+    * `retry`/backoff (`simulate_llm`'s ``fail_rate`` guarantees some attempts are retried),
+    * a resource pool with `backoff` acquire (so a saturated pool actually parks a waiter), and
+    * `--shards`, which forks two separate child *processes* — each with its own event loop,
+      its own pool instances, its own retry state.
+
+    Passing individually says nothing about this combination: a resource pool's waiter queue or
+    a task's retry RNG could, in principle, leak process-global state across what should be
+    fully independent shard children. This proves they don't: the merged view accounts for
+    every pipeline exactly once, and every attempt/backoff actually happened (attempts_total is
+    strictly more than the pipeline count whenever fail_rate causes any retries).
+    """
+    cfg = tmp_path / "combo.yaml"
+    cfg.write_text(textwrap.dedent(_COMBINED_CONFIG), encoding="utf-8")
+    base = tmp_path / "combo.db"
+    capsys.readouterr()
+
+    try:
+        rc = main(["run", "-c", str(cfg), "--shards", "2", "--jobs", "2", "--store", str(base)])
+    except OSError as exc:  # pragma: no cover - only on an environment that cannot spawn a child
+        pytest.skip(f"cannot spawn shard children in this environment: {exc}")
+
+    assert rc == 0
+    shard0, shard1 = tmp_path / "combo.shard0of2.db", tmp_path / "combo.shard1of2.db"
+    assert shard0.exists() and shard1.exists()
+
+    store0, store1 = SqliteStore(str(shard0), read_only=True), SqliteStore(str(shard1), read_only=True)
+    try:
+        rows0, rows1 = store0.pipelines(), store1.pipelines()
+        ids0 = {r.pipeline_id for r in rows0}
+        ids1 = {r.pipeline_id for r in rows1}
+        assert not (ids0 & ids1)  # every pipeline is owned by exactly one shard
+        assert len(ids0) + len(ids1) == 12
+        assert all(r.state == "succeeded" for r in rows0 + rows1)  # simulate_llm always retries enough to succeed
+
+        attempts0 = sum(r.attempts_total for r in rows0)
+        attempts1 = sum(r.attempts_total for r in rows1)
+        # fail_rate=0.5 over 12 pipelines makes at least one retry near-certain in either shard
+        assert attempts0 + attempts1 > 12
+
+        resources0 = store0.resources(pool="apis")
+        resources1 = store1.resources(pool="apis")
+        assert len(resources0) == 2 and len(resources1) == 2  # each shard's own pool, independently populated
+        # every attempt takes exactly one lease: the pool actually did the work, not a stub
+        assert sum(r["stats"]["leases"] for r in resources0) == attempts0
+        assert sum(r["stats"]["leases"] for r in resources1) == attempts1
+    finally:
+        store0.close()
+        store1.close()
+
+    merged = merge_reports([str(shard0), str(shard1)])
+    assert merged.stats()["pipelines"]["by_state"] == {"succeeded": 12}
+    assert merged.stats()["attempts_total"] == attempts0 + attempts1

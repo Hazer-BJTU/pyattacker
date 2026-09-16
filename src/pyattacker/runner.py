@@ -630,6 +630,7 @@ class Runner:
             try:
                 if item is None:
                     return
+                state = None
                 self._live["running"] += 1
                 try:
                     # The queue carries two shapes: fresh PipelineSpec objects from the producer,
