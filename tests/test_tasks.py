@@ -2,18 +2,24 @@
 
 The centerpiece here is the injection regression for issue #5: a value coming out of an
 upstream task (model/judge output in the typical use case) must never be able to break out of
-its position and run as a separate shell command, in either the string-template form or the
-argv form.
+its position and run as a separate shell command. `shlex.quote()` on a single substitution
+turns out not to be enough — it is only safe when `{value}` lands as a whole, unquoted shell
+token, and shell_run has no way to guarantee where in a user-written template it lands (inside
+`'...'`, inside `"..."`, inside `$(...)`, ...). So string commands reject `{value}` outright, and
+only the argv form (no shell involved at all) may reference it.
 """
 
 from __future__ import annotations
 
 import json
 
+import pytest
+
 from pyattacker import Runner, pipeline
+from pyattacker.errors import ConfigError
 from pyattacker.tasks import shell_run
 
-# a value that would break out of naive `f"...{value}..."` interpolation if not handled safely
+# a value that would break out of naive interpolation if not handled safely
 _DANGEROUS = "foo'; touch {marker}; echo 'done"
 
 
@@ -40,15 +46,26 @@ def test_argv_command_runs_and_captures_output():
     assert result["stdout"].strip() == "hello"
 
 
-def test_string_command_quotes_untrusted_value_instead_of_letting_it_break_out(tmp_path):
-    marker = tmp_path / "pwned_str"
-    dangerous = _DANGEROUS.format(marker=marker)
-    result = _run_one(shell_run("echo {value}"), dangerous)
+@pytest.mark.parametrize(
+    "template",
+    [
+        "echo {value}",
+        "echo '{value}'",
+        'echo "{value}"',
+        "python -c 'print({value})'",
+        "echo {value!r}",
+    ],
+)
+def test_string_command_rejects_value_interpolation_in_any_quoting_context(template):
+    """No placement is safe: quoting only protects an unquoted standalone token, and shell_run
+    cannot know or enforce where in the caller's template the substitution lands."""
+    with pytest.raises(ConfigError, match="may not interpolate"):
+        shell_run(template)
 
-    assert not marker.exists(), "the ';' must not have started a second command"
-    assert result["returncode"] == 0
-    # the value round-trips through the shell as one literal argument (JSON-encoded)
-    assert result["stdout"].strip() == json.dumps(dangerous)
+
+def test_string_command_with_other_placeholders_is_unaffected():
+    result = _run_one(shell_run("echo {not_value}"), {"i": 0})
+    assert result["stdout"].strip() == "{not_value}"
 
 
 def test_argv_command_treats_untrusted_value_as_one_literal_argument(tmp_path):
@@ -58,6 +75,15 @@ def test_argv_command_treats_untrusted_value_as_one_literal_argument(tmp_path):
 
     assert not marker.exists()
     assert result["returncode"] == 0
+    assert result["stdout"].strip() == json.dumps(dangerous)
+
+
+def test_argv_command_is_safe_even_when_the_value_contains_command_substitution(tmp_path):
+    marker = tmp_path / "pwned_subst"
+    dangerous = f"foo$(touch {marker})bar"
+    result = _run_one(shell_run(["echo", "{value}"]), dangerous)
+
+    assert not marker.exists()
     assert result["stdout"].strip() == json.dumps(dangerous)
 
 

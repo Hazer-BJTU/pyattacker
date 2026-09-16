@@ -10,12 +10,12 @@ import asyncio
 import inspect
 import json
 import random
-import shlex
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
+from string import Formatter
 from typing import Any
 
-from ..errors import FatalError, RetryableError
+from ..errors import ConfigError, FatalError, RetryableError
 from ..task import Retrying, TaskSpec, build_task_spec, task
 
 __all__ = [
@@ -262,29 +262,38 @@ def shell_run(
 ) -> TaskSpec:
     """Run a subprocess (standard library) and return stdout/stderr as the result.
 
-    **Prefer the argv form** — ``command=["python", "postprocess.py", "--input", "{value}"]`` —
-    which runs via ``create_subprocess_exec`` and never involves a shell: ``{value}`` (the
-    upstream artifact, JSON-encoded) is substituted per-argument, so it is passed to the child
-    process as one literal argument no matter what characters it contains. This is the safe
-    choice whenever ``value`` comes from an untrusted source (model/judge output, external
-    data), which is the common case in evaluation pipelines.
+    **Use the argv form to pass ``value`` to the command** —
+    ``command=["python", "postprocess.py", "--input", "{value}"]`` — which runs via
+    ``create_subprocess_exec`` and never involves a shell: ``{value}`` (the upstream artifact,
+    JSON-encoded) is substituted per-argument, so it reaches the child process as one literal
+    argument no matter what characters it contains. This is required whenever ``value`` comes
+    from an untrusted source (model/judge output, external data), which is the common case in
+    evaluation pipelines — no quoting scheme applied to a single substitution can make it safe
+    to insert into an arbitrary shell-syntax position (unquoted, inside ``'...'``, inside
+    ``"..."``, inside command substitution, ...), because that safety depends on *where* in the
+    template the substitution lands, which is up to whoever wrote the template.
 
     A plain string ``command`` is run through the system shell (``create_subprocess_shell``) for
-    when you actually need shell features (pipes, globbing, redirection). ``{value}`` is
-    substituted with :func:`shlex.quote` applied, which is safe against shell metacharacters for
-    that one substitution — but the rest of a template you write yourself is still your own
-    responsibility, and quoting cannot help if the template itself, not just ``{value}``, is
-    built from untrusted input.
+    when you need actual shell features (pipes, globbing, redirection, `&&`). Because of the
+    above, a string command may **not** reference ``{value}`` at all — constructing one that does
+    raises :class:`ConfigError` immediately, rather than silently running something unsafe.
     """
+    if isinstance(command, str) and any(field == "value" for _, field, _, _ in Formatter().parse(command)):
+        raise ConfigError(
+            "shell_run: a string command may not interpolate {value} — there is no shell quoting "
+            "rule that stays safe regardless of where in the template the substitution lands. "
+            "Use the argv form instead: command=[..., '{value}', ...], which passes value as one "
+            "literal argument via create_subprocess_exec (no shell involved)."
+        )
 
     async def _impl(value: Any, ctx: Any) -> Any:
-        encoded = json.dumps(value, default=str)
         if isinstance(command, str):
-            cmd: str | list[str] = command.format(value=shlex.quote(encoded))
+            cmd: str | list[str] = command
             proc = await asyncio.create_subprocess_shell(
                 cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
         else:
+            encoded = json.dumps(value, default=str)
             cmd = [part.format(value=encoded) for part in command]
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
