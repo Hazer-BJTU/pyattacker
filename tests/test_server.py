@@ -110,7 +110,7 @@ def test_endpoints_serve_html_and_concrete_json(seeded):
         assert row["failed_task"] == "mock.boom"
         assert row["error_type"] == "RetryableError"
         assert row["error_message"] == "upstream exploded"
-        assert (row["n_tasks_done"], row["n_tasks_total"], row["attempts_total"]) == (0, 1, 0)
+        assert (row["n_tasks_done"], row["n_tasks_total"], row["attempts_total"]) == (0, 1, 1)
         assert row["run_id"] == _run_bad
         assert row["finished_at"] >= row["started_at"]
 
@@ -135,10 +135,7 @@ def test_endpoints_serve_html_and_concrete_json(seeded):
 
         status, resources = _fetch_json(server, "/resources")
         assert status == 200
-        assert resources == {
-            "rows": [],
-            "note": "this store backend does not persist resource state",
-        }
+        assert resources == {"rows": []}
 
         with pytest.raises(urllib.error.HTTPError) as excinfo:
             _fetch(server, "/nope")

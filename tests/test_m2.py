@@ -18,7 +18,7 @@ import time
 
 from helpers import run
 
-from pyattacker import RetryableError, Retrying, Runner, pipeline, task
+from pyattacker import Pool, Resource, RetryableError, Retrying, Runner, pipeline, task
 from pyattacker.store.writebehind import WriteBehindStore
 
 
@@ -173,3 +173,18 @@ def test_store_stats_expose_buffering_only_when_batching():
         assert batched.stats()["buffered"]["pending"] == 0
     finally:
         batched.close()
+
+
+def test_resources_survive_write_behind_flush(tmp_path):
+    """WriteBehindStore.resources() must flush pending writes before reading, like every other view."""
+    pool = Pool("apis", [Resource.create("llm", id="api-1")])
+    db = str(tmp_path / "wb.db")
+    runner = Runner(store=db, pools=[pool], write_behind=True, handle_signals=False)
+    try:
+        runner.run(pipeline("noop", fast).map([{"i": 0}]))
+        assert isinstance(runner.store, WriteBehindStore)
+        rows = runner.store.resources(pool="apis")
+        assert len(rows) == 1
+        assert rows[0]["resource_id"] == "api-1"
+    finally:
+        runner.close()

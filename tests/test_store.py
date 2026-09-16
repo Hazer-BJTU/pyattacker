@@ -651,3 +651,29 @@ def test_stats_run_id_scopes_pipelines_tasks_and_attempts(store):
     assert scoped["attempts_total"] == 3
 
     assert scoped["events_total"] == 3  # consistent with SqliteStore: filtered by run
+
+
+# --------------------------------------------------------------------- resources
+
+
+def test_resources_roundtrip_and_pool_filter(store):
+    store.upsert_resource("apis", "api-1", "llm", {"model": "gpt-4o"}, "ready", {"active": 1})
+    store.upsert_resource("apis", "api-2", "llm", {"model": "gpt-4o-mini"}, "degraded", {"active": 0})
+    store.upsert_resource("workers", "w-1", "local", {}, "ready", {"active": 2})
+
+    all_rows = store.resources()
+    assert {row["resource_id"] for row in all_rows} == {"api-1", "api-2", "w-1"}
+
+    apis = store.resources(pool="apis")
+    assert {row["resource_id"] for row in apis} == {"api-1", "api-2"}
+    row = next(r for r in apis if r["resource_id"] == "api-1")
+    assert row["pool"] == "apis"
+    assert row["kind"] == "llm"
+    assert row["spec"] == {"model": "gpt-4o"}
+    assert row["state"] == "ready"
+    assert row["stats"] == {"active": 1}
+
+    # upserting the same (pool, resource_id) updates in place instead of duplicating
+    store.upsert_resource("apis", "api-1", "llm", {"model": "gpt-4o"}, "dead", {"active": 0})
+    assert len(store.resources(pool="apis")) == 2
+    assert next(r for r in store.resources(pool="apis") if r["resource_id"] == "api-1")["state"] == "dead"

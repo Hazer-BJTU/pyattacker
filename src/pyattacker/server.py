@@ -212,10 +212,9 @@ class StatsServer:
             return 200, {"rows": rows, "limit": limit}
 
         if path == "/resources":
-            resources = getattr(self.store_spec, "resources", None)
-            if resources is None:
-                return 200, {"rows": [], "note": "this store backend does not persist resource state"}
-            return 200, {"rows": resources()}
+            pool = (query.get("pool") or [None])[0]
+            rows = self._read(lambda store: store.resources(pool=pool))
+            return 200, {"rows": rows}
 
         if path == "/errors":
             return 200, {"rows": self._read(lambda store: store.errors(run_id=run_id, limit=limit))}

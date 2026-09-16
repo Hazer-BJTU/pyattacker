@@ -604,6 +604,7 @@ class Runner:
         """
         leftover = self._delays.drain()
         for state in leftover:
+            self.store.upsert_pipeline(state.record)
             self.store.finish_pipeline(
                 state.pipeline_id, "interrupted", n_tasks_done=state.record.n_tasks_done
             )
@@ -811,6 +812,7 @@ class Runner:
             if not outcome.ok:
                 self._counters["pipelines_failed"] += 1
                 self._counters["pipelines_done"] += 1
+                self.store.upsert_pipeline(state.record)
                 self.store.finish_pipeline(
                     state.pipeline_id,
                     "failed",
@@ -880,6 +882,7 @@ class Runner:
         state.attempts_used += 1
         attempts_used = state.attempts_used
         record.attempts_used = attempts_used
+        state.record.attempts_total += 1
         rng = random.Random(int(digest_of(f"{spec.pipeline_id}|{seq}|{attempts_used}")[:16], 16))
         ctx = TaskContext(
             run_id=state.run_id,
@@ -1142,12 +1145,14 @@ class Runner:
 
     def _finalize_pools(self) -> None:
         for pool in self.pools.values():
+            resources = {r.id: r for r in pool.resources()}
             for slot in pool.snapshot():
+                resource = resources.get(slot["id"])
                 self.store.upsert_resource(
                     pool.name,
                     slot["id"],
                     slot["kind"],
-                    {},
+                    resource.spec() if resource is not None else {},
                     slot["state"],
                     slot,
                 )

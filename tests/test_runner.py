@@ -11,6 +11,8 @@ import json
 
 from pyattacker import (
     FatalError,
+    Pool,
+    Resource,
     RetryableError,
     Retrying,
     Runner,
@@ -102,6 +104,23 @@ def test_retry_reexecutes_and_records_decision():
     assert attempts[2].decision["reason"] == "ok"
     assert attempts[0].retry_delay_s is not None
 
+    # the pipeline-level counter (distinct from the per-task attempts_used) must reflect
+    # every attempt actually made, not just the exhausted-attempts failure path
+    pid = next(iter(runner.store.pipelines())).pipeline_id
+    assert runner.store.get_pipeline(pid).attempts_total == 3
+
+
+def test_attempts_total_accumulates_across_tasks():
+    runner = Runner(store=":memory:", handle_signals=False)
+    spec = pipeline(
+        "multi",
+        r_fetch | flaky(1),
+    )
+    runner.run(spec.map([{"q": "hi"}]))
+    pid = next(iter(runner.store.pipelines())).pipeline_id
+    # 1 attempt for r_fetch + 2 attempts (1 failure, 1 success) for the flaky task
+    assert runner.store.get_pipeline(pid).attempts_total == 3
+
 
 def test_attempts_exhausted_marks_pipeline_failed():
     runner = Runner(store=":memory:", handle_signals=False)
@@ -118,6 +137,21 @@ def test_attempts_exhausted_marks_pipeline_failed():
     row = next(iter(runner.store.export_rows()))
     assert row["error_type"] == "TimeoutError"
     assert row["tasks"][0]["state"] == "failed"
+
+    pid = next(iter(runner.store.pipelines())).pipeline_id
+    assert runner.store.get_pipeline(pid).attempts_total == 2
+
+
+def test_finalize_pools_persists_a_redacted_resource_spec():
+    pool = Pool("apis", [Resource.create("llm", id="api-1", options={"api_key": "sk-secret123"})])
+    runner = Runner(store=":memory:", pools=[pool], handle_signals=False)
+    runner.run(pipeline("noop", r_fetch).map([{"q": "hi"}]))
+
+    rows = runner.store.resources(pool="apis")
+    assert len(rows) == 1
+    assert rows[0]["spec"]["id"] == "api-1"
+    # a real spec is persisted (not the {} placeholder) and secrets are redacted
+    assert rows[0]["spec"]["options"]["api_key"] == "***t123"
 
 
 def test_fatal_error_is_not_retried():

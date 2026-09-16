@@ -204,6 +204,10 @@ class WriteBehindStore:
             pool, resource_id, kind, spec, state, stats, published_by=published_by
         )
 
+    def resources(self, pool: str | None = None) -> list[dict[str, Any]]:
+        self.flush()
+        return self.inner.resources(pool=pool)
+
     # ---------------------------------------------------------------- read views
     def pipelines(
         self, *, run_id: str | None = None, state: str | None = None, limit: int | None = None
