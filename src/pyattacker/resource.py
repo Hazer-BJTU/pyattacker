@@ -221,9 +221,15 @@ class _Slot:
         threshold is below the dead threshold, DEAD could never be reached (each
         cooldown would wipe the count out). The count is cleared only by
         ``report(ok=True)``.
+
+        ``client_error`` *is* cleared here, though: it is what makes cooldown expiry a genuine
+        second chance for a broken factory rather than a delay before the inevitable ``DEAD``.
+        Without this, ``_lease`` would see the stale error and refuse the resource forever,
+        never calling the factory again to find out whether the problem actually went away.
         """
         if self.state is ResourceState.DEGRADED and now >= self.blocked_until:
             self.state = ResourceState.READY
+            self.client_error = None
         return self.state
 
     def available(self, now: float) -> bool:
