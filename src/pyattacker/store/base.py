@@ -197,7 +197,13 @@ class Store(Protocol):
     def upsert_resource(self, pool: str, resource_id: str, kind: str, spec: Mapping[str, Any],
                         state: str, stats: Mapping[str, Any], *, published_by: str = "") -> None: ...
 
-    def resources(self, pool: str | None = None) -> list[dict[str, Any]]: ...
+    # ``resources()`` is deliberately *not* part of this protocol: ``Store`` is
+    # ``@runtime_checkable``, and ``open_store()`` uses ``isinstance(spec, Store)`` to recognize an
+    # already-open store passed in directly. Requiring a new method here would make any
+    # pre-existing custom ``Store`` that hasn't added it stop satisfying the protocol, and
+    # ``open_store`` would then mistreat the live object as an unresolved path/URI spec. All
+    # built-in backends (``MemoryStore``, ``SqliteStore``, ``WriteBehindStore``) implement it;
+    # callers that want it should check with ``getattr(store, "resources", None)``.
 
     def pipelines(
         self, *, run_id: str | None = None, state: str | None = None, limit: int | None = None
