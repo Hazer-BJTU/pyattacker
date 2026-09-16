@@ -165,7 +165,15 @@ class LeastBusy:
 
 @dataclass
 class Failover:
-    """Fail over across multiple pools in order; when all are unavailable, defer to ``fallback``."""
+    """Fail over across multiple pools in order; when all are unavailable, defer to ``fallback``.
+
+    ``fallback`` (``Wait()`` by default) only ever runs against ``pools[0]`` — once every pool has
+    been tried immediately and none had capacity, this waits on the first (primary) pool rather
+    than looping ``fallback`` across the whole list. That is deliberate: the list is meant to be
+    read as "try these in order, then park on the one you actually want", not as "wait on
+    whichever of these frees up first" (that is what :class:`LeastBusy` or plain ``Wait`` on a
+    single pool covering all resources are for).
+    """
 
     name: str = "failover"
     pools: Sequence[str] = ()

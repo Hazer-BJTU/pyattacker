@@ -230,6 +230,37 @@ def pool_name(lease) -> str:
     return lease.pool.name
 
 
+def test_failover_fallback_only_waits_on_the_first_pool_not_the_whole_list():
+    """Documented behavior (algorithm.py docstring, design.md): once every pool has been tried
+    immediately and none had capacity, ``fallback`` parks on ``pools[0]`` only. Freeing up a
+    *later* pool must not wake it — only freeing the first pool does."""
+    async def _case():
+        primary = Pool("primary", [Resource.create("llm", id="p1", capacity=1)], algorithm="immediate")
+        backup = Pool("backup", [Resource.create("llm", id="b1", capacity=1)], algorithm="immediate")
+        ctx = _Ctx()
+        ctx.pools = {"primary": primary, "backup": backup}
+
+        primary_holder = primary.try_acquire()
+        backup_holder = backup.try_acquire()
+        assert primary_holder is not None and backup_holder is not None
+
+        task = asyncio.ensure_future(
+            primary.acquire(ctx=ctx, algorithm=Failover(pools=["primary", "backup"]))
+        )
+        await asyncio.sleep(0)  # let it walk both pools immediately and start waiting on fallback
+
+        backup_holder.release_now()  # frees the *second* listed pool, not pools[0]
+        await asyncio.sleep(0)
+        assert not task.done()  # fallback is bound to "primary"; a free backup slot doesn't wake it
+
+        primary_holder.release_now()  # frees pools[0]
+        lease = await asyncio.wait_for(task, timeout=1.0)
+        assert pool_name(lease) == "primary"
+        lease.release_now()
+
+    run(_case())
+
+
 def test_failover_reports_why_every_pool_failed():
     async def _case():
         primary = Pool("primary", [Resource.create("llm", id="p1", capacity=1)], algorithm="immediate")

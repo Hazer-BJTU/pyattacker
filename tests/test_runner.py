@@ -133,6 +133,7 @@ def test_attempts_exhausted_marks_pipeline_failed():
     attempts = runner.store.attempts()
     assert len(attempts) == 2
     assert attempts[-1].decision["reason"] == "attempts_exhausted"
+    assert attempts[-1].decision["delay_s"] == 0.0  # always present, per the documented schema
     assert attempts[-1].error_class == "timeout"
     row = next(iter(runner.store.export_rows()))
     assert row["error_type"] == "TimeoutError"
@@ -161,7 +162,22 @@ def test_fatal_error_is_not_retried():
     assert report.stats["pipelines"]["by_state"] == {"failed": 1}
     assert len(runner.store.attempts()) == 1
     assert runner.store.attempts()[0].decision["reason"] == "policy_declined"
+    assert runner.store.attempts()[0].decision["delay_s"] == 0.0  # always present, per the documented schema
     assert runner.store.attempts()[0].error_class == "fatal"
+
+
+def test_total_budget_exhaustion_still_reports_delay_s():
+    runner = Runner(store=":memory:", handle_signals=False)
+    spec = pipeline("budget", flaky(5, error="timeout").with_overrides(
+        retry=Retrying(max_attempts=5, base=1.0, jitter="none", max_total_s=0.0)
+    ))
+    report = runner.run(spec.map([{"i": 0}]))
+
+    assert report.stats["pipelines"]["by_state"] == {"failed": 1}
+    attempts = runner.store.attempts()
+    assert len(attempts) == 1  # the very first failure already exceeds a zero total budget
+    assert attempts[0].decision["reason"] == "total_budget"
+    assert attempts[0].decision["delay_s"] == 0.0  # always present, per the documented schema
 
 
 # ------------------------------------------------------------- ★ resume semantics

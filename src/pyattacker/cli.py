@@ -120,7 +120,6 @@ def _cmd_run(args: argparse.Namespace, *, resume: bool = False) -> int:
         if base == ":memory:":
             raise ConfigError("--shard needs a file-backed store (set run.store or pass --store)")
         run_cfg["store"] = shard_store_path(base, shard[0], shard[1])
-        run_cfg.setdefault("label", "") or None
     if args.concurrency:
         run_cfg["concurrency"] = args.concurrency
     if args.journal:

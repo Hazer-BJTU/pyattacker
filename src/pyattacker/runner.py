@@ -1003,7 +1003,9 @@ class Runner:
             else:
                 decision["retry"] = True
                 decision["reason"] = "retryable"
-                decision["delay_s"] = round(delay, 4)
+        # Always present, per the documented schema (docs/design.md §4.4) — 0.0 when there is no
+        # retry to delay, not a missing key that turns "why did it give up" queries into a KeyError.
+        decision["delay_s"] = round(delay, 4)
         self._last_traceback = "".join(tb_mod.format_exception(type(error), error, error.__traceback__))
         self._record_attempt(
             spec, task_spec, task_run_id, attempts_used, attempt_started, attempt_ms,
