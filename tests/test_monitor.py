@@ -29,10 +29,11 @@ def test_bar_tolerates_a_total_of_zero_or_negative():
     assert _bar(5, -1, width=8) == "·" * 8
 
 
-def test_bar_over_100_percent_overflows_rather_than_clamping():
-    # documents actual behavior: `_bar` does not clamp `filled` to `width`, so a value greater
-    # than `total` produces a bar longer than `width` instead of raising or silently truncating.
-    assert _bar(15, 10, width=10) == "█" * 15
+def test_bar_over_100_percent_clamps_to_a_full_fixed_width_bar():
+    # a value greater than total (e.g. transiently inconsistent by_state counts) must still
+    # produce exactly `width` characters, not a longer string -- callers rely on a fixed width.
+    assert _bar(15, 10, width=10) == "█" * 10
+    assert len(_bar(1000, 1, width=10)) == 10
 
 
 # --------------------------------------------------------------------- render_snapshot

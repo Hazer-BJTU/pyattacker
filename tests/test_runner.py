@@ -326,24 +326,39 @@ def test_worker_records_internal_error_and_keeps_the_run_going():
 
         runner._open_pipeline = flaky_open
         spec = pipeline("internal-error", flaky(0))
+        failing = next(iter(spec.map([{"i": 0}])))
         report = await asyncio.wait_for(
             runner.run_async(spec.map([{"i": 0}, {"i": 1}])), timeout=5.0
         )
 
-        # the second pipeline still ran to completion: one worker dying does not take the run down
-        assert report.stats["pipelines"]["by_state"] == {"succeeded": 1}
+        # the second pipeline still ran to completion: one worker dying does not take the run down.
+        # the first pipeline reaches a real terminal "failed" row, matching the scheduler's own
+        # pipelines_failed/pipelines_done counters -- it does not just vanish from the report.
+        assert report.stats["pipelines"]["by_state"] == {"succeeded": 1, "failed": 1}
+        record = runner.store.get_pipeline(failing.pipeline_id)
+        assert record.state == "failed"
+        assert record.error_type == "RuntimeError"
+        assert record.error_message == "framework surprise"
+
         events = runner.store.events(limit=50)
         internal = [e for e in events if e.kind == "runner.internal_error"]
         assert len(internal) == 1
-        assert internal[0].pipeline_id is None  # the pipeline never even got a state object
+        assert internal[0].pipeline_id == failing.pipeline_id  # identity preserved even though
+        # _open_pipeline raised before ever returning a _RunState for it
         assert internal[0].data["error"] == "RuntimeError: framework surprise"
         assert "Traceback" in internal[0].data["traceback"]
 
     run(_case())
 
 
-def test_internal_error_after_state_exists_still_reports_its_pipeline_id():
-    """Once ``state`` is bound, the event should carry the real ``pipeline_id`` (not None)."""
+def test_internal_error_after_state_exists_marks_the_pipeline_failed():
+    """Once ``state`` is bound, the persisted row must move out of "running" too.
+
+    Regression: the scheduler already counts this pipeline as failed+done, but the earlier fix
+    left the SQLite/Memory row itself stuck at ``state="running"`` forever -- an inconsistency
+    that would let the CLI report success (it reads the persisted failed count) even though the
+    scheduler had already decided the run contains a failure.
+    """
 
     async def _case():
         runner = Runner(store=":memory:", concurrency=1, handle_signals=False)
@@ -353,13 +368,43 @@ def test_internal_error_after_state_exists_still_reports_its_pipeline_id():
 
         runner._drive = boom_drive
         spec = pipeline("internal-error-2", flaky(0))
+        failing = next(iter(spec.map([{"i": 0}])))
         report = await asyncio.wait_for(runner.run_async(spec.map([{"i": 0}])), timeout=5.0)
 
-        assert report.stats["pipelines"]["by_state"] == {"running": 1}  # opened, but never reached a terminal state
+        assert report.stats["pipelines"]["by_state"] == {"failed": 1}
+        record = runner.store.get_pipeline(failing.pipeline_id)
+        assert record.state == "failed"
+        assert record.error_type == "RuntimeError"
+        assert record.error_message == "drive exploded"
+
         events = runner.store.events(limit=50)
         internal = next(e for e in events if e.kind == "runner.internal_error")
-        assert internal.pipeline_id is not None
+        assert internal.pipeline_id == failing.pipeline_id
         assert internal.data["error"] == "RuntimeError: drive exploded"
+
+    run(_case())
+
+
+def test_internal_error_report_never_looks_like_success():
+    """End-to-end version of the same guarantee, through the CLI's own success criterion.
+
+    ``_cmd_run`` returns exit code 1 whenever the persisted failed-pipeline count is nonzero;
+    this proves that count is nonzero after a framework-level (not task-level) failure, so a
+    caller relying on the exit code cannot be fooled into thinking the run fully succeeded.
+    """
+
+    async def _case():
+        runner = Runner(store=":memory:", concurrency=1, handle_signals=False)
+
+        def boom_open(spec, run_id):
+            raise RuntimeError("framework surprise")
+
+        runner._open_pipeline = boom_open
+        spec = pipeline("internal-error-3", flaky(0))
+        report = await asyncio.wait_for(runner.run_async(spec.map([{"i": 0}])), timeout=5.0)
+
+        failed = report.stats.get("pipelines", {}).get("by_state", {}).get("failed", 0)
+        assert failed == 1  # what _cmd_run checks to decide between exit code 0 and 1
 
     run(_case())
 

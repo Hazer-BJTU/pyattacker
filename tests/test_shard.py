@@ -196,6 +196,23 @@ def test_describe_shard_round_trips_through_parse_shard():
 
 # --------------------------------------------------- retry + resource pool + sharding (combined)
 
+# A task that both retries deterministically (by ctx.attempt, no RNG) and actually acquires a
+# real lease from a real pool -- none of the built-in mock tasks do both at once. Written to a
+# file on disk (module form, not `@task` in this test module) because `--shards` spawns genuine
+# child *processes*: they re-import the declarative config's `use:` target from scratch, so it
+# has to be importable on its own, not just defined in this process's memory.
+_COMBINED_TASK_MODULE = '''
+from pyattacker import RetryableError, task
+
+
+@task("combo.flaky_pool", retry={"max_attempts": 3, "base": 0.001, "cap": 0.01}, resource="apis")
+async def combo_flaky_pool(value, ctx):
+    async with ctx.acquire() as lease:
+        if ctx.attempt == 1:
+            raise RetryableError("first attempt fails on purpose")
+        return {"value": value, "resource": lease.resource.id}
+'''
+
 _COMBINED_CONFIG = """
 pools:
   apis:
@@ -213,29 +230,33 @@ source:
 pipeline:
   name: combo
   tasks:
-    - use: pyattacker.tasks:simulate_llm
-      resource: apis
-      retry: {max_attempts: 4, base: 0.001, cap: 0.01}
-      kwargs: {fail_rate: 0.5, latency_ms: 1}
+    - use: combo_flaky_pool_task:combo_flaky_pool
 run:
   concurrency: 3
 """
 
 
-def test_shards_with_retrying_resource_pool_pipelines_merge_cleanly(tmp_path, capsys):
+def test_shards_with_retrying_resource_pool_pipelines_merge_cleanly(tmp_path, capsys, monkeypatch):
     """None of the three subsystems has ever been exercised together before this test:
 
-    * `retry`/backoff (`simulate_llm`'s ``fail_rate`` guarantees some attempts are retried),
-    * a resource pool with `backoff` acquire (so a saturated pool actually parks a waiter), and
+    * `retry`/backoff (the task above fails attempt 1 and succeeds attempt 2 -- decided by
+      ``ctx.attempt``, not by chance, so the expected attempt/lease counts below are exact
+      rather than "at least"),
+    * a resource pool with a real ``ctx.acquire()`` and `backoff` acquire algorithm, and
     * `--shards`, which forks two separate child *processes* — each with its own event loop,
       its own pool instances, its own retry state.
 
     Passing individually says nothing about this combination: a resource pool's waiter queue or
-    a task's retry RNG could, in principle, leak process-global state across what should be
-    fully independent shard children. This proves they don't: the merged view accounts for
-    every pipeline exactly once, and every attempt/backoff actually happened (attempts_total is
-    strictly more than the pipeline count whenever fail_rate causes any retries).
+    a task's retry state could, in principle, leak across what should be fully independent shard
+    children. This proves they don't: the merged view accounts for every pipeline exactly once,
+    and every pipeline took exactly 2 attempts (1 failure + 1 success), each of which acquired a
+    real lease from that shard's own pool.
     """
+    (tmp_path / "combo_flaky_pool_task.py").write_text(_COMBINED_TASK_MODULE, encoding="utf-8")
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join([str(tmp_path), os.environ.get("PYTHONPATH", "")])
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))  # the parent's own --shards preflight also imports it
     cfg = tmp_path / "combo.yaml"
     cfg.write_text(textwrap.dedent(_COMBINED_CONFIG), encoding="utf-8")
     base = tmp_path / "combo.db"
@@ -257,12 +278,14 @@ def test_shards_with_retrying_resource_pool_pipelines_merge_cleanly(tmp_path, ca
         ids1 = {r.pipeline_id for r in rows1}
         assert not (ids0 & ids1)  # every pipeline is owned by exactly one shard
         assert len(ids0) + len(ids1) == 12
-        assert all(r.state == "succeeded" for r in rows0 + rows1)  # simulate_llm always retries enough to succeed
+        assert all(r.state == "succeeded" for r in rows0 + rows1)
+        # deterministic: attempt 1 always fails, attempt 2 always succeeds
+        assert all(r.attempts_total == 2 for r in rows0 + rows1)
 
         attempts0 = sum(r.attempts_total for r in rows0)
         attempts1 = sum(r.attempts_total for r in rows1)
-        # fail_rate=0.5 over 12 pipelines makes at least one retry near-certain in either shard
-        assert attempts0 + attempts1 > 12
+        assert attempts0 == 2 * len(rows0)
+        assert attempts1 == 2 * len(rows1)
 
         resources0 = store0.resources(pool="apis")
         resources1 = store1.resources(pool="apis")

@@ -645,14 +645,60 @@ class Runner:
             except Exception as exc:  # framework-level surprise: record it, don't take down the run
                 self._counters["pipelines_failed"] += 1
                 self._counters["pipelines_done"] += 1
+                tb = tb_mod.format_exc()
+                pipeline_id = self._finish_pipeline_after_internal_error(item, state, exc, run_id, tb)
                 self._check_all_done()
                 self._emit(
                     "runner.internal_error",
-                    pipeline_id=getattr(state, "pipeline_id", None),
-                    data={"error": f"{type(exc).__name__}: {exc}", "traceback": tb_mod.format_exc()},
+                    pipeline_id=pipeline_id,
+                    data={"error": f"{type(exc).__name__}: {exc}", "traceback": tb},
                 )
             finally:
                 queue.task_done()
+
+    def _finish_pipeline_after_internal_error(
+        self, item: Any, state: "_RunState | None", exc: Exception, run_id: str, tb: str
+    ) -> str | None:
+        """Give a framework-level surprise the same terminal representation a task failure gets.
+
+        The worker's counters (``pipelines_failed``/``pipelines_done``) already treat this
+        pipeline as terminally failed; the persisted row must agree, or the final report (and
+        the CLI's exit code, which reads the persisted failed-count) can disagree with the
+        scheduler and silently call the run a success. Two shapes reach here:
+        ``state`` already exists (``_drive`` raised mid-flight — its row is durable, just still
+        ``"running"``), or it does not (``_open_pipeline`` itself raised, possibly before ever
+        calling ``upsert_pipeline``) — in which case a row is created first so the pipeline does
+        not simply vanish from the report.
+        """
+        if state is not None:
+            self.store.finish_pipeline(
+                state.pipeline_id,
+                "failed",
+                n_tasks_done=state.record.n_tasks_done,
+                error=exc,
+                failed_task=state.task_spec.name,
+                traceback=tb,
+            )
+            return state.pipeline_id
+        if not isinstance(item, PipelineSpec):
+            return None  # nothing identifiable to attach the failure to
+        if self.store.get_pipeline(item.pipeline_id) is None:
+            self.store.upsert_pipeline(
+                PipelineRecord(
+                    pipeline_id=item.pipeline_id,
+                    run_id=run_id,
+                    name=item.name,
+                    key=item.key,
+                    tags=dict(item.template.tags),
+                    n_tasks_total=item.n_tasks,
+                    seed_digest=item.seed_digest,
+                    spec_digest=item.spec_digest,
+                    state="running",
+                    started_at=time.time(),
+                )
+            )
+        self.store.finish_pipeline(item.pipeline_id, "failed", n_tasks_done=0, error=exc, traceback=tb)
+        return item.pipeline_id
 
     # ------------------------------------------------------- pipeline execution
     def _open_pipeline(self, spec: PipelineSpec, run_id: str) -> _RunState | None:
