@@ -682,7 +682,13 @@ class Runner:
             return state.pipeline_id
         if not isinstance(item, PipelineSpec):
             return None  # nothing identifiable to attach the failure to
-        if self.store.get_pipeline(item.pipeline_id) is None:
+        # `state is None` only means _open_pipeline() never *returned* a _RunState -- it may
+        # already have restored and re-persisted an existing checkpoint (record.n_tasks_done)
+        # before raising later on. Leave n_tasks_done untouched when a row already exists, so
+        # a framework-level surprise can never rewind a durable checkpoint back to 0 and cause
+        # a later resume to re-run tasks that had already completed.
+        record = self.store.get_pipeline(item.pipeline_id)
+        if record is None:
             self.store.upsert_pipeline(
                 PipelineRecord(
                     pipeline_id=item.pipeline_id,
@@ -697,7 +703,9 @@ class Runner:
                     started_at=time.time(),
                 )
             )
-        self.store.finish_pipeline(item.pipeline_id, "failed", n_tasks_done=0, error=exc, traceback=tb)
+            self.store.finish_pipeline(item.pipeline_id, "failed", n_tasks_done=0, error=exc, traceback=tb)
+        else:
+            self.store.finish_pipeline(item.pipeline_id, "failed", error=exc, traceback=tb)
         return item.pipeline_id
 
     # ------------------------------------------------------- pipeline execution

@@ -409,6 +409,50 @@ def test_internal_error_report_never_looks_like_success():
     run(_case())
 
 
+def test_internal_error_during_resume_does_not_roll_back_the_checkpoint():
+    """``state is None`` in the exception handler does not mean nothing was persisted yet.
+
+    Regression: ``_open_pipeline`` restores an existing checkpoint and re-persists it
+    (``record.n_tasks_done = start_index`` -> ``upsert_pipeline``) *before* it can still raise
+    later (e.g. in ``_pool_problem`` or artifact I/O) without ever returning a ``_RunState``. The
+    original internal-error fix unconditionally wrote ``n_tasks_done=0`` in that case, silently
+    rewinding a durable checkpoint back to the start and making a later resume re-run tasks that
+    had already completed successfully -- a violation of the task-level checkpoint guarantee.
+    """
+    CALLS.update(fetch=0, ask=0)
+    BEHAVIOR["ask_fails"] = True
+    runner = Runner(store=":memory:", concurrency=1, handle_signals=False)
+    spec = next(iter(TEMPLATE.map([{"q": "checkpoint-test"}])))
+
+    first = runner.run([spec])
+    assert first.stats["pipelines"]["by_state"] == {"failed": 1}
+    record = runner.store.get_pipeline(spec.pipeline_id)
+    assert record.state == "failed"
+    assert record.n_tasks_done == 1  # r.fetch's output is checkpointed; only r.ask failed
+
+    def boom_pool_problem(_spec):
+        raise RuntimeError("framework surprise, after the resumed checkpoint was re-persisted")
+
+    runner._pool_problem = boom_pool_problem
+    second = runner.run([spec], resume=True)
+
+    assert second.stats["pipelines"]["by_state"] == {"failed": 1}
+    resumed_record = runner.store.get_pipeline(spec.pipeline_id)
+    assert resumed_record.state == "failed"
+    assert resumed_record.n_tasks_done == 1  # ★ preserved, not rewound to 0
+    events = runner.store.events(pipeline_id=spec.pipeline_id, limit=200)
+    assert any(e.kind == "runner.internal_error" for e in events)
+
+    # a further resume continues past the checkpoint instead of re-running r.fetch
+    del runner._pool_problem
+    BEHAVIOR["ask_fails"] = False
+    CALLS.update(fetch=0, ask=0)
+    third = runner.run([spec], resume=True)
+    assert third.stats["pipelines"]["by_state"] == {"succeeded": 1}
+    assert CALLS["fetch"] == 0  # r.fetch was not re-run: its checkpoint survived the internal error
+    assert CALLS["ask"] == 1
+
+
 def test_events_form_a_structured_per_pipeline_log():
     runner = Runner(store=":memory:", handle_signals=False)
     spec = next(iter(pipeline("log", flaky(1)).map([{"i": 0}])))
