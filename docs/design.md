@@ -199,6 +199,11 @@ This is the most easily confused part, so the implementation deliberately keeps 
 | Built-in | `immediate` (fail if unavailable) / `wait` (default) / `backoff` (exponential backoff + full jitter) / `least_busy` (pick the least-busy) / `failover` (switch pools in order) / `sticky` (stay on the resource this pipeline already used) / `quota_aware` (prefer the most remaining quota) | `Retrying(max_attempts, on, base, factor, cap, jitter, max_total_s)` |
 | Where it is declared | `@task(algorithm="backoff")` or `pool.algorithm` | `@task(retry={"max_attempts": 4, "on": ["RetryableError"]})` |
 
+`failover` tries every listed pool immediately, in order; if none has capacity, its `fallback`
+(`Wait()` by default) parks on `pools[0]` only — it does not loop the fallback across the whole
+list. Read the list as "try these, then settle on the primary", not "wait on whichever frees up
+first".
+
 **Failure classification** (`errors.error_class_of`, a pure function, unit-testable):
 408/504 in a `status`/`status_code` attribute → `timeout`, 425/429 → `rate_limit`, 5xx → `upstream`, 4xx → `fatal`;
 `TimeoutError` → `timeout`; `ConnectionError` → `connection`; `ValueError/TypeError/...` → `invalid`; everything
@@ -208,7 +213,8 @@ else → `unknown`. You can take over directly by raising
 **No retry by default** (`max_attempts=1`), preserving the simple "a failure is a failure" semantics; turn it
 on explicitly when you need it.
 **Every retry decision is persisted** (`attempts.decision_json`): `{retry, reason, delay_s, error_class, attempt, max_attempts, retry_after}`,
-with `reason ∈ {ok, retryable, attempts_exhausted, policy_declined, total_budget}`.
+with `reason ∈ {ok, retryable, attempts_exhausted, policy_declined, total_budget}`. `delay_s` is always present
+(`0.0` when there is nothing to delay), so code reading the schema never has to guard against a missing key.
 So "why did it retry 5 times / why did it give up" can be queried straight out of the database instead of being
 guessed at by digging through logs.
 
