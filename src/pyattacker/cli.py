@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,30 @@ _RUN_KEYS = {
 }
 
 
+def _warn_unresolved_env(spec: Any, *, leading_blank_line: bool = False) -> None:
+    """Same protection ``validate`` has always had, now also on the commands that actually spend the value."""
+    if spec.unresolved_env:
+        prefix = "\n" if leading_blank_line else ""
+        print(f"{prefix}Warning: unresolved environment variables {sorted(set(spec.unresolved_env))}", file=sys.stderr)
+
+
+@contextlib.contextmanager
+def _shard_env_preview(count: int) -> Iterator[None]:
+    """Make the orchestrator-owned shard variables visible for the parent's env preflight.
+
+    Only stands in for a variable the *user's own environment* does not already define, and only
+    for the duration of one ``load_spec()`` call — the children get the real per-shard value from
+    :func:`shard_env` when they load the config again.
+    """
+    added = {k: v for k, v in shard_env(0, count).items() if k not in os.environ}
+    os.environ.update(added)
+    try:
+        yield
+    finally:
+        for key in added:
+            del os.environ[key]
+
+
 def _open_readonly(path: str, backend: Any = None) -> SqliteStore:
     """Open an existing store read-only; give a human-readable error when the file is missing.
 
@@ -82,7 +107,8 @@ def _cmd_run(args: argparse.Namespace, *, resume: bool = False) -> int:
             raise ConfigError("--shard and --shards are mutually exclusive")
         return _run_shards(args, resume=resume)
 
-    spec = load_spec(args.config)
+    spec = load_spec(args.config, strict_env=args.strict_env)
+    _warn_unresolved_env(spec)
     run_cfg = {k: v for k, v in spec.run.items() if k in _RUN_KEYS}
     if args.store:
         run_cfg["store"] = args.store
@@ -167,6 +193,7 @@ _CHILD_FLAGS = (
     ("strict_leases", "--strict-leases"),
     ("no_write_behind", "--no-write-behind"),
     ("no_signals", "--no-signals"),
+    ("strict_env", "--strict-env"),
 )
 
 
@@ -197,7 +224,14 @@ def _run_shards(args: argparse.Namespace, *, resume: bool = False) -> int:
     count = int(args.shards)
     if count < 2:
         raise ConfigError("--shards must be >= 2 (use a single run otherwise)")
-    cfg = load_spec(args.config)
+    # The parent never runs any pipeline itself — every ${VAR} the config references is only
+    # actually spent inside a shard child, which gets shard_env() injected before it loads the
+    # config again (see _child_argv). So the parent's env check must see the same shard-only
+    # variables a child would, or a config that only references e.g. ${PYATACKER_SHARD} would
+    # falsely warn (or, with --strict-env, refuse to even start the children that would succeed).
+    with _shard_env_preview(count):
+        cfg = load_spec(args.config, strict_env=args.strict_env)
+    _warn_unresolved_env(cfg)
     base = str(args.store or cfg.run.get("store") or ":memory:")
     if base == ":memory:":
         raise ConfigError("--shards needs a file-backed store (set run.store or pass --store)")
@@ -446,8 +480,7 @@ def _cmd_plugins(args: argparse.Namespace) -> int:
 def _cmd_validate(args: argparse.Namespace) -> int:
     spec = load_spec(args.config, strict_env=args.strict_env)
     print(json.dumps(spec.describe(), ensure_ascii=False, indent=2))
-    if spec.unresolved_env:
-        print(f"\nWarning: unresolved environment variables {sorted(set(spec.unresolved_env))}", file=sys.stderr)
+    _warn_unresolved_env(spec, leading_blank_line=True)
     return 0
 
 
@@ -556,6 +589,11 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
         "--no-write-behind",
         action="store_true",
         help="commit every attempt/event immediately instead of batching them",
+    )
+    parser.add_argument(
+        "--strict-env",
+        action="store_true",
+        help="fail (exit 2) instead of warning when the config references an unset ${VAR}",
     )
 
 

@@ -665,3 +665,77 @@ def test_cli_run_shards_spawns_children_and_merges(cli_config, tmp_path, capsys)
         store1.close()
     assert not (ids0 & ids1)
     assert ids0 | ids1 == {spec.pipeline_id for spec in load_spec(cli_config).pipelines()}
+
+
+# ---------------------------------------------- --shards + --strict-env (${ENV} preflight)
+
+SHARD_PROVIDED_VAR_CONFIG = """
+source:
+  kind: range
+  n: 6
+pipeline:
+  name: cli-shard
+  tasks:
+    - use: echo
+run:
+  concurrency: 2
+  label: "${PYATACKER_SHARD}"
+"""
+
+ACTUALLY_MISSING_VAR_CONFIG = """
+source:
+  kind: range
+  n: 6
+pipeline:
+  name: cli-shard
+  tasks:
+    - use: echo
+run:
+  concurrency: 2
+  label: "${CLI_SHARD_TEST_DEFINITELY_UNSET}"
+"""
+
+
+def test_cli_run_shards_strict_env_accepts_the_shard_provided_variable(tmp_path, capsys, monkeypatch):
+    """${PYATACKER_SHARD} is only ever set inside a shard child (see shard_env()); the parent's
+    own --strict-env preflight must not treat it as missing, or every --shards run referencing it
+    would fail before a single child started."""
+    monkeypatch.delenv("PYATACKER_SHARD", raising=False)
+    cfg = tmp_path / "shard.yaml"
+    cfg.write_text(textwrap.dedent(SHARD_PROVIDED_VAR_CONFIG), encoding="utf-8")
+    base = tmp_path / "multi.db"
+    capsys.readouterr()
+
+    try:
+        rc = main(["run", "-c", str(cfg), "--shards", "2", "--jobs", "2", "--store", str(base), "--strict-env"])
+    except OSError as exc:  # pragma: no cover - only on an environment that cannot spawn a child
+        pytest.skip(f"cannot spawn shard children in this environment: {exc}")
+
+    assert rc == 0
+    assert "Warning: unresolved environment variables" not in capsys.readouterr().err
+    assert (tmp_path / "multi.shard0of2.db").exists()
+    assert (tmp_path / "multi.shard1of2.db").exists()
+
+
+def test_cli_run_shards_strict_env_still_rejects_a_genuinely_missing_variable(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("CLI_SHARD_TEST_DEFINITELY_UNSET", raising=False)
+    cfg = tmp_path / "shard.yaml"
+    cfg.write_text(textwrap.dedent(ACTUALLY_MISSING_VAR_CONFIG), encoding="utf-8")
+    base = tmp_path / "multi.db"
+    capsys.readouterr()
+
+    rc = main(["run", "-c", str(cfg), "--shards", "2", "--store", str(base), "--strict-env"])
+
+    assert rc == 2
+    assert "CLI_SHARD_TEST_DEFINITELY_UNSET" in capsys.readouterr().err
+    assert not (tmp_path / "multi.shard0of2.db").exists()  # failed before any child was spawned
+
+
+def test_child_argv_propagates_strict_env_to_shard_children():
+    from pyattacker.cli import _child_argv
+
+    args = SimpleNamespace(config="spec.yaml", limit=None, concurrency=None, journal=None, label=None,
+                            stop_after_failures=None, retry_succeeded=False, strict_leases=False,
+                            no_write_behind=False, no_signals=False, strict_env=True)
+    argv = _child_argv(args, 0, 2, "shard0.db", resume=False)
+    assert "--strict-env" in argv
