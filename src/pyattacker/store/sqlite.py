@@ -162,6 +162,19 @@ def _dumps(obj: Any) -> str:
 
 
 class SqliteStore:
+    """The default, file-backed :class:`~pyattacker.store.base.Store` implementation.
+
+    Invariants: WAL + ``synchronous=NORMAL`` and a single writer connection (see module
+    docstring); state writes (pipelines/tasks) are synchronous so a crash never leaves a gap
+    between "the scheduler thinks this happened" and "the row says so" — only append-only facts
+    (attempts/events) are ever eligible for batching, and only when wrapped in
+    ``WriteBehindStore``.
+
+    Collaborators: normally not constructed directly — ``open_store(path)`` builds one and, for
+    a file-backed store, wraps it in ``store/writebehind.py``'s ``WriteBehindStore`` unless
+    write-behind was explicitly disabled.
+    """
+
     def __init__(
         self,
         path: str,

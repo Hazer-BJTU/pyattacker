@@ -140,6 +140,22 @@ ERROR_CLASSES = (
 
 _RETRYABLE_CLASSES = frozenset({"retryable", "rate_limit", "timeout", "connection", "upstream"})
 
+# Each bracket is a framework retry-policy grouping, not a restatement of HTTP semantics — the
+# question each answers is "is trying again likely to help", and that is what decides whether it
+# lands in _RETRYABLE_CLASSES:
+# - 408/504: the request itself may have just been slow -> "timeout", worth another try.
+# - 425 ("Too Early", not itself a rate-limit status) / 429 (actual rate limiting): grouped
+#   together as "rate_limit" because both mean "retry, just not immediately" from the caller's
+#   side, not because 425 and 429 share HTTP semantics. retry_after_of() honors a server-supplied
+#   Retry-After delay independently of this classification, so it applies just as much to a
+#   retryable 5xx as it does to these.
+# - remaining 5xx (504 is already claimed above by "timeout") -> "upstream": the server, not the
+#   request, is the problem, so retrying is reasonable regardless of which 5xx it is; splitting
+#   them further has not earned its keep.
+# - 4xx (validation/auth/not-found/conflict/payload errors) -> "fatal": the request is wrong as
+#   sent, and retrying it unchanged would just fail again.
+# Adding a new provider-specific status code: pick the bucket by that logic, not by proximity to
+# an existing number.
 _STATUS_RULES: tuple[tuple[tuple[int, ...], str], ...] = (
     ((408, 504), "timeout"),
     ((425, 429), "rate_limit"),

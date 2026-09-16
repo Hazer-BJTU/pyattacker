@@ -9,6 +9,7 @@ logic that decides who gets woken.
 from __future__ import annotations
 
 import asyncio
+import random
 
 import pytest
 from helpers import FakeClock, run
@@ -24,8 +25,10 @@ from pyattacker import (
     Sticky,
     Wait,
 )
+from pyattacker.algorithm import backoff_delay
 from pyattacker.errors import ResourceUnavailable
 from pyattacker.resource import _Waiter
+from pyattacker.task import Retrying
 
 
 class _Ctx:
@@ -517,5 +520,72 @@ def test_wait_and_backoff_skip_a_broken_resource_instead_of_raising(algorithm):
             lease = await pool.acquire()
             assert lease.resource.id == "good"
             lease.release_now()
+
+    run(_case())
+
+
+@pytest.mark.parametrize("jitter", ["none", "full", "equal"])
+def test_backoff_delay_matches_retrying_delay_for(jitter):
+    """`Backoff.acquire` and `Retrying.delay_for` must compute backoff identically.
+
+    Both used to carry their own copy of the "exponential + jitter" formula; now both call the
+    shared `backoff_delay`, so this pins the contract rather than either call site's formula.
+    """
+    retry = Retrying(base=0.5, factor=2.0, cap=30.0, jitter=jitter)
+    for attempt in range(1, 6):
+        rng_a = random.Random(1234)
+        rng_b = random.Random(1234)
+        direct = backoff_delay(attempt, rng_a, base=0.5, factor=2.0, cap=30.0, jitter=jitter)
+        via_retrying = retry.delay_for(attempt, rng_b)
+        assert via_retrying == direct
+
+
+def test_backoff_delay_full_jitter_is_bounded_and_varies():
+    rng = random.Random(42)
+    samples = [backoff_delay(3, rng, base=0.5, factor=2.0, cap=30.0, jitter="full") for _ in range(20)]
+    raw = min(30.0, 0.5 * 2.0 ** (3 - 1))
+    assert all(0.0 <= s <= raw for s in samples)
+    assert len(set(samples)) > 1
+
+
+def test_backoff_delay_respects_cap():
+    rng = random.Random(7)
+    delay = backoff_delay(50, rng, base=0.5, factor=2.0, cap=30.0, jitter="none")
+    assert delay == 30.0
+
+
+def test_backoff_acquire_delay_matches_backoff_delay_directly():
+    """`Backoff.acquire` itself (not just `Retrying.delay_for`) must call the shared `backoff_delay`.
+
+    Runs the real algorithm against a saturated pool and checks the delays it asks the clock to
+    sleep against `backoff_delay` computed with an independently-seeded RNG in the same state,
+    rather than only inferring this from reading the source.
+    """
+
+    async def _case():
+        clock = FakeClock()
+        pool = Pool("apis", [Resource.create("llm", id="only", capacity=1)], clock=clock)
+        holder = await pool.acquire()  # saturate the only resource
+
+        ctx = _Ctx()
+        ctx.rng = random.Random(99)
+        expected_rng = random.Random(99)
+        algo = Backoff(base=0.2, factor=2.0, cap=10.0, jitter="full", max_wait=100.0)
+
+        async def _release_after_n_backoffs(n: int) -> None:
+            while len(clock.sleeps) < n:
+                await asyncio.sleep(0)
+            holder.release_now()
+
+        release_task = asyncio.create_task(_release_after_n_backoffs(3))
+        lease = await algo.acquire(pool, ctx=ctx)
+        await release_task
+        assert lease is not None
+
+        expected = [
+            backoff_delay(attempt, expected_rng, base=0.2, factor=2.0, cap=10.0, jitter="full")
+            for attempt in range(1, len(clock.sleeps) + 1)
+        ]
+        assert clock.sleeps == expected
 
     run(_case())

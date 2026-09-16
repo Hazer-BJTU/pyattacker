@@ -212,6 +212,28 @@ def _build_pool(name: str, spec: Mapping[str, Any]) -> Pool:
 
 @dataclass
 class DeclarativeSpec:
+    """A fully-resolved config file: pools + pipeline template + run parameters, ready to hand to a :class:`~pyattacker.runner.Runner`.
+
+    Collaborators: produced by :func:`load_spec`; :meth:`pipelines` is what a CLI ``run`` command
+    actually iterates to get :class:`~pyattacker.pipeline.PipelineSpec` instances.
+
+    Attributes:
+        path: Source config file path, kept for error messages and :meth:`describe`.
+        template: The built, validated :class:`~pyattacker.pipeline.PipelineTemplate`.
+        pools: Resource pools declared under ``pools:``, ready to pass to ``Runner(pools=...)``.
+        run: The raw ``run:`` section (concurrency, store, etc.) — not validated here; the CLI
+            maps it onto :class:`~pyattacker.runner.RunConfig` fields.
+        source: The raw ``source:`` section describing how to generate seeds (``kind``/``repeats``/
+            ``key_field`` plus factory-specific keys); consumed by :meth:`seeds`/:meth:`pipelines`.
+        raw: The config with ``${VAR}`` references expanded where resolvable; in non-strict mode
+            an unresolved reference is left as the literal ``${VAR}`` placeholder rather than
+            raising (see :func:`expand_env`) — this is *not* guaranteed to be fully expanded.
+            Kept for :meth:`describe` and debugging.
+        unresolved_env: Names of ``${VAR}`` references that had no default and no environment
+            value (only populated when ``load_spec`` was *not* called with ``strict_env=True``,
+            since strict mode raises instead of collecting them).
+    """
+
     path: str
     template: PipelineTemplate
     pools: list[Pool] = field(default_factory=list)
