@@ -585,9 +585,13 @@ depends on them.
   precedence, and extracting a server-suggested `retry_after` from both a direct attribute and response headers.
 * `tests/test_monitor.py` — the `watch` terminal renderer: progress-bar clamping/rounding, run-scoped vs.
   store-wide snapshots, pool bars, and the leaked-leases/stopping indicators.
-* `tests/test_tasks.py` — `shell_run`: string vs. argv form, and that no placement of untrusted input in a
-  command template is vulnerable to shell injection (the other built-in mock tasks are exercised incidentally
-  wherever other test files need a stand-in task, rather than in a dedicated file).
+* `tests/test_tasks.py` — `shell_run`: string vs. argv form; string commands reject `{value}` interpolation
+  outright, while argv commands pass the substituted value as one literal argument via
+  `create_subprocess_exec`, without implicit shell interpretation. (If the argv form's own command explicitly
+  invokes a shell or another interpreter, e.g. `["sh", "-c", ...]`, that interpreter's input-safety semantics
+  are the caller's responsibility — the guarantee here is "no *implicit* shell", not "safe with any program".)
+  The other built-in mock tasks are exercised incidentally wherever other test files need a stand-in task,
+  rather than in a dedicated file.
 * `tests/test_tutorial.py` — every code block in `docs/tutorial.md` marked as a complete program
   (`# tutorial/<name>.py`) is extracted and actually run, so the tutorial cannot silently rot out of sync
   with the real API.

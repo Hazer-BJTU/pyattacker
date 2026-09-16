@@ -27,24 +27,24 @@ want "how does X work", use this table instead of scanning headings:
 | Feature | This tutorial | `design.md` | Source |
 |---|---|---|---|
 | Core concepts (artifact/task/pipeline/runner) | [Step 1](#step-1--one-seed-one-task-one-run) | [§3](design.md#3-conceptual-model) | `pipeline.py`, `task.py`, `runner.py` |
-| `map`/streaming, pass@k (`repeats=`) | [Step 2](#step-2--many-inputs-at-once) | §3 | `pipeline.py` |
-| Pipeline composition, artifact-type chaining | [Step 3](#step-3--chaining-tasks) | §3 | `pipeline.py` |
+| `map`/streaming, pass@k (`repeats=`) | [Step 2](#step-2--many-inputs-at-once) | [§3](design.md#3-conceptual-model) | `pipeline.py` |
+| Pipeline composition, artifact-type chaining | [Step 3](#step-3--chaining-tasks) | [§3](design.md#3-conceptual-model) | `pipeline.py` |
 | Checkpoint/artifact, content addressing, `spec_digest` | [Step 4](#step-4--the-checkpoint-is-the-artifact) | [§4.1](design.md#41-task-level-checkpoint-and-recovery) | `artifact.py`, `runner.py` |
 | Resource pools, basics | [Step 5](#step-5--endpoints-as-a-pool) | [§4.3](design.md#43-resource-pool) | `resource.py` |
 | Resource pool state machine (READY/DEGRADED/DEAD/REVOKED) | *no tutorial step yet — only appears as bare config in Step 11* | [§4.3](design.md#43-resource-pool) | `resource.py` |
 | Publish/subscribe bus (`ctx.subscribe`/`ctx.publish_resource`) | *no tutorial step yet* | [§4.3](design.md#43-resource-pool) | `resource.py` (`Bus`, `Pool.subscribe`) |
 | Acquire algorithms (wait/backoff/least\_busy/failover/sticky/quota\_aware) | [Step 6](#step-6--choosing-how-to-wait) | [§4.4](design.md#44-algorithm-and-retry-are-two-orthogonal-axes) | `algorithm.py` |
-| Lease safety contract | [Step 7](#step-7--the-lease-contract) | [design.md](design.md), §4.2 | `task.py`, `resource.py` |
+| Lease safety contract | [Step 7](#step-7--the-lease-contract) | [§4.2](design.md#42--lease-safety-contract) | `task.py`, `resource.py` |
 | Error classification, retry/backoff policy | [Step 8](#step-8--failures-classify-retry-record) | [§4.4](design.md#44-algorithm-and-retry-are-two-orthogonal-axes) | `errors.py`, `algorithm.py` |
 | Resume / recovery | [Step 9](#step-9--resume-what-reruns-and-what-does-not) | [§4.1](design.md#41-task-level-checkpoint-and-recovery) | `runner.py` |
 | Scheduler internals (`DelayQueue`, write-behind batching) | *mentioned only in passing (end of Step 8, troubleshooting notes) — no dedicated step* | [§4.5](design.md#45-delayed-continuations-and-batched-facts-m2) | `scheduler.py`, `store/writebehind.py` |
-| Data model / store tables, export | [Step 10](#step-10--reading-the-record) | [design.md](design.md), §5 | `store/`, `export.py` |
+| Data model / store tables, export | [Step 10](#step-10--reading-the-record) | [§5](design.md#5-data-model-sqlite-wal--synchronousnormal) | `store/`, `export.py` |
 | Declarative config | [Step 11](#step-11--the-declarative-path-and-the-cli) | [§6.2](design.md#62-declarative-simple-tasks) | `declarative.py` |
 | CLI reference (`validate`/`run`/`resume`/`report`/`watch`/`export`/`serve`/`plugins`/`demo`) | scattered across [Step 0](#step-0--install-and-sanity-check), [Step 11](#step-11--the-declarative-path-and-the-cli), [Step 12](#step-12--sharding-and-merging) — no single summary table yet | — | `cli.py` |
 | Sharding and merging | [Step 12](#step-12--sharding-and-merging) | [§6.3](design.md#63-sharding-merging-and-export-m3) | `shard.py`, `merge.py` |
 | Monitoring / HTTP endpoint | *one sentence at the end of Step 14 — no runnable example* | [§4.6](design.md#46-monitoring-cares-about-traffic-and-blocking-not-about-metrics), [§6.4](design.md#64-plugins-backends-and-the-monitoring-endpoint-m4) | `server.py`, `monitor.py` |
 | Custom types / codecs, artifact backends, plugins | [Step 14](#step-14--your-own-types-blobs-plugins) | [§6.4](design.md#64-plugins-backends-and-the-monitoring-endpoint-m4) | `artifact.py`, `backends.py`, `plugins.py` |
-| Fan-out / branching, integration-scale example | [Step 13](#step-13--capstone-a-small-model-evaluation) | — | `tasks.py` (`fanout`) |
+| Fan-out / branching, integration-scale example | [Step 13](#step-13--capstone-a-small-model-evaluation) | — | `tasks/__init__.py` (`fanout`) |
 
 Rows marked "no tutorial step yet" are real gaps in this tutorial, not omissions from this table.
 The `design.md`/source columns are the actual reference for those until a step is written.
