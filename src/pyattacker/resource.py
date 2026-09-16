@@ -54,6 +54,24 @@ class ResourceState(str, Enum):
 
 @dataclass
 class ResourceStats:
+    """Running counters for one :class:`Resource` inside a pool. All fields are cumulative for the pool's lifetime.
+
+    Attributes:
+        active: Leases currently held (0 <= active <= resource.capacity).
+        leases: Total leases ever handed out.
+        ok / failed: Outcomes reported via ``lease.report(ok=...)``.
+        leaked: Leases force-reclaimed because a task ended without releasing them.
+        waits: Acquisitions that had to wait (``waited_ms > 0``) before this resource was handed out.
+        wait_ms_total: Sum of wait time (ms) across ``waits`` acquisitions, for computing an average.
+        consecutive_failures: Failures in a row since the last ``ok=True`` report; drives the
+            degrade/dead circuit breaker and is *not* reset by a cooldown expiring (see ``_Slot.state_at``).
+        degraded_count: How many times this resource has entered ``DEGRADED``.
+        latency_ms_ema: Exponential moving average of reported ``latency_ms`` (None until the first report).
+        usage: Free-form cumulative usage metrics (e.g. ``{"tokens": ...}``), consumed by
+            :class:`~pyattacker.algorithm.QuotaAware`.
+        last_used_at: Clock time of the most recent ``report()`` call.
+    """
+
     active: int = 0
     leases: int = 0
     ok: int = 0
@@ -260,7 +278,21 @@ class ResourceEvent:
 
 
 class Pool:
-    """Resource pool: a group of like resources + a default acquire algorithm + a state event stream."""
+    """A group of like resources + a default acquire algorithm + a state event stream.
+
+    Invariants: see the module docstring — every state change here is synchronous and
+    single-threaded-safe, every lease is returned exactly once, and every state change emits a
+    :class:`ResourceEvent`.
+
+    Collaborators: :class:`Lease` (what ``acquire``/``select``/``try_acquire`` hand back),
+    :class:`~pyattacker.algorithm.AcquireAlgorithm` (the pluggable "how to wait" strategy that
+    :meth:`acquire` delegates to), and :class:`Bus`/``on_event`` (where published events fan out to).
+
+    Failure modes: if a resource's ``factory`` raises, that resource is dropped from the
+    candidate set for this call (and pushed toward degraded/dead via the same circuit breaker as
+    a reported failure) rather than making the whole pool look unavailable; :class:`ResourceUnavailable`
+    is only raised once every candidate has been tried and failed.
+    """
 
     def __init__(
         self,
@@ -805,6 +837,21 @@ class Pool:
 
 @dataclass
 class PoolStats:
+    """Aggregate snapshot across every resource matching a :meth:`Pool.stats` selector.
+
+    Attributes:
+        total: Number of resources considered (after selector/``where`` filtering).
+        ready / degraded / dead / revoked: Resource counts by :class:`ResourceState`.
+        active / capacity: Leases currently held / total concurrent-lease capacity, across those resources.
+        waiting: Callers currently blocked in :meth:`Pool.wait_slot` (approximately — a pool-wide count,
+            not filtered by this selector).
+        leases_total / ok_total / failed_total / leaked_total: Cumulative counters, summed across resources.
+        usage: Cumulative usage metrics, summed across resources (see ``ResourceStats.usage``).
+        waits_total: Acquisitions that waited, summed across resources.
+        wait_ms_avg / wait_ms_p50 / wait_ms_p95 / wait_ms_max: Wait-time distribution over the pool's
+            most recent samples (bounded window, not all-time); ``None`` when there are no samples yet.
+    """
+
     name: str
     kind: str | None
     total: int

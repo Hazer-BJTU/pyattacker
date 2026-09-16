@@ -26,6 +26,15 @@ __all__ = ["Chain", "PipelineTemplate", "PipelineSpec", "pipeline"]
 
 @dataclass(frozen=True)
 class Chain:
+    """An ordered, not-yet-validated sequence of tasks —— what ``a | b | c`` builds before :func:`pipeline` runs it.
+
+    Invariants: immutable; ``|`` always returns a new ``Chain`` rather than mutating either side,
+    so an intermediate chain can be reused as a building block for several pipelines.
+
+    Collaborators: :func:`pipeline` is what turns a finished ``Chain`` into a validated
+    :class:`PipelineTemplate` (checking that adjacent tasks' artifact types actually chain).
+    """
+
     tasks: tuple[TaskSpec, ...]
 
     def __or__(self, other: Any) -> "Chain":

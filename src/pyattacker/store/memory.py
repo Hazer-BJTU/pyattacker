@@ -20,6 +20,16 @@ __all__ = ["MemoryStore"]
 
 
 class MemoryStore:
+    """Pure in-memory :class:`~pyattacker.store.base.Store` implementation — for tests, dry runs, and "nothing hits disk" scenarios.
+
+    Invariants: satisfies the same semantics as :class:`~pyattacker.store.sqlite.SqliteStore`
+    (state writes are synchronous, journal modes behave the same way), but every read/write is a
+    plain dict/list operation — no serialization round-trip, no durability across process restarts.
+
+    Collaborators: constructed by ``open_store(":memory:")``; interchangeable with
+    ``SqliteStore`` anywhere a ``Store`` is expected.
+    """
+
     def __init__(self, *, journal: str = "full", backend: Any = None) -> None:
         self.journal = journal
         from ..backends import resolve_backend

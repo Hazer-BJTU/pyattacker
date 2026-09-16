@@ -24,6 +24,7 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from .algorithm import backoff_delay
 from .artifact import DEFAULT_REGISTRY, CodecRegistry, digest_of
 from .errors import (
     ConfigError,
@@ -69,17 +70,37 @@ class Retrying:
         """Backoff duration after the given attempt fails (``attempt`` starts at 1)."""
         if retry_after is not None:
             return max(0.0, retry_after)
-        raw = min(self.cap, self.base * self.factor ** max(0, attempt - 1))
-        if self.jitter == "full":
-            return rng.uniform(0, raw)
-        if self.jitter == "equal":
-            return raw / 2 + rng.uniform(0, raw / 2)
-        return raw
+        return backoff_delay(attempt, rng, base=self.base, factor=self.factor, cap=self.cap, jitter=self.jitter)
 
 
 @dataclass(frozen=True)
 class TaskSpec:
-    """Static description of a task. All runtime state lives in :class:`TaskContext`."""
+    """Static description of a task. All runtime state lives in :class:`TaskContext`.
+
+    Invariants: immutable; ``@task``/``build_task_spec`` build one once at decoration time, and
+    ``with_overrides`` returns a new instance rather than mutating in place (needed because a
+    ``TaskSpec`` is reused as-is across every pipeline built from the same template).
+
+    Collaborators: :func:`~pyattacker.pipeline.pipeline`/:class:`~pyattacker.pipeline.Chain`
+    validate adjacent specs' ``accepts``/``returns`` before assembling a pipeline;
+    :class:`~pyattacker.runner.Runner` calls ``__call__`` once per attempt with the current value
+    and (if ``takes_ctx``) a fresh :class:`TaskContext`.
+
+    Attributes:
+        fn: The wrapped callable; ``(value)`` or ``(value, ctx)`` depending on ``takes_ctx``.
+        resource: Default pool name this task acquires from (``ctx.acquire()`` with no ``pool=``
+            falls back to this); ``None`` means the task must always name its pool explicitly.
+        algorithm: Default acquire algorithm for this task's resource acquisitions.
+        retry: Retry policy applied when an attempt of this task raises.
+        timeout_s: Wall-clock timeout for one attempt (only meaningful for an async ``fn``).
+        accepts / returns: Type hints inferred from ``fn``'s signature; used only for the adjacent-task
+            compatibility check at pipeline-build time — not enforced at runtime.
+        takes_ctx: Whether ``fn`` takes a second ``(value, ctx)`` parameter; inferred from ``fn``'s
+            positional-parameter count when the spec is built.
+        module / qualname / code_digest: Identify *this exact version* of the task's code; folded
+            into the pipeline's ``spec_digest`` so that changing a task's source invalidates old
+            checkpoints instead of silently reusing them (see ``pipeline.py`` module docstring).
+    """
 
     name: str
     fn: Callable[..., Any]
@@ -283,6 +304,9 @@ class _LeaseGuard:
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         if self.lease is not None:
             self.lease.release_now()  # synchronous, idempotent, uninterruptible
+        # Deliberately not `True`: the lease safety contract (docs/design.md §4.2) promises that a
+        # failure inside the `with` block still propagates. Swallowing it here would silently turn
+        # every task exception into a successful-looking task.
         return False
 
 

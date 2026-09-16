@@ -9,6 +9,7 @@ logic that decides who gets woken.
 from __future__ import annotations
 
 import asyncio
+import random
 
 import pytest
 from helpers import FakeClock, run
@@ -24,8 +25,10 @@ from pyattacker import (
     Sticky,
     Wait,
 )
+from pyattacker.algorithm import backoff_delay
 from pyattacker.errors import ResourceUnavailable
 from pyattacker.resource import _Waiter
+from pyattacker.task import Retrying
 
 
 class _Ctx:
@@ -519,3 +522,33 @@ def test_wait_and_backoff_skip_a_broken_resource_instead_of_raising(algorithm):
             lease.release_now()
 
     run(_case())
+
+
+@pytest.mark.parametrize("jitter", ["none", "full", "equal"])
+def test_backoff_delay_matches_retrying_delay_for(jitter):
+    """`Backoff.acquire` and `Retrying.delay_for` must compute backoff identically.
+
+    Both used to carry their own copy of the "exponential + jitter" formula; now both call the
+    shared `backoff_delay`, so this pins the contract rather than either call site's formula.
+    """
+    retry = Retrying(base=0.5, factor=2.0, cap=30.0, jitter=jitter)
+    for attempt in range(1, 6):
+        rng_a = random.Random(1234)
+        rng_b = random.Random(1234)
+        direct = backoff_delay(attempt, rng_a, base=0.5, factor=2.0, cap=30.0, jitter=jitter)
+        via_retrying = retry.delay_for(attempt, rng_b)
+        assert via_retrying == direct
+
+
+def test_backoff_delay_full_jitter_is_bounded_and_varies():
+    rng = random.Random(42)
+    samples = [backoff_delay(3, rng, base=0.5, factor=2.0, cap=30.0, jitter="full") for _ in range(20)]
+    raw = min(30.0, 0.5 * 2.0 ** (3 - 1))
+    assert all(0.0 <= s <= raw for s in samples)
+    assert len(set(samples)) > 1
+
+
+def test_backoff_delay_respects_cap():
+    rng = random.Random(7)
+    delay = backoff_delay(50, rng, base=0.5, factor=2.0, cap=30.0, jitter="none")
+    assert delay == 30.0

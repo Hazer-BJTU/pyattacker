@@ -86,6 +86,44 @@ class _RealClock:
 
 @dataclass
 class RunConfig:
+    """Everything that shapes one call to :meth:`Runner.run`/``run_async``.
+
+    Invariants:
+    * Fully immutable-in-spirit: ``Runner.__init__`` only ever reads a snapshot of this via
+      ``dataclasses.replace`` when overrides are passed; it does not mutate a shared instance.
+
+    Attributes:
+        store: Where state lives — ``":memory:"``, a sqlite path, a store plugin URI, or an
+            already-open :class:`~pyattacker.store.base.Store` instance.
+        journal: ``"full"`` keeps artifact payloads (required for resume); ``"summary"`` keeps
+            only metadata, so a resumed pipeline must re-run from the beginning.
+        concurrency: Max attempts in flight at once — not max pipelines in flight, since a
+            pipeline waiting out a retry backoff is parked and does not occupy a worker slot.
+        run_id: Explicit run id; default is a timestamp+digest string.
+        resume: When true, ``interrupt_stale`` runs first and ``_open_pipeline`` restores any
+            existing checkpoint instead of starting from the seed.
+        retry_succeeded: When true, re-run pipelines already marked ``"succeeded"`` instead of
+            skipping them (for re-evaluation passes over the same store).
+        heartbeat_s: How often the run's heartbeat is written; drives ``stale_after_s`` staleness
+            detection for other runners sharing the same store.
+        grace_s: How long a graceful shutdown waits for in-flight workers before cancelling them.
+        stale_after_s: A running pipeline whose owning run's heartbeat is older than this (and
+            that run is not this one) is considered abandoned and gets marked interrupted.
+        strict_leases: When true, a task ending while still holding a lease is a task failure
+            (``LeaseLeakError``) instead of a force-reclaimed-and-recorded event.
+        stop_after_failures / stop_after_s: Optional run-level budgets; once hit, the run stops
+            admitting new pipelines and drains in-flight ones.
+        handle_signals: Install SIGINT/SIGTERM handlers that call ``Runner.stop`` (main thread only).
+        seed: Mixed into the deterministic per-attempt RNG seed alongside pipeline id/seq/attempt.
+        write_behind: ``None`` (auto) batches append-only facts (attempts + events) for file-backed
+            stores only; state writes (pipelines/tasks) are always synchronous. See
+            ``store/writebehind.py`` for the failure model of a batched write.
+        write_batch / flush_interval: Batching knobs when write-behind is active.
+        artifact_backend: Where artifact payloads live — ``None``/``"inline"`` keeps them in the
+            store; a file backend spills large ones to disk (see ``backends.py``).
+        meta: Free-form metadata recorded on the run (digested into ``spec_digest``).
+    """
+
     store: Any = ":memory:"
     journal: str = "full"  # full | summary
     concurrency: int = 16
@@ -115,6 +153,27 @@ class RunConfig:
 
 @dataclass
 class RunReport:
+    """The result of one completed (or interrupted) run —— returned by :meth:`Runner.run`.
+
+    Collaborators: ``store`` (kept so :meth:`summary`/:meth:`export_jsonl` can read back error
+    detail and full pipeline rows after the run has already finished) and
+    :meth:`~pyattacker.store.base.Store.stats`, whose return value populates ``stats`` verbatim.
+
+    Attributes:
+        run_id: The id this run was recorded under.
+        status: ``"completed"`` or ``"interrupted"`` (a stop condition, signal, or cancellation).
+        duration_ms: Wall-clock duration of the run loop (not counting store teardown).
+        stats: The store's aggregate view for this run — pipeline/task counts by state, latency
+            percentiles, etc. (see ``Store.stats``); this is what :meth:`to_dict` flattens.
+        skipped: Pipelines skipped because they were already ``"succeeded"`` (and
+            ``retry_succeeded`` was false).
+        leases_leaked: Leases force-reclaimed because a task ended while still holding them.
+        stop_reason: Why the run stopped early (``"stop_after_failures"``, ``"signal"``, ...);
+            ``None`` when every admitted pipeline simply ran to completion.
+        store: The store this run used; kept for post-run introspection, not part of the report's
+            own data (two reports can legitimately share one store, e.g. across a resume).
+    """
+
     run_id: str
     status: str
     started_at: float
@@ -980,6 +1039,10 @@ class Runner:
         # that already durably happened. Pipeline state writes are synchronous by convention
         # (see store/base.py), so one extra write per attempt is the correct trade, not batched.
         self.store.upsert_pipeline(state.record)
+        # Deterministic seed, not the shared `random` module: re-running the same pipeline/seq/attempt
+        # (e.g. replaying a resumed run against the same checkpoint) must reproduce the same backoff
+        # jitter and the same ctx.seed, or two "identical" runs would silently diverge. Do not switch
+        # this to random.Random() without a good reason.
         rng = random.Random(int(digest_of(f"{spec.pipeline_id}|{seq}|{attempts_used}")[:16], 16))
         ctx = TaskContext(
             run_id=state.run_id,

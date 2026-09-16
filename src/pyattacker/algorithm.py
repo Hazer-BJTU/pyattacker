@@ -32,7 +32,24 @@ __all__ = [
     "QuotaAware",
     "resolve_algorithm",
     "ALGORITHMS",
+    "backoff_delay",
 ]
+
+
+def backoff_delay(attempt: int, rng: random.Random, *, base: float, factor: float, cap: float, jitter: str) -> float:
+    """Exponential backoff + jitter, shared by :class:`Backoff` (acquire) and ``Retrying.delay_for`` (retry).
+
+    Both call sites want the same "raw exponential, then jitter" shape even though they back off
+    for different reasons (waiting for pool capacity vs. waiting to retry a failed attempt); a
+    single implementation means changing the formula (e.g. to decorrelated jitter) only has to
+    happen once, instead of two copies quietly drifting apart from each other.
+    """
+    raw = min(cap, base * factor ** max(0, attempt - 1))
+    if jitter == "full":
+        return rng.uniform(0, raw)
+    if jitter == "equal":
+        return raw / 2 + rng.uniform(0, raw / 2)
+    return raw
 
 
 @runtime_checkable
@@ -124,13 +141,7 @@ class Backoff:
                 pool.note_wait(lease, (pool.clock.now() - started) * 1000.0, selector=selector)
                 return lease
             attempt += 1
-            raw = min(self.cap, self.base * self.factor ** (attempt - 1))
-            if self.jitter == "full":
-                delay = rng.uniform(0, raw)
-            elif self.jitter == "equal":
-                delay = raw / 2 + rng.uniform(0, raw / 2)
-            else:
-                delay = raw
+            delay = backoff_delay(attempt, rng, base=self.base, factor=self.factor, cap=self.cap, jitter=self.jitter)
             elapsed = pool.clock.now() - started
             if limit is not None and elapsed + delay >= limit:
                 raise AcquireTimeout(f"timed out waiting for a resource with backoff ({limit}s): {_describe(pool, selector, where)}")

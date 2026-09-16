@@ -40,6 +40,19 @@ def _now() -> float:
 
 @dataclass
 class RunRecord:
+    """One call to ``Runner.run``/``run_async`` —— the top level of the store's data model.
+
+    Attributes:
+        run_id: Unique id for this run; the scope every stats/report query filters by.
+        status: ``"running"`` while in progress, then ``"completed"``/``"interrupted"``.
+        heartbeat_at: Updated periodically while running; other runners sharing the same store use
+            a stale heartbeat to detect an abandoned run (see ``interrupt_stale``).
+        spec_digest: Digest of the run's ``meta`` config, for distinguishing otherwise-identical runs.
+        code_version: The ``pyattacker`` package version that produced this run.
+        resume_of: run_id this run resumed from, when this run was started with ``resume=True``
+            and picked up an existing run's state; ``None`` for a fresh run.
+    """
+
     run_id: str
     label: str = ""
     status: str = "running"
@@ -57,6 +70,30 @@ class RunRecord:
 
 @dataclass
 class PipelineRecord:
+    """The durable state of one pipeline —— the row that makes resume possible.
+
+    Invariants: ``n_tasks_done`` is the durable checkpoint cursor and must never be silently
+    rewound; a pipeline resumed with ``state in ("failed", "interrupted")`` and ``n_tasks_done > 0``
+    is expected to load artifact ``n_tasks_done - 1`` and continue from there (see
+    ``Runner._open_pipeline``).
+
+    Attributes:
+        pipeline_id: Content-addressed id (task-chain fingerprint + seed + repeat index); stable
+            across resumes/re-runs of the same logical pipeline.
+        run_id: The run currently "owning" this row — rebound on every resume to whichever run is
+            touching it now, since stats/reports are scoped by run_id.
+        key: The pipeline's dedup key (usually equal to ``pipeline_id`` unless an explicit
+            ``key_of`` was supplied to ``template.map``).
+        n_tasks_total / n_tasks_done: Total tasks in the chain / tasks completed so far — the
+            resume cursor described above.
+        seed_digest: Digest of the encoded seed value, for detecting a changed seed.
+        spec_digest: Digest of the task chain's fingerprint (see ``pipeline.compute_spec_digest``);
+            differs from ``seed_digest`` in scope — this changes when the *code* changes, not the data.
+        resume_of: The run_id this pipeline was last resumed from, when it was; ``None`` otherwise.
+        attempts_total: Cumulative attempts across every task in this pipeline (not just the
+            current one), persisted synchronously so a crash mid-backoff does not lose the count.
+    """
+
     pipeline_id: str
     run_id: str
     name: str
@@ -80,6 +117,21 @@ class PipelineRecord:
 
 @dataclass
 class TaskRecord:
+    """The current state of one task-slot within a pipeline (seq N of the chain), across however many attempts it has taken.
+
+    Collaborators: one :class:`TaskRecord` accumulates across all of a task's
+    :class:`AttemptRecord` rows; it holds the *latest* attempt's outcome, while ``AttemptRecord``
+    keeps the full append-only history.
+
+    Attributes:
+        task_run_id: ``f"{pipeline_id}:{seq}"`` — this task-slot's identity within its pipeline.
+        seq: Position in the pipeline's task chain (0-indexed).
+        attempts_used: How many attempts this task-slot has consumed so far.
+        input_artifact_id / output_artifact_id: The artifact this attempt consumed / produced
+            (``output_artifact_id`` is ``None`` until an attempt succeeds).
+        leases: Snapshot of leases used by the most recent attempt (see ``TaskContext.lease_log``).
+    """
+
     task_run_id: str
     pipeline_id: str
     run_id: str
@@ -102,6 +154,22 @@ class TaskRecord:
 
 @dataclass
 class AttemptRecord:
+    """One attempt of one task —— the append-only history that ``TaskRecord`` summarizes.
+
+    Attributes:
+        seq: The task-slot's position in the pipeline (same meaning as ``TaskRecord.seq``).
+        attempt_no: 1-indexed attempt count for this task-slot.
+        outcome: ``"succeeded" | "failed" | "timeout" | "cancelled"`` (``"running"`` only
+            transiently, never persisted as a final row).
+        retry_delay_s: The backoff chosen after this attempt, if it failed and another was scheduled.
+        decision: The full retry-decision payload (``{retry, reason, delay_s, error_class,
+            attempt, max_attempts, retry_after}``, see ``docs/design.md`` §4.4) — this is what
+            makes "why did it retry N times" answerable straight from the store.
+        leases: Every lease used during this attempt, including ones released mid-attempt (see
+            ``TaskContext.lease_log``); a superset of what ``TaskRecord.leases`` keeps.
+        attempt_id: Assigned by the store on insert; ``None`` until then.
+    """
+
     pipeline_id: str
     run_id: str
     task_run_id: str
@@ -125,6 +193,17 @@ class AttemptRecord:
 
 @dataclass
 class EventRecord:
+    """One structured log entry —— the shared shape of everything emitted via ``Runner._emit``/``Pool._emit``.
+
+    Attributes:
+        scope: What this event is about (``"run" | "pipeline" | "task" | "pool" | "resource"``);
+            decides which of the id fields below are meaningful for this row.
+        kind: Dotted event name (e.g. ``"pipeline.failed"``, ``"resource.degraded"``) — the
+            primary thing to filter/group by.
+        data: Free-form event-specific payload; shape depends on ``kind``, not otherwise validated.
+        event_id: Assigned by the store on insert; ``None`` until then.
+    """
+
     ts: float
     kind: str
     scope: str = "pipeline"  # run | pipeline | task | pool | resource
