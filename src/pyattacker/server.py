@@ -212,10 +212,20 @@ class StatsServer:
             return 200, {"rows": rows, "limit": limit}
 
         if path == "/resources":
-            resources = getattr(self.store_spec, "resources", None)
-            if resources is None:
+            pool = (query.get("pool") or [None])[0]
+
+            def _resources(store: Any) -> Any:
+                # resources() is an optional capability, not part of the Store protocol (see
+                # store/base.py): a custom Store that predates it should degrade, not 500.
+                fn = getattr(store, "resources", None)
+                if fn is None:
+                    return None
+                return fn(pool=pool)
+
+            rows = self._read(_resources)
+            if rows is None:
                 return 200, {"rows": [], "note": "this store backend does not persist resource state"}
-            return 200, {"rows": resources()}
+            return 200, {"rows": rows}
 
         if path == "/errors":
             return 200, {"rows": self._read(lambda store: store.errors(run_id=run_id, limit=limit))}

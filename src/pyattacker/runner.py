@@ -604,6 +604,8 @@ class Runner:
         """
         leftover = self._delays.drain()
         for state in leftover:
+            # attempts_total is already durable: _execute_task persists state.record at the
+            # start of every attempt, before a pipeline is ever parked for a retry backoff.
             self.store.finish_pipeline(
                 state.pipeline_id, "interrupted", n_tasks_done=state.record.n_tasks_done
             )
@@ -811,6 +813,8 @@ class Runner:
             if not outcome.ok:
                 self._counters["pipelines_failed"] += 1
                 self._counters["pipelines_done"] += 1
+                # attempts_total is already durable: _execute_task persists state.record at the
+                # start of every attempt, including the one that just failed.
                 self.store.finish_pipeline(
                     state.pipeline_id,
                     "failed",
@@ -880,6 +884,12 @@ class Runner:
         state.attempts_used += 1
         attempts_used = state.attempts_used
         record.attempts_used = attempts_used
+        state.record.attempts_total += 1
+        # Persisted immediately, not just at the next checkpoint: a crash while this pipeline
+        # sits in the delay queue waiting out a retry backoff must not lose the attempt count
+        # that already durably happened. Pipeline state writes are synchronous by convention
+        # (see store/base.py), so one extra write per attempt is the correct trade, not batched.
+        self.store.upsert_pipeline(state.record)
         rng = random.Random(int(digest_of(f"{spec.pipeline_id}|{seq}|{attempts_used}")[:16], 16))
         ctx = TaskContext(
             run_id=state.run_id,
@@ -1142,12 +1152,14 @@ class Runner:
 
     def _finalize_pools(self) -> None:
         for pool in self.pools.values():
+            resources = {r.id: r for r in pool.resources()}
             for slot in pool.snapshot():
+                resource = resources.get(slot["id"])
                 self.store.upsert_resource(
                     pool.name,
                     slot["id"],
                     slot["kind"],
-                    {},
+                    resource.spec() if resource is not None else {},
                     slot["state"],
                     slot,
                 )

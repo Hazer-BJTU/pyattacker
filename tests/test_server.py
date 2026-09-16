@@ -110,7 +110,7 @@ def test_endpoints_serve_html_and_concrete_json(seeded):
         assert row["failed_task"] == "mock.boom"
         assert row["error_type"] == "RetryableError"
         assert row["error_message"] == "upstream exploded"
-        assert (row["n_tasks_done"], row["n_tasks_total"], row["attempts_total"]) == (0, 1, 0)
+        assert (row["n_tasks_done"], row["n_tasks_total"], row["attempts_total"]) == (0, 1, 1)
         assert row["run_id"] == _run_bad
         assert row["finished_at"] >= row["started_at"]
 
@@ -135,10 +135,7 @@ def test_endpoints_serve_html_and_concrete_json(seeded):
 
         status, resources = _fetch_json(server, "/resources")
         assert status == 200
-        assert resources == {
-            "rows": [],
-            "note": "this store backend does not persist resource state",
-        }
+        assert resources == {"rows": []}
 
         with pytest.raises(urllib.error.HTTPError) as excinfo:
             _fetch(server, "/nope")
@@ -228,6 +225,60 @@ def test_events_limit_is_honoured_defaulted_and_clamped(seeded):
 
         clamped = _fetch_json(server, "/events?limit=0")[1]
         assert (clamped["limit"], len(clamped["rows"])) == (1, 1)
+
+
+def test_resources_endpoint_works_through_a_file_backed_store_path(tmp_path):
+    """End-to-end regression for issue #3: ``StatsServer(<sqlite path>)`` is exactly how the
+    CLI's ``serve`` command starts the server — a raw path string, never a live store object.
+    The old implementation only ever worked for the live-object case (see the test above),
+    so this is the path that must be exercised directly.
+    """
+    from pyattacker import Pool, Resource
+
+    db = str(tmp_path / "resources.db")
+    pool = Pool("apis", [Resource.create("llm", id="api-1", options={"api_key": "sk-secret123"}, capacity=2)])
+    runner = Runner(store=db, pools=[pool], handle_signals=False)
+    try:
+        runner.run(pipeline("srv-res", echo).map([{"i": 1}]))
+    finally:
+        runner.close()
+
+    with StatsServer(db, port=0) as server:  # a raw path string, like the CLI passes
+        status, body = _fetch_json(server, "/resources")
+        assert status == 200
+        assert "note" not in body
+        assert len(body["rows"]) == 1
+        row = body["rows"][0]
+        assert row["pool"] == "apis"
+        assert row["resource_id"] == "api-1"
+        assert row["kind"] == "llm"
+        assert row["state"] == "ready"
+        assert row["spec"]["options"]["api_key"] == "***t123"  # redacted, not the raw secret
+        assert row["stats"]["capacity"] == 2
+
+        scoped = _fetch_json(server, "/resources?pool=apis")[1]
+        assert len(scoped["rows"]) == 1
+        assert _fetch_json(server, "/resources?pool=workers")[1] == {"rows": []}
+
+
+def test_resources_endpoint_degrades_for_a_store_without_resources():
+    """A custom Store that predates resources() must still satisfy isinstance(_, Store)
+    (resources() was deliberately kept out of the protocol for this reason, see store/base.py)
+    and the endpoint must degrade instead of raising.
+    """
+
+    class _LegacyStore(MemoryStore):
+        resources = None  # hide the inherited method: simulates a pre-existing custom Store
+
+    store = _LegacyStore()
+    from pyattacker.store.base import Store
+
+    assert isinstance(store, Store)
+
+    with StatsServer(store, port=0) as server:
+        status, body = _fetch_json(server, "/resources")
+        assert status == 200
+        assert body == {"rows": [], "note": "this store backend does not persist resource state"}
 
 
 def test_resources_endpoint_reads_a_store_object():

@@ -18,7 +18,7 @@ import time
 
 from helpers import run
 
-from pyattacker import RetryableError, Retrying, Runner, pipeline, task
+from pyattacker import Pool, Resource, RetryableError, Retrying, Runner, pipeline, task
 from pyattacker.store.writebehind import WriteBehindStore
 
 
@@ -113,6 +113,48 @@ def test_deferred_pipeline_survives_a_stop_and_is_resumable(tmp_path):
     run(_case())
 
 
+def test_attempts_total_is_durable_while_parked_for_a_retry_backoff(tmp_path):
+    """attempts_total must be visible on disk *during* the backoff, not only at the next checkpoint.
+
+    Regression: incrementing state.record.attempts_total in memory is not enough if nothing
+    persists it before the pipeline is parked in the delay queue — a crash during the backoff
+    would then lose an attempt that already durably happened (its `attempts` row is on disk,
+    but the pipeline-level counter would not be).
+    """
+
+    async def _case():
+        db = str(tmp_path / "attempts_total_live.db")
+        runner = Runner(store=db, concurrency=1, handle_signals=False)
+        try:
+            spec = next(iter(pipeline("m2-parked", slow_retry).map([{"q": "x"}])))
+            running = asyncio.create_task(runner.run_async([spec]))
+
+            for _ in range(400):
+                if runner.stats()["delayed_pipelines"] == 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert runner.stats()["delayed_pipelines"] == 1, "pipeline should be parked for its backoff"
+
+            # read through a second connection while the writer is still open and the pipeline
+            # is still sitting in the delay queue, not yet at its next checkpoint
+            conn = sqlite3.connect(db)
+            try:
+                (attempts_total,) = conn.execute(
+                    "SELECT attempts_total FROM pipelines WHERE pipeline_id=?",
+                    (spec.pipeline_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            assert attempts_total == 1
+
+            runner.stop("test")
+            await asyncio.wait_for(running, 5.0)
+        finally:
+            runner.close()
+
+    run(_case())
+
+
 def test_write_behind_reaches_disk_for_a_finished_run(tmp_path):
     db = tmp_path / "batched.db"
     runner = Runner(store=str(db), concurrency=4, handle_signals=False)
@@ -173,3 +215,18 @@ def test_store_stats_expose_buffering_only_when_batching():
         assert batched.stats()["buffered"]["pending"] == 0
     finally:
         batched.close()
+
+
+def test_resources_survive_write_behind_flush(tmp_path):
+    """WriteBehindStore.resources() must flush pending writes before reading, like every other view."""
+    pool = Pool("apis", [Resource.create("llm", id="api-1")])
+    db = str(tmp_path / "wb.db")
+    runner = Runner(store=db, pools=[pool], write_behind=True, handle_signals=False)
+    try:
+        runner.run(pipeline("noop", fast).map([{"i": 0}]))
+        assert isinstance(runner.store, WriteBehindStore)
+        rows = runner.store.resources(pool="apis")
+        assert len(rows) == 1
+        assert rows[0]["resource_id"] == "api-1"
+    finally:
+        runner.close()

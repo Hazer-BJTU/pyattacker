@@ -285,13 +285,6 @@ class SqliteStore:
         self._conn.execute(f"UPDATE pipelines SET {', '.join(fields)} WHERE pipeline_id=?", values)
         self._conn.commit()
 
-    def bump_attempts(self, pipeline_id: str, delta: int = 1) -> None:
-        self._conn.execute(
-            "UPDATE pipelines SET attempts_total = attempts_total + ? WHERE pipeline_id=?",
-            (delta, pipeline_id),
-        )
-        self._conn.commit()
-
     def interrupt_stale(self, *, stale_after_s: float = 30.0, keep_run_id: str | None = None) -> int:
         cutoff = time.time() - stale_after_s
         sql = (
@@ -409,6 +402,27 @@ class SqliteStore:
             (pool, resource_id, kind, _dumps(spec), state, _dumps(stats), published_by, now, now),
         )
         self._conn.commit()
+
+    def resources(self, pool: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM resources WHERE 1=1"
+        args: list[Any] = []
+        if pool:
+            sql += " AND pool=?"
+            args.append(pool)
+        sql += " ORDER BY pool, resource_id"
+        return [
+            {
+                "pool": row["pool"],
+                "resource_id": row["resource_id"],
+                "kind": row["kind"],
+                "spec": json.loads(row["spec_json"]),
+                "state": row["state"],
+                "stats": json.loads(row["stats_json"]),
+                "published_by": row["published_by"],
+                "updated_at": row["updated_at"],
+            }
+            for row in self._conn.execute(sql, args).fetchall()
+        ]
 
     # ----------------------------------------------------------- query views
     def pipelines(
