@@ -64,6 +64,7 @@ from .errors import (
     ResourceUnavailable,
     RetryableError,
     RunInterrupted,
+    StoreUnavailable,
     error_class_of,
 )
 from .export import FORMATS, ROW_KINDS, export_store, export_stores, iter_rows
@@ -192,5 +193,6 @@ __all__ = [
     "FatalError",
     "BudgetExceeded",
     "RunInterrupted",
+    "StoreUnavailable",
     "error_class_of",
 ]

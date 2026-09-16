@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
 from helpers import run
 
 from pyattacker import (
@@ -18,6 +19,7 @@ from pyattacker import (
     RetryableError,
     Retrying,
     Runner,
+    StoreUnavailable,
     pipeline,
     task,
 )
@@ -502,6 +504,46 @@ def test_internal_error_during_checkpoint_restore_reattributes_to_the_current_ru
     assert third.stats["pipelines"]["by_state"] == {"succeeded": 1}
     assert CALLS["fetch"] == 0
     assert CALLS["ask"] == 1
+
+
+def test_internal_error_recovery_itself_failing_stops_the_run_instead_of_hanging():
+    """A double failure (the recovery path's own store calls also raise) must not reproduce the
+    original bug this whole recovery path exists to fix: an exception inside the exception
+    handler killing the worker silently, with the queue never draining at concurrency=1.
+
+    Regression: ``_finish_pipeline_after_internal_error`` talks to the store
+    (get_pipeline/upsert_pipeline/finish_pipeline); if any of those calls also raise, the new
+    exception previously propagated straight out of ``_worker`` uncaught -- the worker task died,
+    ``asyncio.gather(..., return_exceptions=True)`` at shutdown swallowed it, and with
+    concurrency=1 and more than one admitted pipeline the run hung forever
+    (pipelines_done < pipelines_admitted, nothing left to drain the queue).
+
+    The fix treats a failing recovery as fatal and deterministic: it hard-stops the run and
+    ``run_async`` raises a clear ``StoreUnavailable`` instead of hanging or losing the worker
+    silently.
+    """
+
+    async def _case():
+        runner = Runner(store=":memory:", concurrency=1, handle_signals=False)
+
+        def boom_open(spec, run_id):
+            raise RuntimeError("framework surprise")
+
+        def boom_get_pipeline(pipeline_id):
+            raise RuntimeError("store is also broken during recovery")
+
+        runner._open_pipeline = boom_open
+        runner.store.get_pipeline = boom_get_pipeline
+
+        spec = pipeline("double-fail", flaky(0))
+        # two admitted pipelines at concurrency=1: with the old bug, the first one's worker dies
+        # and the second is left stranded in the queue forever
+        with pytest.raises(StoreUnavailable, match="store is also broken during recovery"):
+            await asyncio.wait_for(
+                runner.run_async(spec.map([{"i": 0}, {"i": 1}])), timeout=5.0
+            )
+
+    run(_case())
 
 
 def test_events_form_a_structured_per_pipeline_log():
