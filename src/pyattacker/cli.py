@@ -51,6 +51,12 @@ _RUN_KEYS = {
 }
 
 
+def _warn_unresolved_env(spec: Any) -> None:
+    """Same protection ``validate`` has always had, now also on the commands that actually spend the value."""
+    if spec.unresolved_env:
+        print(f"Warning: unresolved environment variables {sorted(set(spec.unresolved_env))}", file=sys.stderr)
+
+
 def _open_readonly(path: str, backend: Any = None) -> SqliteStore:
     """Open an existing store read-only; give a human-readable error when the file is missing.
 
@@ -82,7 +88,8 @@ def _cmd_run(args: argparse.Namespace, *, resume: bool = False) -> int:
             raise ConfigError("--shard and --shards are mutually exclusive")
         return _run_shards(args, resume=resume)
 
-    spec = load_spec(args.config)
+    spec = load_spec(args.config, strict_env=args.strict_env)
+    _warn_unresolved_env(spec)
     run_cfg = {k: v for k, v in spec.run.items() if k in _RUN_KEYS}
     if args.store:
         run_cfg["store"] = args.store
@@ -197,7 +204,8 @@ def _run_shards(args: argparse.Namespace, *, resume: bool = False) -> int:
     count = int(args.shards)
     if count < 2:
         raise ConfigError("--shards must be >= 2 (use a single run otherwise)")
-    cfg = load_spec(args.config)
+    cfg = load_spec(args.config, strict_env=args.strict_env)
+    _warn_unresolved_env(cfg)
     base = str(args.store or cfg.run.get("store") or ":memory:")
     if base == ":memory:":
         raise ConfigError("--shards needs a file-backed store (set run.store or pass --store)")
@@ -556,6 +564,11 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
         "--no-write-behind",
         action="store_true",
         help="commit every attempt/event immediately instead of batching them",
+    )
+    parser.add_argument(
+        "--strict-env",
+        action="store_true",
+        help="fail (exit 2) instead of warning when the config references an unset ${VAR}",
     )
 
 

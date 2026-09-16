@@ -166,6 +166,55 @@ def test_validate_returns_zero_and_prints_describe_json(tmp_path, capsys):
     assert "Warning" not in captured.err
 
 
+# ------------------------------------------------ unresolved ${ENV} outside validate
+
+RUN_CONFIG_WITH_MISSING_ENV = """
+pipeline:
+  name: env-check
+  tasks:
+    - use: echo
+run:
+  concurrency: 1
+  label: "${CLI_TEST_DEFINITELY_UNSET}"
+"""
+
+
+def test_run_warns_about_unresolved_env_instead_of_ignoring_it(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("CLI_TEST_DEFINITELY_UNSET", raising=False)
+    cfg = _write_config(tmp_path, "spec.yaml", RUN_CONFIG_WITH_MISSING_ENV)
+    db = tmp_path / "run.db"
+
+    rc = main(["run", "-c", str(cfg), "--store", str(db)])
+
+    assert rc == 0
+    assert "Warning: unresolved environment variables ['CLI_TEST_DEFINITELY_UNSET']" in capsys.readouterr().err
+
+
+def test_run_strict_env_fails_fast_on_a_missing_variable(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("CLI_TEST_DEFINITELY_UNSET", raising=False)
+    cfg = _write_config(tmp_path, "spec.yaml", RUN_CONFIG_WITH_MISSING_ENV)
+    db = tmp_path / "run.db"
+
+    rc = main(["run", "-c", str(cfg), "--store", str(db), "--strict-env"])
+
+    assert rc == 2
+    assert "CLI_TEST_DEFINITELY_UNSET" in capsys.readouterr().err
+    assert not db.exists()  # failed during load_spec, before the run ever started
+
+
+def test_run_resume_shares_the_same_env_warning_path(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("CLI_TEST_DEFINITELY_UNSET", raising=False)
+    cfg = _write_config(tmp_path, "spec.yaml", RUN_CONFIG_WITH_MISSING_ENV)
+    db = tmp_path / "run.db"
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 0
+    capsys.readouterr()
+
+    rc = main(["resume", "-c", str(cfg), "--store", str(db)])
+
+    assert rc == 0
+    assert "Warning: unresolved environment variables ['CLI_TEST_DEFINITELY_UNSET']" in capsys.readouterr().err
+
+
 # ------------------------------------------------------------- config errors → 2
 
 
