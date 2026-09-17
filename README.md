@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Hazer-BJTU/pyattacker/75382d0901b869360817b9cd46a52e8ee73dbfda/assets/logo/title.png" width="720" alt="pyattacker">
+  <img src="https://raw.githubusercontent.com/Hazer-BJTU/pyattacker/ff819b1710d26eadf7c2e89465044975aef8eb8e/assets/logo/title.png" width="600" alt="pyattacker">
 </p>
 
 [![PyPI](https://img.shields.io/pypi/v/pyattacker)](https://pypi.org/project/pyattacker/)
