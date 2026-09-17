@@ -159,6 +159,24 @@ jobs:
           /tmp/wheel-check/bin/pyattacker validate -c /tmp/wheel-check/cfg/x.json > /dev/null
           echo "yaml asked for the extra; json validated"
 
+      - name: Check the wheel's yaml extra installs and works
+        # The other direction of the same metadata, and the one no source-level test can cover: the
+        # extra has to make `pip install "pyattacker[yaml]"` resolve PyYAML *from the built wheel*, and
+        # that has to be enough to read a real config. A wrong Provides-Extra, a missing marker on
+        # Requires-Dist or a build-backend change would leave the suite green and break this.
+        run: |
+          uv venv /tmp/wheel-yaml-check --python 3.11
+          wheel="$(ls dist/*.whl)"   # exactly one; `dist/` is rebuilt from scratch above
+          uv pip install --python /tmp/wheel-yaml-check/bin/python "${wheel}[yaml]"
+          /tmp/wheel-yaml-check/bin/python -c "
+          import importlib.metadata as md, yaml
+          print('PyYAML', yaml.__version__, 'from', md.requires('pyattacker'))
+          "
+          mkdir -p /tmp/wheel-yaml-check/cfg
+          printf 'pipeline:\n  name: x\n  tasks:\n    - {use: echo}\n' > /tmp/wheel-yaml-check/cfg/x.yaml
+          /tmp/wheel-yaml-check/bin/pyattacker validate -c /tmp/wheel-yaml-check/cfg/x.yaml > /dev/null
+          echo "the extra resolved pyyaml and the config validated"
+
       - uses: actions/upload-artifact@v7
         with:
           name: dist

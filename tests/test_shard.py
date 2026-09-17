@@ -236,6 +236,7 @@ run:
 """
 
 
+@pytest.mark.requires_yaml
 def test_shards_with_retrying_resource_pool_pipelines_merge_cleanly(tmp_path, capsys, monkeypatch):
     """None of the three subsystems has ever been exercised together before this test:
 
@@ -252,7 +253,6 @@ def test_shards_with_retrying_resource_pool_pipelines_merge_cleanly(tmp_path, ca
     and every pipeline took exactly 2 attempts (1 failure + 1 success), each of which acquired a
     real lease from that shard's own pool.
     """
-    pytest.importorskip("yaml", reason="needs the optional yaml extra")
     (tmp_path / "combo_flaky_pool_task.py").write_text(_COMBINED_TASK_MODULE, encoding="utf-8")
     monkeypatch.setenv(
         "PYTHONPATH", os.pathsep.join([str(tmp_path), os.environ.get("PYTHONPATH", "")])

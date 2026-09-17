@@ -64,7 +64,13 @@ def _load_raw(path: Path) -> dict[str, Any]:
     if suffix in (".yaml", ".yml"):
         try:
             import yaml
-        except ImportError as exc:
+        except ModuleNotFoundError as exc:
+            # Only "the extra is not installed" earns the hint, so the check is narrow: `import yaml`
+            # can also fail because PyYAML is installed but something inside it is missing, and in
+            # that case the real ModuleNotFoundError names the module that is actually absent —
+            # telling that user to install an extra they already have would send them the wrong way.
+            if exc.name != "yaml":
+                raise
             # The one place PyYAML is needed, and it is an extra rather than a dependency: a machine
             # that reads JSON/TOML configs, or no config at all, installs pyattacker and nothing else.
             # Say so in the error, because the traceback a bare `import yaml` gives names neither the

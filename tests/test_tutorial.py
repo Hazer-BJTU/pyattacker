@@ -61,11 +61,11 @@ def test_every_runnable_block_is_a_complete_program():
         assert not elided, f"{name}: elided code cannot be executed"
 
 
+@pytest.mark.requires_yaml
 def test_tutorial_programs_run(tmp_path: Path):
     # Step 11 drives the declarative layer from a .yaml config, so its program needs the optional
     # extra. The other steps would run without it, but re-running them here keeps this test honest
     # about the environment it is actually testing in.
-    pytest.importorskip("yaml", reason="step 11 reads a YAML config")
     # The step programs import pyattacker; point the child at src/ as well so the test verifies the
     # checkout rather than depending on how the parent process happened to be installed.
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT / "src"), os.environ.get("PYTHONPATH", "")])}

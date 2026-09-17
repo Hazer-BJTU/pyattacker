@@ -537,9 +537,8 @@ run:
 
 @pytest.fixture()
 def cli_config(tmp_path) -> Path:
-    # The CLI section below drives the real entry point with a YAML config, so it needs the optional
-    # extra; the store-level tests above it run without it.
-    pytest.importorskip("yaml", reason="needs the optional yaml extra")
+    # The tests that request this fixture — or `sharded`, which depends on it — carry the
+    # `requires_yaml` mark: writing the file never needs the extra, reading it back does.
     path = tmp_path / "shard.yaml"
     path.write_text(textwrap.dedent(CLI_CONFIG), encoding="utf-8")
     return path
@@ -563,6 +562,7 @@ def sharded(cli_config, tmp_path):
     )
 
 
+@pytest.mark.requires_yaml
 def test_cli_shard_run_partitions_one_dataset(sharded):
     assert (sharded.rc0, sharded.rc1) == (0, 0)
     store0, store1 = _open(sharded.db0), _open(sharded.db1)
@@ -580,6 +580,7 @@ def test_cli_shard_run_partitions_one_dataset(sharded):
     assert len(ids0 | ids1) == 6
 
 
+@pytest.mark.requires_yaml
 def test_cli_shard_summary_json_is_one_object_with_store_and_shard(cli_config, sharded, tmp_path, capsys):
     db = str(tmp_path / "summary.db")
     capsys.readouterr()  # discard fixture output
@@ -606,6 +607,7 @@ def test_cli_shard_summary_json_is_one_object_with_store_and_shard(cli_config, s
     assert sum(payload["pipelines"]["by_state"].values()) == payload["pipelines"]["total"]
 
 
+@pytest.mark.requires_yaml
 def test_cli_report_over_shard_stores_prints_merged_summary(sharded, capsys):
     capsys.readouterr()
     assert main(["report", sharded.db0, sharded.db1]) == 0
@@ -620,6 +622,7 @@ def test_cli_report_over_shard_stores_prints_merged_summary(sharded, capsys):
     assert '"total": 6' in out
 
 
+@pytest.mark.requires_yaml
 def test_cli_export_merges_stores_into_one_file(sharded, tmp_path, capsys):
     out_path = tmp_path / "merged.jsonl"
     capsys.readouterr()
@@ -634,6 +637,7 @@ def test_cli_export_merges_stores_into_one_file(sharded, tmp_path, capsys):
     assert {row["state"] for row in rows} == {"succeeded"}
 
 
+@pytest.mark.requires_yaml
 def test_cli_shard_without_store_exits_two(cli_config, capsys):
     assert main(["run", "-c", str(cli_config), "--shard", "0/2"]) == 2
     err = capsys.readouterr().err
@@ -641,6 +645,7 @@ def test_cli_shard_without_store_exits_two(cli_config, capsys):
     assert "--shard needs a file-backed store" in err
 
 
+@pytest.mark.requires_yaml
 def test_cli_run_shards_spawns_children_and_merges(cli_config, tmp_path, capsys):
     base = tmp_path / "multi.db"
     capsys.readouterr()
@@ -699,11 +704,11 @@ run:
 """
 
 
+@pytest.mark.requires_yaml
 def test_cli_run_shards_strict_env_accepts_the_shard_provided_variable(tmp_path, capsys, monkeypatch):
     """${PYATACKER_SHARD} is only ever set inside a shard child (see shard_env()); the parent's
     own --strict-env preflight must not treat it as missing, or every --shards run referencing it
     would fail before a single child started."""
-    pytest.importorskip("yaml", reason="needs the optional yaml extra")
     monkeypatch.delenv("PYATACKER_SHARD", raising=False)
     cfg = tmp_path / "shard.yaml"
     cfg.write_text(textwrap.dedent(SHARD_PROVIDED_VAR_CONFIG), encoding="utf-8")
@@ -721,8 +726,8 @@ def test_cli_run_shards_strict_env_accepts_the_shard_provided_variable(tmp_path,
     assert (tmp_path / "multi.shard1of2.db").exists()
 
 
+@pytest.mark.requires_yaml
 def test_cli_run_shards_strict_env_still_rejects_a_genuinely_missing_variable(tmp_path, capsys, monkeypatch):
-    pytest.importorskip("yaml", reason="needs the optional yaml extra")
     monkeypatch.delenv("CLI_SHARD_TEST_DEFINITELY_UNSET", raising=False)
     cfg = tmp_path / "shard.yaml"
     cfg.write_text(textwrap.dedent(ACTUALLY_MISSING_VAR_CONFIG), encoding="utf-8")

@@ -11,9 +11,10 @@ are tested here rather than in the YAML tests themselves:
   a YAML one.
 
 Absence is simulated by putting ``None`` into ``sys.modules``, which is how CPython records "this
-module may not be imported" (``import yaml`` then raises ``ImportError``). That keeps these tests
-meaningful in both environments: the developer one, which has the extra, and the CI job that installs
-the bare package.
+module may not be imported" (``import yaml`` then raises ``ModuleNotFoundError`` named ``yaml``), and a
+*broken* PyYAML is simulated by shadowing it with a module whose own import fails. That keeps these
+tests meaningful in both environments: the developer one, which has the extra, and the CI job that
+installs the bare package.
 """
 
 from __future__ import annotations
@@ -97,6 +98,24 @@ def test_yaml_config_without_the_extra_names_the_install_command(tmp_path, monke
     assert str(cfg) in message, "the error must say which file pulled the dependency in"
     assert "pyattacker[yaml]" in message, "the error must name the extra to install"
     assert "JSON and TOML" in message, "and must mention that there is a way out that needs nothing"
+
+
+def test_a_broken_pyyaml_is_not_reported_as_missing(tmp_path, monkeypatch):
+    """PyYAML installed but broken (one of its own imports fails) is not a missing extra.
+
+    The hint is only correct when the `yaml` module itself is absent, so the loader checks the name on
+    the exception: a user who already has the extra needs the real error, which names the module that
+    is actually missing, not advice to install what they already installed.
+    """
+    (tmp_path / "yaml.py").write_text("import pyattacker_no_such_internal_module\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "yaml", raising=False)  # a cached real PyYAML would win instead
+
+    cfg = _write(tmp_path, "spec.yaml", YAML_CONFIG)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        load_spec(cfg)
+    assert excinfo.value.name == "pyattacker_no_such_internal_module"
 
 
 def test_one_process_reads_json_and_refuses_yaml(tmp_path, monkeypatch):

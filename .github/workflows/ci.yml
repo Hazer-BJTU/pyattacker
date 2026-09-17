@@ -90,9 +90,10 @@ jobs:
           "
 
       - name: The suite passes without it
-        # The YAML tests skip with a reason; everything else runs for real, which is what proves no
-        # other module quietly depends on the extra.
-        run: /tmp/no-extra/bin/python -m pytest -q -rs
+        # The `requires_yaml` tests are deselected rather than skipped, so an accidental loss of the
+        # extra in the *development* environment fails the ordinary suite instead of quietly skipping
+        # a third of it. The optional-dependency tests above are not marked, and run here for real.
+        run: /tmp/no-extra/bin/python -m pytest -q -m "not requires_yaml"
 
       - name: A YAML config asks for the extra, a JSON one does not
         run: |
