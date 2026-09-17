@@ -32,10 +32,13 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        # The only third-party action in the pipeline, so it carries a commit pin: setup-uv stopped
+        # publishing floating major tags at v8, and pinning to the commit is what its README now
+        # recommends. The actions/* elsewhere in this file are GitHub's own and track a major tag.
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -65,10 +68,10 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
           python-version: "3.11"
@@ -127,7 +130,7 @@ jobs:
           /tmp/wheel-check/bin/pyattacker --version
           /tmp/wheel-check/bin/pyattacker demo --pipelines 10 --store /tmp/wheel-check/demo.db
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -144,13 +147,17 @@ jobs:
     permissions:
       id-token: write # mint the OIDC token trusted publishing exchanges for an upload token
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          # This job never checks out the repository, so there is no uv.lock to key a cache on:
+          # caching here can only ever warn that the cache will never get invalidated.
+          enable-cache: false
 
       # --check-url lets a re-run skip files already uploaded instead of failing the job.
       - name: Publish
@@ -170,13 +177,16 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          # No checkout in this job, so no lockfile to key a cache on — see the note in `testpypi`.
+          enable-cache: false
 
       - name: Publish
         run: |
@@ -195,9 +205,9 @@ jobs:
     permissions:
       contents: write # create the release and upload the artifacts to it
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
