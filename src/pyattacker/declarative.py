@@ -3,7 +3,9 @@
 A clear-eyed admission: the declarative layer can never escape Python (``use: myproj.tasks:ask_model`` still imports your code),
 so this layer only does three things: **pick tasks, chain pipelines, configure resource pools**.
 
-YAML is an explicit dependency (``pyyaml``); TOML/JSON go through the standard library ``tomllib``/``json``.
+YAML is an optional extra (``pyyaml``), needed only to read a ``.yaml``/``.yml`` config: the base install
+carries no dependencies at all, and a missing PyYAML surfaces as a ``ConfigError`` naming the extra.
+TOML/JSON go through the standard library ``tomllib``/``json`` and need nothing.
 """
 
 from __future__ import annotations
@@ -56,13 +58,22 @@ def expand_env(value: Any, *, strict: bool = False, unresolved: list[str] | None
 
 
 def _load_raw(path: Path) -> dict[str, Any]:
+    """Read the config file, dispatching on its suffix. Nothing here is imported at module scope."""
     text = path.read_text(encoding="utf-8")
     suffix = path.suffix.lower()
     if suffix in (".yaml", ".yml"):
         try:
             import yaml
-        except ImportError as exc:  # pragma: no cover - dependency is already declared
-            raise ConfigError("reading YAML requires pyyaml: uv add pyyaml") from exc
+        except ImportError as exc:
+            # The one place PyYAML is needed, and it is an extra rather than a dependency: a machine
+            # that reads JSON/TOML configs, or no config at all, installs pyattacker and nothing else.
+            # Say so in the error, because the traceback a bare `import yaml` gives names neither the
+            # extra nor the file that pulled it in.
+            raise ConfigError(
+                f"{path} is a YAML config, which needs the optional 'yaml' extra: "
+                'pip install "pyattacker[yaml]" (or: uv add "pyattacker[yaml]"). '
+                "JSON and TOML configs need no extra."
+            ) from exc
 
         data = yaml.safe_load(text)
     elif suffix == ".json":

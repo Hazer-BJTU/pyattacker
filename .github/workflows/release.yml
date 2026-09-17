@@ -120,7 +120,9 @@ jobs:
           mkdir -p /tmp/sdist && tar xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
           cd /tmp/sdist
           uv venv .venv --python 3.11
-          uv pip install --python .venv/bin/python -e . pytest
+          # The extra is requested on purpose here: the whole suite is the point of this check, and
+          # the configuration without PyYAML is the `no-extra` job in ci.yml plus the wheel check below.
+          uv pip install --python .venv/bin/python -e ".[yaml]" pytest
           .venv/bin/python -m pytest -q
 
       - name: Check the wheel installs and runs
@@ -129,6 +131,33 @@ jobs:
           uv pip install --python /tmp/wheel-check/bin/python dist/*.whl
           /tmp/wheel-check/bin/pyattacker --version
           /tmp/wheel-check/bin/pyattacker demo --pipelines 10 --store /tmp/wheel-check/demo.db
+
+      - name: Check the extra really is optional
+        # A plain install of the wheel must bring in nothing, so this is the one place where the
+        # published metadata is checked rather than the source tree: PyYAML must be absent, importing
+        # pyattacker must not change that, YAML must ask for the extra, and JSON must still work.
+        run: |
+          /tmp/wheel-check/bin/python -c "
+          import importlib.util, sys
+          assert importlib.util.find_spec('yaml') is None, 'pyyaml leaked into the base install'
+          import pyattacker
+          assert 'yaml' not in sys.modules, 'importing pyattacker pulled in pyyaml'
+          print('the wheel installs with no dependencies')
+          "
+          mkdir -p /tmp/wheel-check/cfg
+          printf 'pipeline:\n  name: x\n  tasks:\n    - {use: echo}\n' > /tmp/wheel-check/cfg/x.yaml
+          printf '{"pipeline": {"name": "x", "tasks": [{"use": "echo"}]}}' > /tmp/wheel-check/cfg/x.json
+          if /tmp/wheel-check/bin/pyattacker validate -c /tmp/wheel-check/cfg/x.yaml 2>/tmp/wheel-check/err.txt; then
+            echo "::error::a YAML config was accepted without the extra installed"
+            exit 1
+          fi
+          grep -q 'pyattacker\[yaml\]' /tmp/wheel-check/err.txt || {
+            echo "::error::the YAML error does not name the extra to install"
+            cat /tmp/wheel-check/err.txt
+            exit 1
+          }
+          /tmp/wheel-check/bin/pyattacker validate -c /tmp/wheel-check/cfg/x.json > /dev/null
+          echo "yaml asked for the extra; json validated"
 
       - uses: actions/upload-artifact@v7
         with:

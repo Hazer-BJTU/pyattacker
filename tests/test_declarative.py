@@ -28,6 +28,9 @@ from pyattacker.tasks import boom, flaky
 
 
 def _write(tmp_path: Path, name: str, text: str) -> Path:
+    # Every file this module writes is read back as YAML, so a test that calls this helper needs the
+    # optional extra. The few tests here that only exercise expand_env() keep running without it.
+    pytest.importorskip("yaml", reason="needs the optional yaml extra")
     path = tmp_path / name
     path.write_text(textwrap.dedent(text), encoding="utf-8")
     return path

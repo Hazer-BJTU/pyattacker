@@ -1104,6 +1104,11 @@ dropped silently.
 `DeclarativeSpec` (defined in `pyattacker.declarative`). The file describes **composition and resources**; your
 logic stays in Python behind `use:`.
 
+The parser is chosen from the file's suffix, and only the YAML one is optional: `.json` and `.toml` are read
+with the standard library, while `.yaml`/`.yml` needs the `yaml` extra (`pip install "pyattacker[yaml]"`).
+Without it, `load_spec` raises a `ConfigError` that names both the file and the extra — the check happens
+when that file is read, so a process that only ever sees JSON/TOML never needs PyYAML installed.
+
 ```python
 from pyattacker import Runner, load_spec
 

@@ -537,6 +537,9 @@ run:
 
 @pytest.fixture()
 def cli_config(tmp_path) -> Path:
+    # The CLI section below drives the real entry point with a YAML config, so it needs the optional
+    # extra; the store-level tests above it run without it.
+    pytest.importorskip("yaml", reason="needs the optional yaml extra")
     path = tmp_path / "shard.yaml"
     path.write_text(textwrap.dedent(CLI_CONFIG), encoding="utf-8")
     return path
@@ -700,6 +703,7 @@ def test_cli_run_shards_strict_env_accepts_the_shard_provided_variable(tmp_path,
     """${PYATACKER_SHARD} is only ever set inside a shard child (see shard_env()); the parent's
     own --strict-env preflight must not treat it as missing, or every --shards run referencing it
     would fail before a single child started."""
+    pytest.importorskip("yaml", reason="needs the optional yaml extra")
     monkeypatch.delenv("PYATACKER_SHARD", raising=False)
     cfg = tmp_path / "shard.yaml"
     cfg.write_text(textwrap.dedent(SHARD_PROVIDED_VAR_CONFIG), encoding="utf-8")
@@ -718,6 +722,7 @@ def test_cli_run_shards_strict_env_accepts_the_shard_provided_variable(tmp_path,
 
 
 def test_cli_run_shards_strict_env_still_rejects_a_genuinely_missing_variable(tmp_path, capsys, monkeypatch):
+    pytest.importorskip("yaml", reason="needs the optional yaml extra")
     monkeypatch.delenv("CLI_SHARD_TEST_DEFINITELY_UNSET", raising=False)
     cfg = tmp_path / "shard.yaml"
     cfg.write_text(textwrap.dedent(ACTUALLY_MISSING_VAR_CONFIG), encoding="utf-8")

@@ -59,7 +59,9 @@ run ... status=completed  wall=1.2s
   ...
 ```
 
-Requirements: Python 3.11+ and nothing else — pyattacker's only dependency is PyYAML.
+Requirements: Python 3.11+ and nothing else — the base install has no dependencies. Step 11 reads a YAML
+config, the one thing that needs the optional extra (`uv add "pyattacker[yaml]"`); every other step installs
+nothing.
 
 ---
 
@@ -1062,6 +1064,12 @@ reopened: 4 pipelines, 8 attempts, 13 events
 
 Composition and resources can live in YAML; the logic stays in Python. The declarative layer does exactly
 three things: pick tasks, chain them, configure pools.
+
+This is the first step that needs something beyond the standard library, so it is where the extra comes in:
+`uv add "pyattacker[yaml]"` (or `pip install "pyattacker[yaml]"`). Only the YAML *parser* is optional — the
+layer itself, and the same config written as `.json` or `.toml`, work without it. The parser is chosen from
+the file suffix, so a `.yaml` file on a machine without the extra is a config error that names the extra
+rather than an import traceback.
 
 ```python
 # tutorial/step_11_declarative.py

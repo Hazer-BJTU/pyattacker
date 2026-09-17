@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+* **PyYAML is no longer a dependency — it is the optional `yaml` extra.** `pip install pyattacker` now
+  installs nothing at all: the kernel and the declarative layer's JSON/TOML paths are the standard library.
+  Only reading a `.yaml`/`.yml` config needs the parser, so it moved to `pyattacker[yaml]`. The loader
+  already imported it lazily and chose the parser from the file suffix; what changed is that the error now
+  says so — a `.yaml` file without the extra raises `ConfigError: … needs the optional 'yaml' extra:
+  pip install "pyattacker[yaml]"` naming the file that pulled it in, and the CLI reports it as the usual
+  config error (exit code 2). ``import pyattacker``, the CLI, every SDK-only program and every JSON/TOML
+  config keep working with no third-party package installed, and a new CI job plus the release's wheel check
+  verify exactly that.
 * **The workflows moved off the deprecated Node 20 action runtime.** `actions/checkout` v4 → v7,
   `actions/upload-artifact` v4 → v7, `actions/download-artifact` v4 → v8, and `astral-sh/setup-uv` v5 →
   v10.1.0 — the last one pinned to a commit, because setup-uv stopped publishing floating major tags at v8

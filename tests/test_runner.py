@@ -595,6 +595,7 @@ def test_stats_snapshot_is_available_before_and_after_run():
 
 def test_cli_run_persists_to_configured_store_and_resume_skips(tmp_path, capsys):
     """Regression: run.store must actually be used (it used to be filtered out by a whitelist, so runs were written to the in-memory store and resume always re-ran everything)."""
+    pytest.importorskip("yaml", reason="needs the optional yaml extra")
     from pyattacker.cli import main
 
     db = tmp_path / "runs" / "cli.db"

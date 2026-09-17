@@ -15,9 +15,14 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-dependencies = [
-    "pyyaml>=6.0",
-]
+# The kernel is the standard library only, and the declarative layer reads JSON and TOML with the
+# standard library too, so the base install pulls in nothing at all. PyYAML is the one optional extra
+# (below): only a .yaml/.yml config needs it, and the loader raises a message naming this extra when
+# it is missing.
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["pyyaml>=6.0"]
 
 [project.urls]
 Homepage = "https://github.com/Hazer-BJTU/pyattacker"
@@ -34,6 +39,10 @@ pyattacker = "pyattacker.cli:main"
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
+    # The optional extra, installed for development so that `uv run pytest` exercises the YAML path
+    # as well. CI has a second job that installs the base package only and proves the suite passes
+    # without it.
+    "pyyaml>=6.0",
 ]
 
 [tool.ruff]

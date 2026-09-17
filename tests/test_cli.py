@@ -16,6 +16,8 @@ import textwrap
 from pathlib import Path
 from typing import ClassVar
 
+import pytest
+
 from pyattacker.cli import main
 
 # demo is deliberately given a failure probability: by the exit code convention demo is always 0 (it is only a demo),
@@ -67,6 +69,8 @@ def _run_demo(
 
 
 def _write_config(tmp_path: Path, name: str, text: str) -> Path:
+    # Every config this module writes is YAML, so the tests that call it need the optional extra.
+    pytest.importorskip("yaml", reason="needs the optional yaml extra")
     path = tmp_path / name
     path.write_text(textwrap.dedent(text), encoding="utf-8")
     return path

@@ -32,7 +32,8 @@ pyattacker is that scheduler, extracted and made boring:
   is still going.
 
 It **does not touch the network**: you write the openai/anthropic calls, it handles everything around
-them. The core dependency list is the standard library plus PyYAML.
+them. The base install has no dependencies at all — the only third-party code in the project is a YAML
+parser, it is optional, and only a `.yaml`/`.yml` config needs it.
 
 **New here?** The [tutorial](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md) goes from a five-line program to a sharded, resumable
 model evaluation. Every snippet in it is executed by the test suite.
@@ -41,6 +42,7 @@ model evaluation. Every snippet in it is executed by the test suite.
 
 ```bash
 uv add pyattacker            # or: pip install pyattacker
+uv add "pyattacker[yaml]"    # only for .yaml/.yml configs; JSON and TOML need no extra
 ```
 
 From a clone:
@@ -51,7 +53,9 @@ uv sync
 uv run pyattacker demo       # zero-config smoke test: 50 simulated pipelines, retries, a report
 ```
 
-Requires Python 3.11+.
+Requires Python 3.11+. `import pyattacker`, the CLI and every config format except YAML work with no
+third-party package installed; a `.yaml`/`.yml` config without the extra is a config error (exit code 2)
+that names the extra to install.
 
 ## Core Model
 
@@ -167,6 +171,9 @@ uv run pyattacker export runs/qa.shard*of4.db runs/tasks.csv --rows tasks --form
 ## Declarative (Simple Tasks)
 
 The YAML describes **composition and resources**; the logic stays in Python (`use: my_pkg.tasks:ask`).
+Reading a `.yaml`/`.yml` file is the only part of pyattacker that needs a third-party library, so it lives
+in the `yaml` extra; the same config written as JSON or TOML is read with the standard library. The loader
+decides per file, from the suffix, and says which extra to install when the parser is missing.
 
 ```yaml
 run:   { store: runs/demo.db, concurrency: 8, label: demo }
@@ -310,7 +317,7 @@ Left for later: a distributed scheduler, Parquet export, blob garbage collection
 ## Development
 
 ```bash
-uv sync                      # create the venv + install dependencies (the only core dependency is pyyaml)
+uv sync                      # create the venv + install the dev group (which includes the optional yaml extra)
 uv run pytest                # the whole suite: zero network, a few seconds
 uv run ruff check            # lint (configuration lives in pyproject.toml, with reasons for each exception)
 uv run pyattacker demo       # end-to-end smoke test

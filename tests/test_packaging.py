@@ -30,10 +30,28 @@ def test_version_matches_between_package_and_metadata(project):
 
 
 def test_declared_dependencies_are_intentional(project):
-    # The kernel is standard library only; PyYAML is the single agreed runtime dependency, and it
-    # exists for the declarative layer. Anything else needs a deliberate decision.
-    assert project["dependencies"] == ["pyyaml>=6.0"]
+    # The kernel is standard library only, and so is the declarative layer for JSON/TOML configs, so
+    # the base install declares nothing. PyYAML is optional: only a .yaml/.yml config needs it, and
+    # the loader raises a ConfigError naming the extra when it is absent. Anything in `dependencies`
+    # would be paid for by every user of the SDK, including those who never write a config file.
+    assert project["dependencies"] == []
+    assert project["optional-dependencies"]["yaml"] == ["pyyaml>=6.0"]
     assert project["requires-python"] == ">=3.11"
+
+
+def test_no_module_imports_yaml_at_import_time():
+    """`import pyattacker` must not need the extra; reading a .yaml file is the only thing that may."""
+    import re
+
+    package_root = Path(pyattacker.__file__).parent
+    offenders = sorted(
+        path.name
+        for path in package_root.rglob("*.py")
+        # Column 0 only: the one legitimate import lives inside a function, and an indented import is
+        # exactly what keeps the extra optional.
+        if re.search(r"^(import yaml|from yaml)", path.read_text(encoding="utf-8"), re.MULTILINE)
+    )
+    assert offenders == [], f"these modules import yaml eagerly: {offenders}"
 
 
 def test_console_script_and_module_entry_point(project):
