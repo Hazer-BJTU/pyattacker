@@ -650,12 +650,18 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
 * `tests/test_subprocess_lifecycle.py` — `shell_run`'s process lifetime as the OS sees it. Cancellation,
   a `timeout_s` expiry, a `Runner` stop and a cancellation aimed at the cleanup itself all leave the child
   killed *and reaped* (`os.kill(pid, 0)` must fail, which catches both "still running" and "killed but not
-  waited for"), while a child that exited on its own is left alone and keeps its result. The descendant tests
-  cancel a string command whose shell is waiting on a real pipeline, and an argv program that spawned a
-  child of its own, then assert every PID is gone — they fail if cleanup only kills the direct child.
-  Children signal readiness by writing their own PID (no fixed sleep anywhere), and the `tracked_pids`
-  fixture SIGKILLs every PID a test saw even when the test fails, so a red test cannot leave a live process
-  behind. The two descendant tests are skipped off POSIX with the platform reason (see §8.15).
+  waited for"), while a child that exited on its own is left alone and keeps its result. One test cancels
+  the caller *while the process is still being created*: it deliberately widens that window by holding the
+  wrapped `loop.subprocess_exec` until the test releases it, because the child already exists there while no
+  frame holds a handle — a race no test can be trusted to hit on purpose (the stock 3.11/3.12 implementation
+  only happens to close the transport when its own internal wait is cancelled, which is not a guarantee
+  `shell_run` may lean on). The descendant tests cancel a string command whose shell is waiting on a real
+  pipeline, and an argv program that spawned a child of its own, then assert every PID is gone — they fail
+  if cleanup only kills the direct child. Children signal readiness by writing their own PID (no fixed sleep
+  anywhere), and the `tracked_pids` fixture kills every PID a test saw even when the test fails, so a red
+  test cannot leave a live process behind. The two descendant tests are skipped off POSIX with the platform
+  reason (see §8.15); the kill and liveness probes follow the platform's own semantics, and only the POSIX
+  branches are exercised by CI.
 * `tests/test_tutorial.py` — every code block in `docs/tutorial.md` marked as a complete program
   (`# tutorial/<name>.py`) is extracted and actually run, so the tutorial cannot silently rot out of sync
   with the real API.

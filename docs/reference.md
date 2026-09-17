@@ -1348,17 +1348,20 @@ plain substring swap, not `str.format()`, so other braces (a `jq` filter, a dict
 The guarantee is "no *implicit* shell", not "safe with any program": if your argv itself invokes an
 interpreter (`["sh", "-c", ...]`), that interpreter's input handling is yours to reason about.
 
-**Process lifetime.** The task owns the process it starts, and every exit path runs the same cleanup.
-A normal exit is left alone (its result is returned as before, and `check=False` still reports a
-non-zero `returncode` instead of raising). If `timeout_s` expires, the coroutine is cancelled (a
-`Runner` stop, a group task timeout, an outer `asyncio` cancellation) or any other exception escapes,
-a child that is still running is killed with `SIGKILL` and then **reaped** before that exception
-continues to the caller: cancellation still arrives as `CancelledError` and a timeout as
-`TimeoutError`, but no process is left running behind them. There is no graceful `SIGTERM` window —
-cleanup does not wait for a child to finish. The wait for the OS to report the exit is bounded (5 s),
-which only matters for a process the OS never reports as exited, and nothing cleanup itself runs into
-(a reader left in a bad state by a cancelled `communicate()`, a failed signal) is allowed to replace
-the caller's exception: cleanup is best effort, the caller's error type is not.
+**Process lifetime.** The task owns the process it starts, and every exit path runs the same cleanup —
+process creation included. The OS child exists before `create_subprocess_exec` /
+`create_subprocess_shell` has returned a handle, so a cancellation that lands in that window is not
+allowed to abandon it: the task keeps waiting for the handle, disposes of the child, and only then
+lets the cancellation continue. A normal exit is left alone (its result is returned as before, and
+`check=False` still reports a non-zero `returncode` instead of raising). If `timeout_s` expires, the
+coroutine is cancelled (a `Runner` stop, a group task timeout, an outer `asyncio` cancellation) or any
+other exception escapes, a child that is still running is killed with `SIGKILL` and then **reaped**
+before that exception continues to the caller: cancellation still arrives as `CancelledError` and a
+timeout as `TimeoutError`, but no process is left running behind them. There is no graceful `SIGTERM`
+window — cleanup does not wait for a child to finish. The wait for the OS to report the exit is bounded
+(5 s), which only matters for a process the OS never reports as exited, and nothing cleanup itself runs
+into (a reader left in a bad state by a cancelled `communicate()`, a failed signal) is allowed to
+replace the caller's exception: cleanup is best effort, the caller's error type is not.
 
 **Descendants.** On POSIX, each child is started in its own session (`start_new_session=True`), so
 cleanup signals the whole process group rather than one PID. For a string command that covers every

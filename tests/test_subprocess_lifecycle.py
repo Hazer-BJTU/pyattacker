@@ -4,19 +4,26 @@ terminate *and reap* the child, and on POSIX shell mode must take its descendant
 The bug this file pins: cancelling the coroutine returned by ``shell_run(...)`` raised
 ``CancelledError`` while the child kept running, and the timeout path called ``proc.kill()`` and
 re-raised without waiting for the reap — so ``os.kill(pid, 0)`` still succeeded after the coroutine
-was already gone.
+was already gone. The same ownership question applies while the process is still being created, so
+that window has a test of its own.
 
 Two rules keep these tests honest and non-flaky:
 
 * readiness is signalled by the child itself (it writes its own PID to a file) and the test waits for
   that file with a deadline — nothing here sleeps for a fixed time hoping the child has started;
-* process state is asserted against the real OS: ``os.kill(pid, 0)`` must fail, which is only true
-  once the child has actually been *reaped* (a zombie still answers signal 0), and it is asserted as
-  soon as the awaiting code returns, with no polling that could forgive a slow cleanup. The one
-  exception is the test that breaks the reap wait on purpose: there the reaping is left to the child
-  watcher, so that test polls with a deadline instead. The ``tracked_pids`` fixture SIGKILLs every PID
-  a test registered when the test ends, so a red test cannot leave a live child behind; the children
-  also exit on their own after 30s as a second net.
+* process state is asserted against the real OS: ``_assert_reaped`` requires the platform's "this PID
+  is gone" answer (POSIX signal 0, which a zombie still answers, so it also catches "killed but not
+  waited for"), and it is asserted as soon as the awaiting code returns, with no polling that could
+  forgive a slow cleanup. The one exception is the test that breaks the reap wait on purpose: there
+  the reaping is left to the child watcher, so that test polls with a deadline instead. The
+  ``tracked_pids`` fixture kills every PID a test registered when the test ends, so a red test cannot
+  leave a live child behind; the children also exit on their own after 30s as a second net.
+
+Platform scope: the tests run everywhere, but the OS-level probes are platform-specific and only the
+POSIX ones are exercised by CI (Linux). The two descendant tests are skipped off POSIX because the
+guarantee they check is POSIX-only (see `docs/reference.md`), and the Windows probe branches in
+``_force_kill`` / ``_assert_reaped`` follow the documented Windows behaviour of ``os.kill`` (a
+non-console signal opens the process and terminates it) without being able to verify it here.
 """
 
 from __future__ import annotations
@@ -52,6 +59,19 @@ time.sleep(30)  # bounded lifetime: even a leaked child dies on its own
 '''
 
 
+def _force_kill(pid: int) -> None:
+    """Terminate a child we no longer hold a handle for, using what each platform offers.
+
+    POSIX: ``SIGKILL``. Windows: ``os.kill(pid, 0)`` *is* the terminate call there (a non-console
+    signal maps to ``TerminateProcess`` with that exit code) — the Windows branch is not exercised by
+    this project's Linux-only CI.
+    """
+    if os.name == "posix":
+        os.kill(pid, signal.SIGKILL)
+    else:  # pragma: no cover - Windows has no ``signal.SIGKILL``; see the docstring
+        os.kill(pid, 0)
+
+
 @pytest.fixture(scope="session")
 def child_script(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """One child program for the whole file: report readiness, optionally spawn a descendant, wait."""
@@ -72,7 +92,7 @@ def tracked_pids() -> Callable[..., None]:
     for pid in pids:
         # already reaped, or exited between the liveness check and the kill
         with contextlib.suppress(OSError):
-            os.kill(pid, signal.SIGKILL)
+            _force_kill(pid)
 
 
 def _child_command(child_script: Path, pid_file: Path, *, spawn: Path | None = None) -> list[str]:
@@ -95,14 +115,35 @@ async def _wait_for_pid(pid_file: Path, *, timeout_s: float = 10.0) -> int:
     raise AssertionError(f"the child never signalled readiness: {pid_file} stayed empty for {timeout_s}s")
 
 
+def _process_state(pid: int) -> str:
+    """Best-effort OS view of a PID, used only to say *why* a reaping assertion failed.
+
+    Linux ``/proc`` reports a zombie as ``state=Z`` and a live process as ``state=S``/``R``; elsewhere
+    the field is unavailable and the message says so.
+    """
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split(") ", 1)[1].split()
+    except (OSError, IndexError):
+        return "state unknown"
+    return f"state={fields[0]} ppid={fields[1]}"
+
+
 def _assert_reaped(pid: int) -> None:
     """The observable guarantee: the OS no longer knows this PID.
 
-    ``os.kill(pid, 0)`` succeeds for a running process *and* for a zombie nobody has waited for, so a
-    failure here means either "still running" or "killed but not reaped" — exactly the two states
-    the fix must rule out.
+    POSIX: ``os.kill(pid, 0)`` succeeds for a running process *and* for a zombie nobody has waited
+    for, so requiring ``ProcessLookupError`` fails for both "still running" and "killed but not
+    reaped". Windows: a non-console signal is not a liveness probe — ``os.kill`` opens the process and
+    terminates it — so a live PID makes the call succeed (and disposes of the leak) while a dead one
+    raises ``OSError``, which is what is required there. That branch is not exercised by CI.
     """
-    with pytest.raises(ProcessLookupError):
+    if os.name == "posix":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        raise AssertionError(f"PID {pid} is still known to the OS ({_process_state(pid)})")
+    with pytest.raises(OSError):  # pragma: no cover - Windows: see the docstring
         os.kill(pid, 0)
 
 
@@ -115,7 +156,8 @@ async def _await_cancellation(task: asyncio.Task[object]) -> None:
 async def _wait_until_gone(pid: int, *, timeout_s: float = 5.0) -> None:
     """Poll with a deadline for a killed child to disappear from the OS's view.
 
-    Only needed when the *reap wait* itself failed, so the reaping is left to the child watcher.
+    Used where the *reap wait* itself is broken on purpose, so the reaping is left to the child
+    watcher; everywhere else the reap is awaited and asserted immediately with ``_assert_reaped``.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
@@ -126,6 +168,36 @@ async def _wait_until_gone(pid: int, *, timeout_s: float = 5.0) -> None:
             return
         await asyncio.sleep(0.01)
     raise AssertionError(f"PID {pid} was still known to the OS {timeout_s}s after it was killed")
+
+
+def _pid_is_dead(pid: int) -> bool:
+    """True once the PID is gone, or (where ``/proc`` says so) a zombie: dead, however reaped.
+
+    A descendant is nobody's child in this process, so its zombie is reaped by init, at a time this
+    test does not control; on Linux the process state can tell a zombie from a live process without
+    waiting for that. Elsewhere the PID has to disappear.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return _process_state(pid).startswith("state=Z")
+
+
+async def _wait_until_dead(pid: int, *, timeout_s: float = 5.0) -> None:
+    """Wait with a deadline for a killed *descendant* to stop running.
+
+    Descendants are signalled by the process-group kill but reaped by init, so this is the strongest
+    observation available for them: gone, or a zombie that can never run again. The deadline is what
+    still makes it a kill test — a descendant that survived cleanup sleeps for 30s, far past it.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while loop.time() < deadline:
+        if _pid_is_dead(pid):
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"PID {pid} survived its process-group kill for {timeout_s}s ({_process_state(pid)})")
 
 
 async def _cancel_quietly(task: asyncio.Task[object]) -> None:
@@ -154,6 +226,116 @@ def test_cancelling_the_task_kills_and_reaps_the_argv_child(
         return pid
 
     _assert_reaped(run(scenario()))
+
+
+def test_cancellation_during_process_creation_still_kills_and_reaps_the_child(
+    tmp_path: Path,
+    child_script: Path,
+    tracked_pids: Callable[..., None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The OS child exists before ``create_subprocess_exec`` has returned a handle to ``shell_run``,
+    and a cancellation delivered in that window must not abandon it.
+
+    The window is deliberately widened rather than raced: the wrapped ``loop.subprocess_exec`` holds
+    the real result until the test releases it, so the child is created, running and past its own
+    readiness signal while the caller is still parked inside process creation. Cancelling there is
+    exactly the case where no frame of the old code held a handle, so nothing could clean it up. The
+    creation must not be cancelled either — the fix keeps waiting for the handle, kills and reaps the
+    child, and only then lets the ``CancelledError`` surface.
+
+    (The widening is an injection on purpose: in CPython 3.11/3.12 the stock implementation closes the
+    transport when its own internal wait is cancelled, but that is an implementation detail of
+    ``_make_subprocess_transport``, not something ``shell_run`` should have to rely on — and anything
+    that yields in that window, an event-loop wrapper or a custom policy, leaks without it.)
+    """
+    pid_file = tmp_path / "spawn_window.pid"
+    in_spawn_window = asyncio.Event()
+    release_spawn = asyncio.Event()
+    real_subprocess_exec = asyncio.BaseEventLoop.subprocess_exec
+
+    async def gated_subprocess_exec(
+        loop: asyncio.BaseEventLoop, *args: object, **kwargs: object
+    ) -> object:
+        created = await real_subprocess_exec(loop, *args, **kwargs)
+        # The child now exists; the caller is still inside create_subprocess_exec().
+        in_spawn_window.set()
+        await release_spawn.wait()
+        return created
+
+    monkeypatch.setattr(asyncio.BaseEventLoop, "subprocess_exec", gated_subprocess_exec)
+
+    async def scenario() -> int:
+        spec = shell_run(_child_command(child_script, pid_file), timeout_s=None)
+        task = asyncio.ensure_future(spec(None, None))
+        try:
+            await asyncio.wait_for(in_spawn_window.wait(), 10.0)  # the OS child exists *now*
+            pid = await _wait_for_pid(pid_file)  # ... and is running, not merely spawned
+            tracked_pids(pid)
+            task.cancel()  # cancels the caller while it is still waiting for the Process object
+            release_spawn.set()  # let creation return, so ownership of the child can be taken
+            await _await_cancellation(task)
+        finally:
+            release_spawn.set()  # never leave the injected spawn window closed
+            await _cancel_quietly(task)
+        return pid
+
+    _assert_reaped(run(scenario()))
+
+
+def test_a_cancellation_is_not_parked_behind_an_unresponsive_creation(
+    tmp_path: Path,
+    child_script: Path,
+    tracked_pids: Callable[..., None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other side of the spawn window: a creation that never returns must not hold the cancellation.
+
+    The wrapped ``loop.subprocess_exec`` creates the child and then never returns, and the cleanup
+    budget is shortened for the test, so the task has to surface ``CancelledError`` instead of waiting
+    for a handle that never arrives. A child that exists at that point cannot be owned by anybody in
+    the library — the test takes back the abandoned transport it injected (which kills and reaps that
+    child) and records the PID for teardown, which is exactly the trade the bounded wait makes: a
+    possible orphan instead of a task that never finishes.
+    """
+    pid_file = tmp_path / "stuck_creation.pid"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    abandoned: list[object] = []
+    real_subprocess_exec = asyncio.BaseEventLoop.subprocess_exec
+
+    async def stuck_subprocess_exec(
+        loop: asyncio.BaseEventLoop, *args: object, **kwargs: object
+    ) -> object:
+        created = await real_subprocess_exec(loop, *args, **kwargs)
+        abandoned.append(created)  # the handle the library is about to give up on
+        entered.set()
+        await release.wait()  # never set while the assertion runs
+        return created
+
+    monkeypatch.setattr(asyncio.BaseEventLoop, "subprocess_exec", stuck_subprocess_exec)
+    monkeypatch.setattr("pyattacker.tasks._CLEANUP_TIMEOUT_S", 0.2)
+
+    async def scenario() -> None:
+        spec = shell_run(_child_command(child_script, pid_file), timeout_s=None)
+        task = asyncio.ensure_future(spec(None, None))
+        try:
+            await asyncio.wait_for(entered.wait(), 10.0)  # the child exists, the handle is pending
+            tracked_pids(await _wait_for_pid(pid_file))
+            task.cancel()
+            # `asyncio.wait` never cancels the task it watches, so a missing bound fails the
+            # assertion below instead of hanging this test (or the suite) forever.
+            done, _pending = await asyncio.wait({task}, timeout=3.0)
+            assert task in done, "the cancellation was parked behind a creation that never returned"
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            release.set()  # let the injected creation finish so nothing is left pending
+            await _cancel_quietly(task)
+            for transport, *_ in abandoned:  # test-owned cleanup of what the library had to drop
+                transport.close()  # type: ignore[attr-defined]
+
+    run(scenario())
 
 
 def test_timeout_kills_and_reaps_the_argv_child(
@@ -269,16 +451,17 @@ def test_a_failing_cleanup_cannot_replace_the_callers_exception(
     (not the ``ConnectionResetError``/``RuntimeError`` cleanup ran into), and the child is still
     killed even though only the *reporting* of the kill fails.
 
-    The three failures are injected at the seams the cleanup helpers use. The child is deliberately
-    silent and the broken reader is armed only after the read task is parked inside the real
-    ``read()``: a child that wrote to the pipe would let ``communicate()`` re-enter the patched call
-    on the normal path, which would fail the run before cleanup and prove nothing.
+    The three failures are injected at the seams the cleanup helpers use — the kill seam is
+    platform-specific, matching the branch ``_signal_process`` takes (``os.killpg`` on POSIX,
+    ``Process.kill`` for the direct child elsewhere). The child is deliberately silent and the broken
+    reader is armed only after the read task is parked inside the real ``read()``: a child that wrote
+    to the pipe would let ``communicate()`` re-enter the patched call on the normal path, which would
+    fail the run before cleanup and prove nothing.
     """
     pid_file = tmp_path / "broken_cleanup.pid"
     code = "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)"
     armed = False
     real_read = asyncio.StreamReader.read
-    real_killpg = os.killpg
 
     async def gated_read(stream: asyncio.StreamReader, *args: object) -> bytes:
         if armed:
@@ -288,13 +471,24 @@ def test_a_failing_cleanup_cannot_replace_the_callers_exception(
     async def broken_wait(*args: object, **kwargs: object) -> int:
         raise ConnectionResetError("child watcher never reported the exit")
 
-    def broken_killpg(pid: int, sig: int) -> None:
-        real_killpg(pid, sig)
-        raise RuntimeError("signal delivered, then the call failed")
-
     monkeypatch.setattr(asyncio.StreamReader, "read", gated_read)
     monkeypatch.setattr(asyncio.subprocess.Process, "wait", broken_wait)
-    monkeypatch.setattr(os, "killpg", broken_killpg)
+    if os.name == "posix":  # the signal seam `_signal_process` uses there: the whole process group
+        real_killpg = os.killpg
+
+        def broken_killpg(pid: int, sig: int) -> None:
+            real_killpg(pid, sig)
+            raise RuntimeError("signal delivered, then the call failed")
+
+        monkeypatch.setattr(os, "killpg", broken_killpg)
+    else:  # pragma: no cover - the seam `_signal_process` uses off POSIX: the direct child
+        real_kill = asyncio.subprocess.Process.kill
+
+        def broken_kill(proc: asyncio.subprocess.Process) -> None:
+            real_kill(proc)
+            raise RuntimeError("signal delivered, then the call failed")
+
+        monkeypatch.setattr(asyncio.subprocess.Process, "kill", broken_kill)
 
     async def scenario() -> int:
         nonlocal armed
@@ -340,7 +534,9 @@ def test_shell_mode_kills_the_whole_process_group(
 ) -> None:
     """A string command runs through a shell, so the task's direct child is the shell and the real
     work is a descendant. Cancelling the task must take the descendant with it: without the process
-    group, the descendant would keep running (and hold the pipe) after the shell was killed."""
+    group, the descendant would keep running (and hold the pipe) after the shell was killed. The
+    descendant is not this process's child, so it is observed as dead-within-a-deadline rather than
+    strictly reaped (see ``_wait_until_dead``); the shell, which the task does own, is asserted reaped."""
     shell_pid_file = tmp_path / "shell.pid"
     child_pid_file = tmp_path / "shell_child.pid"
     command = (
@@ -349,7 +545,7 @@ def test_shell_mode_kills_the_whole_process_group(
         f"{shlex.quote(str(child_pid_file))} & wait"
     )
 
-    async def scenario() -> tuple[int, int]:
+    async def scenario() -> int:
         task = asyncio.ensure_future(shell_run(command, timeout_s=None)(None, None))
         try:
             shell_pid = await _wait_for_pid(shell_pid_file)  # the direct child: the shell
@@ -358,13 +554,12 @@ def test_shell_mode_kills_the_whole_process_group(
             assert shell_pid != child_pid
             task.cancel()
             await _await_cancellation(task)
+            await _wait_until_dead(child_pid)
         finally:
             await _cancel_quietly(task)
-        return shell_pid, child_pid
+        return shell_pid
 
-    shell_pid, child_pid = run(scenario())
-    _assert_reaped(shell_pid)
-    _assert_reaped(child_pid)
+    _assert_reaped(run(scenario()))
 
 
 @pytest.mark.skipif(
@@ -376,12 +571,14 @@ def test_argv_mode_kills_descendants_too(
     tmp_path: Path, child_script: Path, tracked_pids: Callable[..., None]
 ) -> None:
     """The argv form starts the program directly, but that program may spawn children of its own;
-    on POSIX the same group signal reaches them, which is what the documented guarantee claims."""
+    on POSIX the same group signal reaches them, which is what the documented guarantee claims. The
+    spawned descendant is observed as dead-within-a-deadline, the argv program itself — the child this
+    task owns and reaps — as strictly reaped."""
     parent_pid_file = tmp_path / "argv_parent.pid"
     child_pid_file = tmp_path / "argv_child.pid"
     command = _child_command(child_script, parent_pid_file, spawn=child_pid_file)
 
-    async def scenario() -> tuple[int, int]:
+    async def scenario() -> int:
         task = asyncio.ensure_future(shell_run(command, timeout_s=None)(None, None))
         try:
             parent_pid = await _wait_for_pid(parent_pid_file)
@@ -390,10 +587,9 @@ def test_argv_mode_kills_descendants_too(
             assert parent_pid != child_pid
             task.cancel()
             await _await_cancellation(task)
+            await _wait_until_dead(child_pid)
         finally:
             await _cancel_quietly(task)
-        return parent_pid, child_pid
+        return parent_pid
 
-    parent_pid, child_pid = run(scenario())
-    _assert_reaped(parent_pid)
-    _assert_reaped(child_pid)
+    _assert_reaped(run(scenario()))

@@ -12,7 +12,7 @@ import json
 import os
 import random
 import signal
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Coroutine, Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -360,6 +360,52 @@ async def _cleanup_process(proc: asyncio.subprocess.Process) -> None:
     await _wait_reaped(proc, deadline)
 
 
+async def _spawn_process(
+    spawn: Coroutine[Any, Any, asyncio.subprocess.Process],
+) -> asyncio.subprocess.Process:
+    """Create the child, keeping the handle when the caller is cancelled while creation is in flight.
+
+    ``create_subprocess_*`` returns only once asyncio has finished building the transport and
+    protocol, while the OS process exists from the moment the platform spawn call returns: a
+    cancellation delivered in that window abandons a live child that no frame holds a reference to.
+    The creation therefore runs as its own task, and the handle is acquired under a shield, so a
+    cancellation cannot drop it -- this frame keeps waiting for the process, disposes of it (it is
+    the only frame that has it), and only then lets the cancellation continue to the caller.
+
+    How long creation takes is the caller's own business until the caller is cancelled; from then on
+    the wait is bounded by the same budget as the rest of the cleanup, because a stop must not park
+    behind an unresponsive creation. A creation that misses that budget cannot be owned by anybody
+    here: the cancellation wins and a child it may have produced is left to the OS -- the trade is a
+    possible orphan instead of a task that never finishes, and it is stated rather than pretended away.
+
+    This window is also where the cleanup starts: a cancellation arriving before the platform spawn
+    call has even run still produces a child that is disposed of here, because whether one exists is
+    not knowable from the outside.
+    """
+    task = asyncio.ensure_future(spawn)
+    cancelled: asyncio.CancelledError | None = None
+    while not task.done():
+        timeout = None if cancelled is None else _CLEANUP_TIMEOUT_S
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout)
+        except TimeoutError:
+            break  # only the cancelled branch has a timeout: the handle is not coming
+        except asyncio.CancelledError as exc:
+            if task.cancelled():
+                break  # the creation itself was cancelled: there is nothing to own yet
+            # Our own cancellation: the creation keeps running, and the child it produces is ours.
+            cancelled = cancelled or exc
+        except Exception as exc:
+            if cancelled is None:
+                raise
+            raise cancelled from exc  # already cancelled: the caller must still see that
+    if cancelled is None:
+        return task.result()  # which raises the creation's own failure, if it failed
+    if task.done() and not task.cancelled() and task.exception() is None:
+        await _cleanup_process(task.result())
+    raise cancelled
+
+
 def shell_run(
     command: str | list[str],
     *,
@@ -394,7 +440,9 @@ def shell_run(
     own syntax, and the usual injection risk applies again — that interpreter's input-safety rules
     are then the caller's responsibility, not something this function can enforce.
 
-    **Process lifetime.** The task owns the process it starts. On every exit path — a normal exit,
+    **Process lifetime.** The task owns the process it starts, from the moment the OS child exists —
+    process creation included, so a cancellation landing after the child has been created but before
+    a handle reached this frame does not abandon it. On every exit path — a normal exit,
     ``timeout_s`` expiring, the coroutine being cancelled, any other exception — a child that is
     still running is SIGKILLed and then *reaped* before the exception propagates: cancellation
     still arrives at the caller as ``CancelledError`` and a timeout as ``TimeoutError``, but nothing
@@ -420,7 +468,7 @@ def shell_run(
     async def _impl(value: Any, ctx: Any) -> Any:
         if isinstance(command, str):
             cmd: str | list[str] = command
-            proc = await asyncio.create_subprocess_shell(
+            spawn = asyncio.create_subprocess_shell(
                 cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -429,18 +477,21 @@ def shell_run(
         else:
             encoded = json.dumps(value, default=str)
             cmd = [part.replace("{value}", encoded) for part in command]
-            proc = await asyncio.create_subprocess_exec(
+            spawn = asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 **_SPAWN_KWARGS,
             )
+        proc = await _spawn_process(spawn)
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout_s)
         finally:
-            # One cleanup for every exit path. A normal exit finds the child already reaped and
-            # does nothing; a timeout, a cancellation or any other exception kills the child
-            # (POSIX: its process group) and waits for the reap before that exception propagates.
+            # One cleanup for every exit path, process creation included (that one runs before this
+            # frame holds a handle, so `_spawn_process` disposes of it itself). A normal exit finds
+            # the child already reaped and does nothing; a timeout, a cancellation or any other
+            # exception kills the child (POSIX: its process group) and waits for the reap before
+            # that exception propagates.
             await _cleanup_process(proc)
         result = {
             "cmd": cmd,
