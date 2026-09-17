@@ -367,7 +367,10 @@ finalised, `n_tasks_done` advances, and only then does the next task start.
   checkpoint is an `Answer`, not a `dict`. For binary types, register a codec (Step 14).
 * **Change a task's code, get a new pipeline.** The pipeline key includes a digest of each task's source, so
   editing a task body abandons the old checkpoints rather than reusing results produced by different code.
-  Pass `include_code=False` to `pipeline(...)` when you want code changes to keep reusing them.
+  Pass `include_code=False` to `pipeline(...)` when you want body-only changes to keep reusing them;
+  factory parameters, child tasks and declared policies still affect identity. Explicit keys reject
+  task/input mismatches. See [resume identity](reference.md#resume-identity) for v2 store upgrades
+  and idempotency when external work succeeds before a checkpoint becomes durable.
 * **Re-running the same seeds is a no-op.** The second run reports `skipped=2`. A skipped pipeline is not
   rewritten, so its row still belongs to the run that did the work.
 

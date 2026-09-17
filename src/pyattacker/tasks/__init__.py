@@ -73,6 +73,7 @@ def flaky(
     return build_task_spec(
         _impl,
         name=name or "mock.flaky",
+        parameters={"fail_times": fail_times, "error": error, "message": message},
         retry=retry or Retrying(max_attempts=max(1, fail_times + 1), base=0.001, cap=0.01),
     )
 
@@ -85,7 +86,7 @@ def delay(seconds: float = 1.0, *, name: str | None = None) -> TaskSpec:
         return value
 
     _impl.__name__ = name or f"delay{seconds}"
-    return build_task_spec(_impl, name=name or "mock.delay")
+    return build_task_spec(_impl, name=name or "mock.delay", parameters={"seconds": seconds})
 
 
 def boom(message: str = "boom", *, error: str = "retryable", name: str | None = None) -> TaskSpec:
@@ -99,7 +100,7 @@ def boom(message: str = "boom", *, error: str = "retryable", name: str | None = 
         raise RetryableError(message, error_class="upstream")
 
     _impl.__name__ = name or "mock.boom"
-    return build_task_spec(_impl, name=name or "mock.boom")
+    return build_task_spec(_impl, name=name or "mock.boom", parameters={"message": message, "error": error})
 
 
 def leaky(*, name: str | None = None, pool: str | None = None) -> TaskSpec:
@@ -152,6 +153,10 @@ def simulate_llm(
     return build_task_spec(
         _impl,
         name=name or "mock.llm",
+        parameters={
+            "latency_ms": latency_ms, "fail_rate": fail_rate, "error": error,
+            "tokens": tokens, "resource": resource, "selector": selector,
+        },
         resource=resource,
         retry=Retrying(max_attempts=3, base=0.01, cap=0.05),
     )
@@ -230,6 +235,8 @@ def fanout(
     return build_task_spec(
         _impl,
         name=name or "fanout",
+        parameters={"on_error": on_error},
+        children=tuple(specs),
         retry=policy,
         **_agreed(specs, "resource"),
         **_agreed(specs, "algorithm"),
@@ -286,6 +293,9 @@ def shell_run(
     own syntax, and the usual injection risk applies again — that interpreter's input-safety rules
     are then the caller's responsibility, not something this function can enforce.
     """
+    if not isinstance(command, str):
+        command = list(command)  # snapshot argv so caller mutation cannot change declared behavior
+
     # A literal substring check, not str.format()/Formatter parsing: neither a string command nor
     # an argv element should have to avoid unrelated brace syntax (a jq filter, a Python literal)
     # just because the framework also uses braces for its one placeholder.
@@ -327,7 +337,10 @@ def shell_run(
         return result
 
     _impl.__name__ = name or "shell.run"
-    return build_task_spec(_impl, name=name or "shell.run")
+    return build_task_spec(
+        _impl, name=name or "shell.run",
+        parameters={"command": command, "timeout_s": timeout_s, "check": check},
+    )
 
 
 def write_jsonl(path: str, *, mode: str = "a", name: str | None = None) -> TaskSpec:
@@ -340,7 +353,7 @@ def write_jsonl(path: str, *, mode: str = "a", name: str | None = None) -> TaskS
         return {"written": path, "bytes": len(json.dumps(value, default=str))}
 
     _impl.__name__ = name or "file.write_jsonl"
-    return build_task_spec(_impl, name=name or "file.write_jsonl")
+    return build_task_spec(_impl, name=name or "file.write_jsonl", parameters={"path": path, "mode": mode})
 
 
 def jsonl_source(path: str | Path, *, limit: int | None = None) -> Iterator[Any]:
