@@ -1348,6 +1348,35 @@ plain substring swap, not `str.format()`, so other braces (a `jq` filter, a dict
 The guarantee is "no *implicit* shell", not "safe with any program": if your argv itself invokes an
 interpreter (`["sh", "-c", ...]`), that interpreter's input handling is yours to reason about.
 
+**Process lifetime.** The task owns the process it starts, and every exit path runs the same cleanup —
+process creation included. The OS child exists before `create_subprocess_exec` /
+`create_subprocess_shell` has returned a handle, so a cancellation that lands in that window is not
+allowed to abandon it: the task keeps waiting for the handle, disposes of the child, and only then
+lets the cancellation continue. A normal exit is left alone (its result is returned as before, and
+`check=False` still reports a non-zero `returncode` instead of raising). If `timeout_s` expires, the
+coroutine is cancelled (a `Runner` stop, a group task timeout, an outer `asyncio` cancellation) or any
+other exception escapes, a child that is still running is killed with `SIGKILL` and then **reaped**
+before that exception continues to the caller: cancellation still arrives as `CancelledError` and a
+timeout as `TimeoutError`, but no process is left running behind them. There is no graceful `SIGTERM`
+window — cleanup does not wait for a child to finish. The wait for the OS to report the exit is bounded
+(5 s), which only matters for a process the OS never reports as exited, and nothing cleanup itself runs
+into (a reader left in a bad state by a cancelled `communicate()`, a failed signal) is allowed to
+replace the caller's exception: cleanup is best effort, the caller's error type is not.
+
+**Descendants.** On POSIX, each child is started in its own session (`start_new_session=True`), so
+cleanup signals the whole process group rather than one PID. For a string command that covers every
+part of a pipeline or a subshell; for the argv form it covers the program and whatever that program
+spawned. There is no "kill only the direct child" mode, and no cgroup/pidfd machinery beyond the
+process group. On Windows there is no group signalling in the standard library (`os.killpg` does not
+exist, and `asyncio` cannot send `CTRL_BREAK_EVENT` to a child's group), so only the direct child is
+terminated there and a descendant of a shell command may outlive the task — a documented limitation,
+verified on POSIX only. Because the child leads its own session on POSIX, it does not receive
+terminal-generated signals such as Ctrl-C; the task's own cancellation is what stops it. Cleanup acts
+only while the child itself is still unreaped: a command that already exited normally is not followed,
+so a process it deliberately left behind (a shell's `&`, a daemon) is not killed — and once the child
+has been reaped its PID, which is also the process-group id, may have been reused, so signalling that
+group would not be safe anyway.
+
 ### `write_jsonl`
 
 ```python
