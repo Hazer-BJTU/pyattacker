@@ -65,6 +65,11 @@ jobs:
         uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
+          # Both 3.11 jobs read the same lockfile, so without a suffix they compute the same cache
+          # key and setup-uv warns that one of them could not upload the cache it just built. The
+          # suffix is also honest: this job installs a different set of packages (pytest and the
+          # build backend, rather than the dev group).
+          cache-suffix: no-extra
           python-version: "3.11"
 
       - name: Install the library and nothing else
