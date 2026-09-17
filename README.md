@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Hazer-BJTU/pyattacker/actions/workflows/ci.yml/badge.svg)](https://github.com/Hazer-BJTU/pyattacker/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/Hazer-BJTU/pyattacker/blob/main/LICENSE)
 
 > Run tens of thousands of independent tasks to completion — resumably, observably, and without
 > reimplementing endpoint pools, retries and "which rows already ran" for the fifth time.
@@ -33,7 +33,7 @@ pyattacker is that scheduler, extracted and made boring:
 It **does not touch the network**: you write the openai/anthropic calls, it handles everything around
 them. The core dependency list is the standard library plus PyYAML.
 
-**New here?** The [tutorial](docs/tutorial.md) goes from a five-line program to a sharded, resumable
+**New here?** The [tutorial](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md) goes from a five-line program to a sharded, resumable
 model evaluation. Every snippet in it is executed by the test suite.
 
 ## Install
@@ -194,7 +194,7 @@ uv run pyattacker plugins                        # installed plugins
 ```
 
 Exit codes: `0` all succeeded / `1` some failed / `2` config error / `130` interrupted.
-Every flag of every subcommand: [`docs/cli.md`](docs/cli.md).
+Every flag of every subcommand: [`docs/cli.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/cli.md).
 
 ## Records and Monitoring
 
@@ -222,7 +222,7 @@ uv run pyattacker plugins                 # what is installed, and what failed t
 ```
 
 Built-ins resolve first (a plugin cannot shadow `echo`), and a plugin that raises on import is
-recorded rather than fatal. A complete worked example: [`examples/plugin_package/`](examples/plugin_package/README.md).
+recorded rather than fatal. A complete worked example: [`examples/plugin_package/`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/plugin_package/README.md).
 
 **Large payloads** can live outside the database:
 
@@ -256,21 +256,21 @@ group).
 
 | Document | What is in it |
 |---|---|
-| [`docs/tutorial.md`](docs/tutorial.md) | fourteen runnable steps, from "one task" to a sharded evaluation; each one executed by the test suite |
-| [`docs/reference.md`](docs/reference.md) | every public class and function: signatures, parameters, examples |
-| [`docs/cli.md`](docs/cli.md) | every subcommand, every flag, exit codes, config reference |
-| [`docs/design.md`](docs/design.md) | conceptual model, the six invariants, the lease contract, data model, tradeoffs |
-| [`CHANGELOG.md`](CHANGELOG.md) | what changed, release by release |
+| [`docs/tutorial.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md) | fourteen runnable steps, from "one task" to a sharded evaluation; each one executed by the test suite |
+| [`docs/reference.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md) | every public class and function: signatures, parameters, examples |
+| [`docs/cli.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/cli.md) | every subcommand, every flag, exit codes, config reference |
+| [`docs/design.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/design.md) | conceptual model, the six invariants, the lease contract, data model, tradeoffs |
+| [`CHANGELOG.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/CHANGELOG.md) | what changed, release by release |
 
 ## Examples
 
 | Example | What it shows |
 |---|---|
-| [`examples/quickstart.py`](examples/quickstart.py) | the SDK in 60 lines: a custom client factory, retries, resume |
-| [`examples/llm_eval/`](examples/llm_eval/README.md) | a complete evaluation — prepare → 2-turn model call → 3 judges → reduce, in **two pipeline shapes**, with the checkpoint-granularity tradeoff *measured* (grouped re-sent 2 judge requests that had already succeeded; split re-sent 0) |
-| [`examples/sharded.py`](examples/sharded.py) | one dataset across N stores, then a merged report |
-| [`examples/plugin_package/`](examples/plugin_package/README.md) | a real installable plugin: tasks, an algorithm, a codec |
-| [`examples/qa_eval.yaml`](examples/qa_eval.yaml) | the declarative path, end to end |
+| [`examples/quickstart.py`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/quickstart.py) | the SDK in 60 lines: a custom client factory, retries, resume |
+| [`examples/llm_eval/`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/llm_eval/README.md) | a complete evaluation — prepare → 2-turn model call → 3 judges → reduce, in **two pipeline shapes**, with the checkpoint-granularity tradeoff *measured* (grouped re-sent 2 judge requests that had already succeeded; split re-sent 0) |
+| [`examples/sharded.py`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/sharded.py) | one dataset across N stores, then a merged report |
+| [`examples/plugin_package/`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/plugin_package/README.md) | a real installable plugin: tasks, an algorithm, a codec |
+| [`examples/qa_eval.yaml`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/qa_eval.yaml) | the declarative path, end to end |
 
 ```bash
 uv run python examples/quickstart.py
@@ -290,7 +290,7 @@ These are design decisions, not missing features:
 * **A serving gateway** — the only HTTP surface is the read-only debug endpoint above.
 * **Distributed scheduling** — scale out with `--shard`; multi-process is the ceiling.
 
-Sections 1 and 11 of [`docs/design.md`](docs/design.md) state the boundary precisely, and section 8 lists
+Sections 1 and 11 of [`docs/design.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/design.md) state the boundary precisely, and section 8 lists
 every known tradeoff with its reason.
 
 ## Status
@@ -319,5 +319,5 @@ extracted and executed by `tests/test_tutorial.py`, so documentation that rots f
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/Hazer-BJTU/pyattacker/blob/main/LICENSE).
 

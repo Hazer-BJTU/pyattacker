@@ -60,6 +60,23 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/pyattacker"]
 
+[tool.hatch.build.targets.sdist]
+# An sdist should be able to rebuild and verify the package, so tests, docs and examples belong in
+# it. Local tooling state does not: .claude/ is untracked editor config, and shipping it in a
+# release leaks whatever a contributor happens to have configured locally.
+include = [
+    "src/pyattacker",
+    "tests",
+    "docs",
+    "examples",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "pyproject.toml",
+    "uv.lock",
+    ".github/workflows",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
