@@ -27,11 +27,15 @@ All notable changes to this project are documented here. The format follows
 ### Fixed
 
 * Resume now rejects an existing pipeline key whose task or seed digest differs, preserving its
-  historical result/checkpoint and raising `PipelineIdentityConflict` (CLI exit 2).
+  historical result/checkpoint and raising `PipelineIdentityConflict` (CLI exit 2). In-flight
+  pipelines cancelled during the stop are immediately finalized as interrupted.
 * Task fingerprint v2 includes built-in factory parameters, ordered fanout children and strategy,
   all retry fields and declared algorithm configuration. Tasks/config entries accept finite-JSON
   `config` and an explicit `version` for dynamic code or external behavior. `include_code=False`
-  excludes child source digests recursively while retaining declared behavior.
+  excludes child source digests recursively while retaining declared behavior. Built-in algorithm
+  execution uses the captured configuration snapshot, including normalized Wait fallbacks; custom
+  fingerprint hooks are checked before execution/acquisition. Identity JSON rejects coercions such
+  as non-string object keys and tuples.
 * Legacy fingerprint stores remain readable but are not automatically migrated: default pipeline
   IDs and shard assignments change, and explicit old keys conflict. The Runner warns when the
   oldest stored pipeline uses the legacy format. Finish old runs with the old package, then use

@@ -35,7 +35,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .algorithm import AcquireAlgorithm, resolve_algorithm
+from .algorithm import AcquireAlgorithm
 from .artifact import (
     DEFAULT_REGISTRY,
     SEED_SEQ,
@@ -722,12 +722,12 @@ class Runner:
     async def _worker(self, queue: "asyncio.Queue[Any]", run_id: str) -> None:
         while True:
             item = await queue.get()
+            state = None
             try:
                 if item is None:
                     return
                 if self._identity_error is not None:
                     continue  # stop queued work before opening or overwriting any other records
-                state = None
                 self._live["running"] += 1
                 try:
                     # The queue carries two shapes: fresh PipelineSpec objects from the producer,
@@ -738,6 +738,20 @@ class Runner:
                 finally:
                     self._live["running"] -= 1
             except asyncio.CancelledError:
+                if state is not None:
+                    try:
+                        self.store.finish_pipeline(
+                            state.pipeline_id, "interrupted", n_tasks_done=state.record.n_tasks_done
+                        )
+                    except Exception as exc:
+                        self._fatal_error = StoreUnavailable(
+                            f"could not persist cancellation for pipeline {state.pipeline_id!r}: {exc}"
+                        )
+                        self._hard_stop = True
+                        self.stop("store_unavailable")
+                        raise
+                    self._counters["pipelines_done"] += 1
+                    self._check_all_done()
                 raise
             except PipelineIdentityConflict as exc:
                 # Do not send conflicts through internal-error recovery: that would overwrite
@@ -958,11 +972,7 @@ class Runner:
         instead of leaving an unexplained gap.
         """
         state.task_spec = state.spec.tasks[state.seq]
-        state.default_algorithm = (
-            resolve_algorithm(state.task_spec.algorithm)
-            if state.task_spec.algorithm is not None
-            else None
-        )
+        state.default_algorithm = state.task_spec.runtime_algorithm()
         state.attempts_used = 0
         state.task_started = self.clock.now()
         state.retry_after = None

@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import inspect
 import json
+import math
 import random
 import typing
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -143,7 +145,8 @@ class TaskSpec:
         fn: The wrapped callable; ``(value)`` or ``(value, ctx)`` depending on ``takes_ctx``.
         resource: Default pool name this task acquires from (``ctx.acquire()`` with no ``pool=``
             falls back to this); ``None`` means the task must always name its pool explicitly.
-        algorithm: Default acquire algorithm for this task's resource acquisitions.
+        algorithm: Supplied default acquire policy. Built-ins execute from a captured configuration,
+            unaffected by later mutation; custom fingerprint hooks are checked before use.
         retry: Retry policy applied when an attempt of this task raises.
         timeout_s: Wall-clock timeout for one attempt (only meaningful for an async ``fn``).
         accepts / returns: Type hints inferred from ``fn``'s signature; used only for the adjacent-task
@@ -178,6 +181,7 @@ class TaskSpec:
     children: tuple["TaskSpec", ...] = field(default=(), repr=False)
     _config_json: str = field(default="{}", init=False, repr=False)
     _parameters_json: str = field(default="{}", init=False, repr=False)
+    _algorithm_snapshot: "_AlgorithmSnapshot | None" = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.version is not None and not isinstance(self.version, str):
@@ -186,6 +190,7 @@ class TaskSpec:
             raise ConfigError("task config and parameters must be JSON mappings")
         object.__setattr__(self, "_config_json", _identity_json(dict(self.config)))
         object.__setattr__(self, "_parameters_json", _identity_json(dict(self.parameters)))
+        object.__setattr__(self, "_algorithm_snapshot", _snapshot_algorithm(self.algorithm, version=self.version))
 
     @property
     def is_async(self) -> bool:
@@ -201,7 +206,7 @@ class TaskSpec:
             "version": self.version,
             "children": [child.fingerprint(include_code=include_code) for child in self.children],
             "resource": self.resource,
-            "algorithm": _algorithm_identity(self.algorithm, version=self.version),
+            "algorithm": self._algorithm_snapshot.identity() if self._algorithm_snapshot is not None else None,
             "timeout_s": self.timeout_s,
             "retry": {
                 "max_attempts": self.retry.max_attempts,
@@ -219,6 +224,10 @@ class TaskSpec:
             result["code"] = self.code_digest
         return result
 
+    def runtime_algorithm(self) -> Any:
+        """Resolve a fresh runtime algorithm from the same snapshot used by fingerprint()."""
+        return self._algorithm_snapshot.runtime() if self._algorithm_snapshot is not None else None
+
     def with_overrides(self, **kwargs: Any) -> "TaskSpec":
         return replace(self, **{k: v for k, v in kwargs.items() if v is not None})
 
@@ -233,31 +242,128 @@ class TaskSpec:
 
 
 def _identity_json(value: Any) -> str:
+    def validate(node: Any, ancestors: set[int]) -> None:
+        if type(node) in (type(None), bool, int, str):
+            return
+        if type(node) is float and math.isfinite(node):
+            return
+        if type(node) not in (dict, list):
+            raise ValueError(f"unsupported identity value: {type(node).__name__}")
+        if id(node) in ancestors:
+            raise ValueError("cyclic identity value")
+        ancestors.add(id(node))
+        try:
+            if type(node) is dict:
+                if any(type(key) is not str for key in node):
+                    raise ValueError("identity object keys must be strings")
+                values = node.values()
+            else:
+                values = node
+            for item in values:
+                validate(item, ancestors)
+        finally:
+            ancestors.remove(id(node))
+
     try:
+        validate(value, set())
         return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise ConfigError(f"task identity must contain only finite JSON values: {exc}") from exc
 
 
-def _algorithm_identity(spec: Any, *, version: str | None = None) -> Any:
+@dataclass(frozen=True)
+class _AlgorithmSnapshot:
+    data: str
+    factory: Any = None
+    fallback: "_AlgorithmSnapshot | None" = None
+    custom: Any = None
+    checked: bool = False
+
+    def identity(self) -> Any:
+        return json.loads(self.data)
+
+    def validate_custom(self) -> None:
+        expected = self.identity()
+        target = f"{type(self.custom).__module__}:{type(self.custom).__qualname__}"
+        actual = _identity_json({"target": target, "config": self.custom.fingerprint()})
+        if actual != self.data:
+            raise ConfigError(
+                f"custom algorithm {expected['target']} fingerprint changed after task construction; "
+                "build a new TaskSpec/pipeline for changed behavior"
+            )
+
+    def runtime(self) -> Any:
+        if self.factory is not None:
+            params = self.identity()["params"]
+            if self.fallback is not None:
+                params["fallback"] = self.fallback.runtime()
+            return self.factory(**params)
+        if self.checked:
+            self.validate_custom()
+            return _CheckedAlgorithm(self)
+        return _copy_custom_algorithm(self.custom)
+
+
+@dataclass
+class _CheckedAlgorithm:
+    snapshot: _AlgorithmSnapshot
+
+    @property
+    def name(self) -> str:
+        return self.snapshot.custom.name
+
+    async def acquire(self, pool: Pool, **kwargs: Any) -> Lease:
+        # Check again at acquisition: another coroutine may have changed the source object
+        # since the attempt was opened, including while waiting between acquisitions.
+        self.snapshot.validate_custom()
+        return await self.snapshot.custom.acquire(pool, **kwargs)
+
+
+def _copy_custom_algorithm(algorithm: Any) -> Any:
+    try:
+        cloned = copy.deepcopy(algorithm)
+    except Exception as exc:
+        raise ConfigError("versioned custom algorithm must support deepcopy, or provide fingerprint()") from exc
+    if cloned is algorithm:
+        raise ConfigError("versioned custom algorithm deepcopy must return a separate instance")
+    return cloned
+
+
+def _snapshot_algorithm(spec: Any, *, version: str | None = None) -> _AlgorithmSnapshot | None:
     if spec is None:
         # Pool defaults and endpoint options are external: version them through task config/version.
         return None
-    from .algorithm import ALGORITHMS, resolve_algorithm
+    from .algorithm import ALGORITHMS, Wait, resolve_algorithm
 
     algorithm = resolve_algorithm(spec)
     target = f"{type(algorithm).__module__}:{type(algorithm).__qualname__}"
     if type(algorithm) in ALGORITHMS.values():
         params = {}
+        fallback = None
         for item in fields(algorithm):
             value = getattr(algorithm, item.name)
-            params[item.name] = _algorithm_identity(value, version=version) if item.name == "fallback" else value
-        return json.loads(_identity_json({"target": target, "params": params}))
+            if item.name == "fallback":
+                fallback = _snapshot_algorithm(value if value is not None else Wait(), version=version)
+                params[item.name] = fallback.identity()
+            elif item.name == "pools":
+                # Failover accepts a Sequence of names; tuple/list represent the same behavior.
+                params[item.name] = list(value)
+            else:
+                params[item.name] = value
+        return _AlgorithmSnapshot(
+            _identity_json({"target": target, "params": params}),
+            factory=type(algorithm), fallback=fallback,
+        )
     hook = getattr(algorithm, "fingerprint", None)
     if callable(hook):
-        return json.loads(_identity_json({"target": target, "config": hook()}))
+        return _AlgorithmSnapshot(
+            _identity_json({"target": target, "config": hook()}), custom=algorithm, checked=True,
+        )
     if version is not None:
-        return {"target": target, "version": version}
+        return _AlgorithmSnapshot(
+            _identity_json({"target": target, "version": version}),
+            custom=_copy_custom_algorithm(algorithm),
+        )
     raise ConfigError(
         f"custom algorithm {target} must provide fingerprint() with JSON values or use task(version=...)"
     )

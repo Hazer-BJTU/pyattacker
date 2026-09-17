@@ -10,7 +10,22 @@ import sys
 
 import pytest
 
-from pyattacker import Backoff, ConfigError, PipelineIdentityConflict, Retrying, Runner, pipeline, task
+from pyattacker import (
+    Backoff,
+    ConfigError,
+    Failover,
+    LeastBusy,
+    PipelineIdentityConflict,
+    Pool,
+    QuotaAware,
+    Resource,
+    Retrying,
+    Runner,
+    Sticky,
+    Wait,
+    pipeline,
+    task,
+)
 from pyattacker.cli import main
 from pyattacker.declarative import load_spec
 from pyattacker.shard import shard_index
@@ -72,7 +87,10 @@ def test_config_snapshot_version_and_recursive_include_code():
     assert pipeline('x', fanout(echo), include_code=False).spec_digest != pipeline('x', fanout(delay(0)), include_code=False).spec_digest
 
 
-@pytest.mark.parametrize('config', [{'client': object()}, {'value': float('nan')}])
+@pytest.mark.parametrize('config', [
+    {'client': object()}, {'value': float('nan')}, {1: "x"},
+    {"value": (1, 2)}, {"nested": [{False: "x"}]},
+])
 def test_identity_rejects_runtime_objects_and_nonfinite_values(config):
     with pytest.raises(ConfigError, match='finite JSON'):
         task(config=config)(echo.fn)
@@ -197,7 +215,8 @@ def test_custom_algorithm_hook_and_factory_config_override(tmp_path):
     assert load(0) != load(1)
 
 
-def test_identity_conflict_cancels_inflight_and_does_not_start_queued_work():
+@pytest.mark.parametrize("storage", ["memory", "sqlite"])
+def test_identity_conflict_cancels_inflight_and_does_not_start_queued_work(tmp_path, storage):
     async def scenario():
         calls = []
         started = asyncio.Event()
@@ -212,10 +231,11 @@ def test_identity_conflict_cancels_inflight_and_does_not_start_queued_work():
             finally:
                 cancelled.set()
 
-        with Runner(handle_signals=False, concurrency=2, grace_s=60) as runner:
+        store = ":memory:" if storage == "memory" else str(tmp_path / "run.db")
+        with Runner(store=store, handle_signals=False, concurrency=2, grace_s=60) as runner:
             runner.run([pipeline("x", echo).bind(1, key="row")])
             conflict = pipeline("x", echo).bind(2, key="row")
-            queued = pipeline("x", slow)
+            queued = pipeline("x", echo, slow)
             def specs():
                 yield queued.bind(0)
                 yield conflict
@@ -226,4 +246,148 @@ def test_identity_conflict_cancels_inflight_and_does_not_start_queued_work():
             assert cancelled.is_set()
             assert calls == [0]
             assert runner.store.get_pipeline("row").state == "succeeded"
+            interrupted = runner.store.get_pipeline(queued.bind(0).pipeline_id)
+            assert interrupted.state == "interrupted"
+            assert interrupted.n_tasks_done == 1
+            assert runner.store.get_artifact(interrupted.pipeline_id, 0).payload == b"0"
+            assert not runner.store.pipelines(run_id=runner.run_id, state="running")
+            tasks = runner.store.tasks(interrupted.pipeline_id)
+            assert [record.state for record in tasks] == ["succeeded", "interrupted"]
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mapping", [False, True])
+def test_runner_uses_algorithm_snapshot_after_caller_mutation(mapping):
+    algorithm = {"name": "backoff", "base": 1.0} if mapping else Backoff(base=1.0)
+
+    @task("probe", resource="apis", algorithm=algorithm)
+    async def probe(value, ctx):
+        async with ctx.acquire():
+            observed = ctx.default_algorithm.base
+        ctx.default_algorithm.base = 200  # a runtime instance cannot change the next task's definition
+        return observed
+
+    template = pipeline("x", probe)
+    original_fingerprint = probe.fingerprint()
+    if mapping:
+        algorithm["base"] = 100
+    else:
+        algorithm.base = 100
+    assert probe.fingerprint() == original_fingerprint
+    assert pipeline("x", probe).spec_digest == template.spec_digest
+    pool = Pool("apis", [Resource.create("llm")])
+    with Runner(pools=[pool], handle_signals=False) as runner:
+        runner.run(template.map([1, 2]))
+        outputs = [runner.store.get_artifact(s.pipeline_id, 0).payload for s in template.map([1, 2])]
+        assert outputs == [b"1.0", b"1.0"]
+
+
+@pytest.mark.parametrize("factory", [Sticky, LeastBusy, Failover, QuotaAware])
+def test_implicit_wait_fallback_is_canonical(factory):
+    implicit = dataclasses.replace(echo, algorithm=factory())
+    explicit = dataclasses.replace(echo, algorithm=factory(fallback=Wait()))
+    assert pipeline("x", implicit).spec_digest == pipeline("x", explicit).spec_digest
+    changed = dataclasses.replace(echo, algorithm=factory(fallback=Wait(timeout=1)))
+    assert pipeline("x", implicit).spec_digest != pipeline("x", changed).spec_digest
+
+
+def test_nested_algorithm_snapshot_is_not_changed_by_caller():
+    fallback = Backoff(base=1)
+    algorithm = Sticky(fallback=fallback)
+    spec = dataclasses.replace(echo, algorithm=algorithm)
+    identity = spec.fingerprint()
+    fallback.base = 100
+    algorithm.fallback = Wait()
+    assert spec.fingerprint() == identity
+    assert spec.runtime_algorithm().fallback.base == 1
+
+
+class FingerprintedAlgorithm(CustomAlgorithm):
+    def __init__(self, value):
+        self.value = value
+        self.calls = 0
+
+    def fingerprint(self):
+        return {"value": self.value}
+
+    async def acquire(self, pool, **kwargs):
+        self.calls += 1
+        return await super().acquire(pool, **kwargs)
+
+
+@pytest.mark.parametrize("value", [(1, 2), {1: "x"}, float("inf")])
+def test_custom_algorithm_fingerprint_rejects_coercions(value):
+    with pytest.raises(ConfigError, match="finite JSON"):
+        dataclasses.replace(echo, algorithm=FingerprintedAlgorithm(value))
+
+
+def test_custom_algorithm_drift_is_rejected_before_task_execution():
+    algorithm = FingerprintedAlgorithm(1)
+    called = []
+
+    @task("probe", algorithm=algorithm)
+    def probe(value):
+        called.append(value)
+        return value
+
+    template = pipeline("x", probe)
+    identity = probe.fingerprint()
+    algorithm.value = 2
+    assert probe.fingerprint() == identity
+    with Runner(handle_signals=False) as runner:
+        report = runner.run(template.map([1]))
+        assert report.stats["pipelines"]["by_state"] == {"failed": 1}
+        row = runner.store.get_pipeline(template.bind(1).pipeline_id)
+        assert "fingerprint changed" in row.error_message
+        assert not called
+
+
+def test_custom_algorithm_drift_is_rechecked_at_acquisition():
+    algorithm = FingerprintedAlgorithm(1)
+
+    @task("probe", algorithm=Sticky(fallback=algorithm), resource="apis")
+    async def probe(value, ctx):
+        algorithm.value = 2  # after _begin_task, before the algorithm is used
+        async with ctx.acquire():
+            return value
+
+    pool = Pool("apis", [Resource.create("llm")])
+    with Runner(pools=[pool], handle_signals=False) as runner:
+        report = runner.run(pipeline("x", probe).map([1]))
+        assert report.stats["pipelines"]["by_state"] == {"failed": 1}
+        assert algorithm.calls == 0
+        assert pool.stats().active == 0
+
+
+def test_version_only_custom_algorithm_is_detached_from_source():
+    algorithm = CustomAlgorithm()
+    algorithm.settings = {"mode": "a"}
+    spec = dataclasses.replace(echo, algorithm=algorithm, version="1")
+    algorithm.settings["mode"] = "b"
+    runtime = spec.runtime_algorithm()
+    assert runtime.settings == {"mode": "a"}
+    runtime.settings["mode"] = "c"
+    assert spec.runtime_algorithm().settings == {"mode": "a"}
+
+
+def test_json_identity_accepts_shared_subtrees_but_rejects_cycles():
+    values = [None, True, 1, 1.5, "x", {"value": []}]
+    task(config={"a": values, "b": values})(echo.fn)
+    values.append(values)
+    with pytest.raises(ConfigError, match="cyclic"):
+        task(config={"a": values})(echo.fn)
+
+
+def test_failover_pool_sequences_normalize_intentionally():
+    a = dataclasses.replace(echo, algorithm=Failover(pools=("primary", "backup")))
+    b = dataclasses.replace(echo, algorithm=Failover(pools=["primary", "backup"]))
+    assert a.fingerprint() == b.fingerprint()
+    assert a.runtime_algorithm().pools == ["primary", "backup"]
+
+
+def test_uncopyable_version_only_custom_algorithm_is_rejected():
+    class Uncopyable(CustomAlgorithm):
+        def __deepcopy__(self, memo):
+            return self
+    with pytest.raises(ConfigError, match="separate instance"):
+        dataclasses.replace(echo, algorithm=Uncopyable(), version="1")

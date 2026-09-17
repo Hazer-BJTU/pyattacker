@@ -124,6 +124,7 @@ Immutable description of a task. You rarely construct one; you receive them from
 |---|---|
 | `is_async` | whether `fn` is a coroutine function |
 | `fingerprint(*, include_code=True)` | the dict that feeds `spec_digest`; includes nested specs |
+| `runtime_algorithm()` | a runtime algorithm derived from the captured identity configuration |
 | `with_overrides(**kwargs)` | a new spec with fields replaced |
 
 Two `TaskSpec`s compose with `|` into a `Chain`. `spec | other` validates nothing on its own; the check
@@ -1079,8 +1080,9 @@ and factory `parameters`. `fanout` also records its ordered child fingerprints a
 Built-in factories record their behavior arguments automatically. User `config` is separate from
 factory parameters, so a declarative override cannot erase a built-in's behavior identity.
 
-`config` and `parameters` must contain JSON values with finite numbers; they are snapshotted when
-the spec is built. Arbitrary closures, clients, globals, imported helpers, endpoint options, and
+`config` and `parameters` accept only null, bool, int, finite float, string, lists, and objects
+with string keys; they are snapshotted when the spec is built. Tuples, non-string object keys,
+Python subclasses of JSON primitives and cycles are rejected rather than coerced. Arbitrary closures, clients, globals, imported helpers, endpoint options, and
 pool-default algorithms are **not** inspected. Declare behavior from those sources explicitly:
 
 ```python
@@ -1091,10 +1093,20 @@ async def ask(row, ctx):
     ...  # use the same declared model, temperature and prompt revision in your client call
 ```
 
-A custom task algorithm must provide `fingerprint()` returning finite JSON values, or the task
-must supply `version=` and bump it when algorithm behavior changes. Built-in algorithm strings,
-config mappings and equivalent instances normalize to the same fingerprint; nested fallback
-configuration is included. Secrets and runtime clients should never be placed in identity config.
+Built-in task algorithms capture their normalized configuration at TaskSpec construction.
+The Runner builds fresh runtime instances from that same snapshot, so later mutation of a supplied
+algorithm instance or mapping cannot change recorded behavior. Nested fallbacks are snapshotted,
+and implicit Wait fallbacks normalize to an explicit `Wait()` for Sticky, LeastBusy, Failover and
+QuotaAware. Failover's tuple/list pool-name sequences intentionally normalize to a JSON list.
+
+A custom task algorithm must provide `fingerprint()` returning the same strict JSON domain, or
+the task must supply `version=` and bump it when algorithm behavior changes. Hook results are
+captured with the spec and checked before task execution and each acquisition, including custom
+fallbacks; drift fails before that algorithm runs. Custom hooks must describe configuration,
+not changing counters, and their configuration must stay stable during an acquisition.
+Version-only custom algorithms must support an independent `deepcopy`; the definition is copied
+at construction and detached runtime copies are produced for each task. Built-in strings,
+config mappings and equivalent instances normalize to the same fingerprint. Secrets and runtime clients should never be placed in identity config.
 
 `pipeline(..., include_code=False)` removes source digests recursively, including fanout children.
 It retains factory parameters, config, version and policies. Source-inspection failure falls back
@@ -1107,6 +1119,8 @@ Explicit `bind(key=...)`, `map(key_of=...)` and declarative `source.key_field` r
 IDs, but the Runner checks the stored spec and seed digest **before** skipping or restoring.
 A mismatch raises `PipelineIdentityConflict` (`ConfigError`, CLI exit 2), interrupts the new run,
 and leaves the conflicting pipeline's stored definition, result and checkpoint untouched.
+Already-open in-flight pipelines are finalized as interrupted immediately, with their durable
+checkpoint cursors preserved; monitoring does not need a later resume to repair their state.
 Use a new key or store for changed work. `retry_succeeded=True` is not a conflict override.
 
 ### Upgrading existing stores
