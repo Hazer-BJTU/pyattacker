@@ -24,7 +24,54 @@ All notable changes to this project are documented here. The format follows
   the policy rather than a block inside the Runner's attempt loop, so the benchmark can ask the same
   question outside a run. Behaviour is unchanged; `tests/test_retry_policy.py` pins the rules directly.
 
+### Fixed
+
+* **Storm scheduling in the benchmark was traffic-dependent.** The simulated provider decided its
+  weather when a request arrived and remembered "checked until now + window", so a request at t=9 could
+  suppress a window a request at t=10 would have evaluated: two algorithms then met different worlds,
+  which quietly breaks the comparison the benchmark exists to make. Storm state is now a pure function of
+  `(seed, endpoint, t)`, anchored to fixed time windows, and the regression test compares two *different*
+  traffic schedules at the same timestamps instead of replaying one schedule twice.
+* **A circuit-break cooldown announced itself to nobody.** `Pool` degrades a resource for `cooldown_s` and
+  recovers it lazily, so a pool whose every resource is cooling down had no event left to broadcast: a
+  waiter parked past the deadline (a starvation bug in real time, a hang under a simulated clock). The
+  pool now arms one task, only while somebody waits, that sleeps on the pool's clock until the earliest
+  future cooldown and broadcasts — and ignores already-expired and permanently dead slots, both of which
+  otherwise re-arm a zero-delay timer forever.
+* **`wall_s` on a benchmark report was never assigned**, so every report and every JSON payload claimed
+  0.0s of wall clock. It is measured now, and it is declared `neutral`: it is what the sweep cost, not
+  evidence about an algorithm.
+* **Winner uncertainty threw away the experimental design.** Every algorithm runs every seed, so the runs
+  are paired and what matters is the spread of the per-seed *difference*; the report used the
+  independent-samples form, which is wider exactly when common random numbers worked. It now compares
+  paired differences, and `SIGNIFICANCE_K = 2.0` is documented as a heuristic rather than as "95%": with
+  three seeds the Student-t critical value is 4.3.
+* **Fail-fast could win latency and throughput rows.** Throughput divided by each run's own makespan (so
+  abandoning work early manufactured throughput) and latency was collected only for jobs that succeeded
+  (so an algorithm that finished 0.23% of the work could lead a latency row). Throughput now divides by
+  the scenario's fixed budget, the latency metrics are named `successful_job_latency_*`, and every
+  conditional metric refuses to crown an algorithm that completed less than 90% of the best completion —
+  naming the excluded ones in the table, the markdown and the JSON.
+* **Client-side randomness depended on worker assignment.** One `Random` per worker was consumed by the
+  acquire algorithm, the retry policy and every later job, so an algorithm that changed its own timing
+  changed its own future randomness. The two subsystems now draw from separate streams derived from
+  `(seed, job, step, attempt)`.
+* **`ResourceUnavailable` was a hidden special case** in the harness: the algorithm declining to wait
+  failed the step without consulting `Retrying`. It now goes through `Retrying.decide()` like any other
+  failure, so a scenario that retries it (`on=`, or `retry_unknown=True`) gets the framework's semantics.
+* **`endpoint_spread` was declared "lower is better"**, which embeds the assumption that an even split
+  across deliberately unlike endpoints is good; it is a diagnostic now, and so is `wall_s`.
+
 ### Changed
+
+* **A scenario can declare the algorithms it cannot exercise** (`Scenario.unsuited`): `bursty_provider`
+  lists `failover` (one pool gives it nothing to fail over to) and `least_busy` (the pool's default
+  selection is already least-busy-first, so it is the same code path as `wait`). Those are skipped by
+  default and marked N/A when asked for, instead of being ranked on a number that cannot mean anything.
+* **The benchmark's refusals are `PyAttackerError`s** (`BenchmarkError`, and beside `BenchmarkTimeout` a
+  new `BenchmarkStalled` for a world whose every resource is dead or revoked), so the CLI reports them as
+  a message and exit code 2 rather than as a traceback — and `BenchmarkStalled` arrives in about a second
+  instead of after the whole wall-clock budget.
 
 * **PyYAML is no longer a dependency — it is the optional `yaml` extra.** `pip install pyattacker` now
   installs nothing at all: the kernel and the declarative layer's JSON/TOML paths are the standard library.

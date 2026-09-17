@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..algorithm import resolve_algorithm
-from ..errors import FatalError, ResourceUnavailable, RetryableError, error_class_of
+from ..errors import FatalError, PyAttackerError, ResourceUnavailable, RetryableError, error_class_of
 from ..resource import Pool, Resource
 from ..task import TaskContext
 from .clock import VirtualClock
@@ -35,11 +35,29 @@ from .metrics import percentile
 from .provider import ProviderError, SimulatedProvider
 from .scenario import Scenario
 
-__all__ = ["BenchmarkTimeout", "Harness", "RunResult"]
+__all__ = ["BenchmarkError", "BenchmarkStalled", "BenchmarkTimeout", "Harness", "RunResult"]
 
 
-class BenchmarkTimeout(RuntimeError):
+class BenchmarkError(PyAttackerError):
+    """Base for the benchmark's refusals to produce a number.
+
+    A `PyAttackerError`, so the CLI reports these as a message and exit code 2 rather than as a
+    traceback — they are outcomes of the run, not crashes in it.
+    """
+
+
+class BenchmarkTimeout(BenchmarkError):
     """The wall-clock budget ran out. Never a benchmark *result*: a run that cannot finish says so."""
+
+
+class BenchmarkStalled(BenchmarkError):
+    """Every resource is DEAD or REVOKED, so no amount of waiting can finish the run.
+
+    A property of the scenario rather than of the algorithm or the machine: the framework retires an
+    endpoint for good after `dead_after` consecutive failures, and with nothing left to lease neither
+    the workers nor the clock can move (no lease to hand out, no timer to advance to). Reported in
+    about a second instead of after the whole wall-clock budget.
+    """
 
 
 @dataclass
@@ -74,6 +92,7 @@ class Harness:
         *,
         seed: int | None = None,
         wall_budget: float = 600.0,
+        supervise_interval_s: float = 0.05,
         clock: VirtualClock | None = None,
         provider: SimulatedProvider | None = None,
         kind: str = "provider",
@@ -86,6 +105,7 @@ class Harness:
         self.algorithm = algorithm
         self.seed = scenario.seed if seed is None else seed
         self.wall_budget = wall_budget
+        self.supervise_interval_s = supervise_interval_s
         self.clock = clock or VirtualClock()
         self.provider = provider or SimulatedProvider(scenario, self.clock, seed=self.seed)
         self.pool = Pool(
@@ -120,19 +140,53 @@ class Harness:
     def run(self) -> RunResult:
         """Run the scenario. Synchronous: the event loop is an implementation detail of the harness."""
         started = time.monotonic()
-        try:
-            asyncio.run(self._simulate())
-        except TimeoutError as exc:  # asyncio.wait_for reports the budget this way
-            raise self._timeout_error() from exc
+        asyncio.run(self._simulate())
         wall_s = time.monotonic() - started
         return self._result(wall_s)
 
     async def _simulate(self) -> None:
         # All workers are spawned before the first await, so the clock never sees a partial fleet.
         workers = [self.clock.spawn(self._worker(index)) for index in range(self.scenario.concurrency)]
-        # The budget is deliberately real time: a scenario is allowed to be slow, it is not allowed
-        # to hang. `asyncio.wait_for` also cancels the workers, whose `finally` blocks release leases.
-        await asyncio.wait_for(asyncio.gather(*workers), self.wall_budget)
+        # `work` is one future for "every worker finished", so the race below has exactly two sides: the
+        # run finishing, or the supervisor giving up (the only way the supervisor ever completes).
+        work = asyncio.ensure_future(asyncio.gather(*workers))
+        supervisor = asyncio.ensure_future(self._supervise())
+        try:
+            # The budget is real time: a scenario is allowed to be slow, it is not allowed to hang.
+            await asyncio.wait({work, supervisor}, timeout=self.wall_budget, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (work, supervisor):
+                if not task.done():
+                    task.cancel()
+            # Let the cancellations land, so every lease is released before the metrics are read.
+            await asyncio.gather(work, supervisor, return_exceptions=True)
+
+        if supervisor.done() and not supervisor.cancelled() and supervisor.exception() is not None:
+            raise supervisor.exception()
+        if work.done() and not work.cancelled():
+            failure = work.exception()
+            if failure is None:
+                return  # every worker finished: the normal path
+            # `gather` reports a cancelled child by *setting* a CancelledError rather than cancelling
+            # itself, so the cleanup above looks like a failure here. It is not one: anything else is a
+            # framework bug, and it must never be folded into a metric.
+            if not isinstance(failure, asyncio.CancelledError):
+                raise failure
+        raise self._timeout_error()
+
+    async def _supervise(self) -> None:
+        """Real-time safety net: report a world with nothing left to lease instead of waiting it out."""
+        while True:
+            await asyncio.sleep(self.supervise_interval_s)
+            rows = self.pool.snapshot()
+            if rows and all(row["state"] in ("dead", "revoked") for row in rows):
+                raise BenchmarkStalled(
+                    f"every resource in {self.scenario.name} is dead or revoked after "
+                    f"{self.clock.now():.1f}s of simulated time ({self._jobs_done} jobs done): the "
+                    "scenario's endpoints can be retired for good, and with nothing left to lease neither "
+                    "the workers nor the clock can move. Raise dead_after, add an endpoint, or lower the "
+                    "failure rates."
+                )
 
     def _timeout_error(self) -> BenchmarkTimeout:
         simulated = self.clock.now()

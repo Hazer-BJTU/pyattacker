@@ -60,7 +60,14 @@ METRICS: dict[str, Metric] = dict(
             gated=True,
         ),
         _m("requests", "requests", "neutral", "Requests sent, including refusals and retries."),
-        _m("attempts_per_job", "attempts", "lower", "Step attempts per completed job (1.0 = no retries)."),
+        _m(
+            "attempts_per_job",
+            "attempts",
+            "lower",
+            "Step attempts per completed job (1.0 = no retries). Per *completed* job: an algorithm that "
+            "gives up on most of them is measured on the few it finished.",
+            gated=True,
+        ),
         _m("retry_rate", "ratio", "lower", "Failed step attempts as a fraction of all step attempts."),
         _m("refusal_rate", "ratio", "lower", "Requests refused by the provider (429) per request sent."),
         _m("error_rate", "ratio", "lower", "Requests that failed with an error per request sent."),
@@ -86,8 +93,21 @@ METRICS: dict[str, Metric] = dict(
             "99th percentile job time among successful jobs.",
             gated=True,
         ),
-        _m("acquire_wait_p50_ms", "ms", "lower", "Median time a step spent waiting for a lease."),
-        _m("acquire_wait_p99_ms", "ms", "lower", "99th percentile lease wait: what a saturated pool costs."),
+        _m(
+            "acquire_wait_p50_ms",
+            "ms",
+            "lower",
+            "Median time a step spent waiting for a lease. Measured over acquisitions that succeeded, "
+            "so an algorithm that abandons the queue instead of waiting is measured on the ones it did queue for.",
+            gated=True,
+        ),
+        _m(
+            "acquire_wait_p99_ms",
+            "ms",
+            "lower",
+            "99th percentile lease wait: what a saturated pool costs a caller that waits.",
+            gated=True,
+        ),
         _m("request_latency_p50_ms", "ms", "neutral", "Median served request latency (a property of the world)."),
         _m("utilization", "ratio", "higher", "Served work-seconds over offered capacity-seconds."),
         _m(

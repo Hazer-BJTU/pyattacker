@@ -701,13 +701,25 @@ class Pool:
             return
         if not self._waiters:
             return  # nobody is waiting, so there is nobody to wake; the next waiter arms this again
-        deadline = min(
-            (slot.blocked_until for slot in self._slots.values() if slot.blocked_until > 0.0),
-            default=0.0,
-        )
-        if deadline <= 0.0:
+        now = self.clock.now()
+        # Only a DEGRADED slot has a cooldown that time alone can end (DEAD and REVOKED are permanent),
+        # and only a deadline still in the future is worth a timer: `state_at` clears the *state* when a
+        # cooldown expires but leaves `blocked_until` behind, so a stale timestamp here would arm a
+        # zero-delay timer over and over — a livelock that advances no simulated time at all.
+        pending = [
+            slot.blocked_until
+            for slot in self._slots.values()
+            if slot.state is ResourceState.DEGRADED and slot.blocked_until > now
+        ]
+        if not pending:
+            if any(
+                slot.state is ResourceState.DEGRADED and slot.blocked_until > 0.0 for slot in self._slots.values()
+            ):
+                # It expired while nobody was looking: the slot is usable again, so one nudge is all the
+                # waiters need (their next check runs `state_at` and finds READY).
+                self._notify()
             return
-        delay = max(0.0, deadline - self.clock.now())
+        delay = min(pending) - now
 
         async def _wake_after_cooldown() -> None:
             try:

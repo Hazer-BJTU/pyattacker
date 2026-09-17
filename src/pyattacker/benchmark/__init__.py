@@ -21,7 +21,7 @@ the table without over-reading it.
 from __future__ import annotations
 
 from .clock import ScaledClock, VirtualClock
-from .harness import BenchmarkTimeout, Harness, RunResult
+from .harness import BenchmarkError, BenchmarkStalled, BenchmarkTimeout, Harness, RunResult
 from .metrics import METRICS, Metric, aggregate, percentile
 from .provider import EndpointStats, ProviderError, ProviderStats, SimulatedProvider
 from .report import BenchmarkReport, default_algorithms, run_benchmark
@@ -39,7 +39,9 @@ from .scenario import (
 __all__ = [
     "METRICS",
     "SCENARIOS",
+    "BenchmarkError",
     "BenchmarkReport",
+    "BenchmarkStalled",
     "BenchmarkTimeout",
     "EndpointProfile",
     "EndpointStats",
