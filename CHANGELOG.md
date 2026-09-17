@@ -51,6 +51,17 @@ All notable changes to this project are documented here. The format follows
   README/CLI-reference YAML examples quote the retry key (`"on"`), which YAML 1.1 otherwise parses
   as the boolean `true`. The examples in both documents are now executed by the test suite.
 
+* **`shell_run` left its child running when the task was cancelled**, and killed without reaping on
+  timeout: cancelling `asyncio.create_task(shell_run(cmd, timeout_s=None)(None, None))` raised
+  `CancelledError` while `os.kill(pid, 0)` on the child still succeeded. Every exit path — normal exit,
+  `timeout_s`, coroutine cancellation, any other exception — now runs one cleanup: a child still running
+  is `SIGKILL`ed and **reaped** before the original exception propagates, so cancellation still arrives as
+  `CancelledError` and a timeout still as `TimeoutError`, and a child that already exited is left alone.
+  Observable change: a timeout now also waits for the reap before raising. On POSIX each child is started
+  in its own session and cleanup signals the whole process group, so a shell pipeline or an argv program's
+  descendants die with it; Windows has no process-group signalling in the standard library, so there only
+  the direct child is terminated — stated as a platform limit in
+  [the `shell_run` reference](docs/reference.md#shell_run).
 * Resume now rejects an existing pipeline key whose task or seed digest differs, preserving its
   historical result/checkpoint and raising `PipelineIdentityConflict` (CLI exit 2). In-flight
   pipelines cancelled during the stop are immediately finalized as interrupted.

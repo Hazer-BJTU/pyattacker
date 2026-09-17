@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import random
+import signal
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -259,6 +261,105 @@ def _agreed(specs: Sequence[TaskSpec], attr: str) -> dict[str, Any]:
     return {attr: first}
 
 
+# ------------------------------------------------------- subprocess lifecycle
+# `shell_run` owns the process it starts, so every exit path -- normal exit, timeout, coroutine
+# cancellation, any other exception -- runs the same cleanup: if the child is still running it is
+# SIGKILLed and then *reaped* before the original exception propagates. The waits are bounded so a
+# pathological child cannot hold a cancellation hostage; SIGKILL is not catchable, so the bound only
+# matters if the OS never reports the exit at all.
+#
+# Every step below is best effort and swallows its own failures (`Exception`, plus `CancelledError`,
+# which is not an `Exception`): the exception the caller is about to see must be the one it gets, so
+# neither a pipe a cancelled `communicate()` left in a bad state nor a failed kill/reap may replace a
+# `CancelledError` with a `ConnectionResetError`. Only a `BaseException` that is *not* cancellation --
+# `KeyboardInterrupt`, `SystemExit` -- is allowed through.
+_POSIX = os.name == "posix"
+_CLEANUP_TIMEOUT_S = 5.0
+# POSIX: start each child in its own session, so that it leads its own process group and one
+# `killpg` reaches a whole tree -- a shell pipeline, or whatever an argv program spawned. Windows has
+# no equivalent in the standard library (`start_new_session` is ignored there and `os.killpg` does
+# not exist), so only the direct child is terminated; see docs/reference.md for the stated guarantee.
+_SPAWN_KWARGS: dict[str, Any] = {"start_new_session": True} if _POSIX else {}
+
+
+def _signal_process(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL a still-running child -- and, on POSIX, everything in its process group.
+
+    Nothing raised here escapes. The process may have exited between the caller's ``returncode``
+    check and this signal (``ProcessLookupError``): that race is exactly what the cleanup has to
+    tolerate, and a failure to signal is not something to escalate -- a *new* exception raised from
+    cleanup would replace the one the caller is about to see.
+    """
+    try:
+        if _POSIX:
+            # The child is a session leader (``start_new_session``), so its group id is its pid.
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:  # pragma: no cover - Windows: no process-group signalling in the standard library
+            proc.kill()
+    except Exception:
+        return  # already gone, or not signalable: the reap wait below still runs
+
+
+async def _drain_pipes(proc: asyncio.subprocess.Process, deadline: float) -> None:
+    """Read to EOF so the pipe transports disconnect and ``Process.wait()`` can complete.
+
+    ``wait()`` is resolved by the transport only once every pipe has seen EOF, and a cancelled
+    ``communicate()`` can leave a reader paused above its flow-control limit with data still
+    buffered. The child (POSIX: its whole group) has just been killed, so EOF is close; the deadline
+    covers the remaining case of a write end held open by a process that escaped the group.
+    """
+    streams = [stream for stream in (proc.stdout, proc.stderr) if stream is not None]
+    remaining = deadline - asyncio.get_running_loop().time()
+    if not streams or remaining <= 0:
+        return
+    try:
+        await asyncio.wait_for(asyncio.gather(*(stream.read() for stream in streams)), remaining)
+    except (TimeoutError, asyncio.CancelledError):
+        return  # best effort: the reap below is what the lifecycle guarantee rests on
+    except Exception:
+        return  # a reader left in a bad state by the cancelled communicate() must not mask the caller's error
+
+
+async def _wait_reaped(proc: asyncio.subprocess.Process, deadline: float) -> None:
+    """Wait until the OS has reaped the child, absorbing a cancellation aimed at the cleanup itself.
+
+    ``proc.returncode`` is set by the child watcher once ``waitpid`` has returned, so observing it
+    (here, through ``Process.wait()``) is what makes "gone, not merely signalled" true. Cancellation
+    must not skip that wait: a cancelled ``wait()`` is safe to retry (the transport ignores cancelled
+    waiters and the watcher reaps the zombie either way), so a cancellation arriving during cleanup
+    is swallowed here -- the caller's own exception still propagates once cleanup returns.
+    """
+    loop = asyncio.get_running_loop()
+    while proc.returncode is None:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return  # bounded: stop observing rather than hang the caller
+        try:
+            await asyncio.wait_for(proc.wait(), remaining)
+        except TimeoutError:
+            return
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            return  # a failed wait is reported to nobody rather than replacing the caller's exception
+
+
+async def _cleanup_process(proc: asyncio.subprocess.Process) -> None:
+    """Terminate a still-running child and reap it; a no-op once it has exited.
+
+    Called from the ``finally`` of every ``shell_run`` attempt, so a normal exit (already exited and
+    reaped) and a natural exit racing the cleanup both fall through the first check, while a timeout,
+    a cancellation and any other exception get the same kill-then-reap treatment. Nothing here can
+    raise, which is what keeps the caller's exception type intact on the way out.
+    """
+    if proc.returncode is not None:
+        return
+    _signal_process(proc)
+    deadline = asyncio.get_running_loop().time() + _CLEANUP_TIMEOUT_S
+    await _drain_pipes(proc, deadline)
+    await _wait_reaped(proc, deadline)
+
+
 def shell_run(
     command: str | list[str],
     *,
@@ -292,6 +393,15 @@ def shell_run(
     ``["sh", "-c", "echo {value}"]``), that interpreter will parse the substituted argument as its
     own syntax, and the usual injection risk applies again — that interpreter's input-safety rules
     are then the caller's responsibility, not something this function can enforce.
+
+    **Process lifetime.** The task owns the process it starts. On every exit path — a normal exit,
+    ``timeout_s`` expiring, the coroutine being cancelled, any other exception — a child that is
+    still running is SIGKILLed and then *reaped* before the exception propagates: cancellation
+    still arrives at the caller as ``CancelledError`` and a timeout as ``TimeoutError``, but nothing
+    keeps running behind them. A child that already exited is left alone. On POSIX the child runs in
+    its own session, so cleanup signals the whole process group (a shell pipeline, or whatever an
+    argv program spawned); on Windows only the direct child is terminated, because the standard
+    library has no process-group signalling there.
     """
     if not isinstance(command, str):
         command = list(command)  # snapshot argv so caller mutation cannot change declared behavior
@@ -311,19 +421,27 @@ def shell_run(
         if isinstance(command, str):
             cmd: str | list[str] = command
             proc = await asyncio.create_subprocess_shell(
-                cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **_SPAWN_KWARGS,
             )
         else:
             encoded = json.dumps(value, default=str)
             cmd = [part.replace("{value}", encoded) for part in command]
             proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **_SPAWN_KWARGS,
             )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout_s)
-        except TimeoutError:
-            proc.kill()
-            raise
+        finally:
+            # One cleanup for every exit path. A normal exit finds the child already reaped and
+            # does nothing; a timeout, a cancellation or any other exception kills the child
+            # (POSIX: its process group) and waits for the reap before that exception propagates.
+            await _cleanup_process(proc)
         result = {
             "cmd": cmd,
             "returncode": proc.returncode,

@@ -567,6 +567,13 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
     to fail over to with one pool, and `least_busy` is the pool's default selection under another name —
     which the scenario declares (and marks N/A) rather than hides behind a plausible-looking number. See
     `docs/benchmark.md`.
+15. **Subprocess trees are only guaranteed on POSIX.** `shell_run` terminates and reaps the process it
+    started on every exit path — normal exit, `timeout_s`, cancellation, any other exception — and on POSIX
+    it signals the child's whole process group, so a shell pipeline or an argv program's descendants go with
+    it. Windows has no process-group signalling in the standard library (`os.killpg` does not exist and
+    `asyncio` cannot send `CTRL_BREAK_EVENT` to a child's group), so only the direct child is terminated
+    there and a descendant may outlive the task. The offline tests verify the descendant guarantee on POSIX
+    and skip those two cases elsewhere with that reason stated.
 
 ---
 
@@ -640,6 +647,15 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
   are the caller's responsibility — the guarantee here is "no *implicit* shell", not "safe with any program".)
   The other built-in mock tasks are exercised incidentally wherever other test files need a stand-in task,
   rather than in a dedicated file.
+* `tests/test_subprocess_lifecycle.py` — `shell_run`'s process lifetime as the OS sees it. Cancellation,
+  a `timeout_s` expiry, a `Runner` stop and a cancellation aimed at the cleanup itself all leave the child
+  killed *and reaped* (`os.kill(pid, 0)` must fail, which catches both "still running" and "killed but not
+  waited for"), while a child that exited on its own is left alone and keeps its result. The descendant tests
+  cancel a string command whose shell is waiting on a real pipeline, and an argv program that spawned a
+  child of its own, then assert every PID is gone — they fail if cleanup only kills the direct child.
+  Children signal readiness by writing their own PID (no fixed sleep anywhere), and the `tracked_pids`
+  fixture SIGKILLs every PID a test saw even when the test fails, so a red test cannot leave a live process
+  behind. The two descendant tests are skipped off POSIX with the platform reason (see §8.15).
 * `tests/test_tutorial.py` — every code block in `docs/tutorial.md` marked as a complete program
   (`# tutorial/<name>.py`) is extracted and actually run, so the tutorial cannot silently rot out of sync
   with the real API.
