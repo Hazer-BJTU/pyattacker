@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] — 2026-09-17
+
+Documentation and release tooling. **No library changes** — the code in this release is identical to 0.1.0,
+which is part of why it is a good first exercise of the publishing pipeline.
+
+### Added
+
+* **Tag-driven publishing.** `.github/workflows/release.yml` re-runs the full suite on 3.11 and 3.12, lints,
+  smoke-tests the CLI and the examples, then builds — and refuses to upload unless the tag matches
+  `__version__`, `twine check --strict` passes, the sdist rebuilds and passes its own tests, and the wheel
+  installs and runs `pyattacker demo`. The upload uses OIDC trusted publishing, so no API token lives in the
+  repository, and it waits on the `pypi` environment's required reviewer. The GitHub release takes its notes
+  from this file.
+* **[docs/releasing.md](docs/releasing.md)** — the maintainer's checklist: trusted-publisher setup, the two
+  version fields that must agree, the TestPyPI rehearsal, why each pre-upload check exists, and how to
+  recover from an upload that failed.
+* **PyPI and Python-version badges** in the README. The Python one reads the package metadata, so it cannot
+  drift from the classifiers.
+
+### Fixed
+
+* The `v0.1.0` tag and GitHub release now exist. 0.1.0 reached PyPI before the publishing workflow did, so it
+  had left no tag, no release page, and a changelog link that led nowhere.
+
 ## [0.1.0] — 2026-09-17
 
 First release. An artifact-centric async orchestration kernel: it runs many independent pipelines to
@@ -88,4 +112,5 @@ hard limit; asyncio tasks only (wrap blocking code with `asyncio.to_thread`); on
 balance is statistical; a merged report is a union, not a sum; a pipeline is a linear chain; the HTTP endpoint
 is unauthenticated.
 
+[0.1.1]: https://github.com/Hazer-BJTU/pyattacker/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Hazer-BJTU/pyattacker/releases/tag/v0.1.0

@@ -1,7 +1,8 @@
 # pyattacker
 
+[![PyPI](https://img.shields.io/pypi/v/pyattacker)](https://pypi.org/project/pyattacker/)
 [![CI](https://github.com/Hazer-BJTU/pyattacker/actions/workflows/ci.yml/badge.svg)](https://github.com/Hazer-BJTU/pyattacker/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](https://www.python.org/)
+[![Python](https://img.shields.io/pypi/pyversions/pyattacker)](https://pypi.org/project/pyattacker/)
 [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/Hazer-BJTU/pyattacker/blob/main/LICENSE)
 
 > Run tens of thousands of independent tasks to completion — resumably, observably, and without
@@ -296,7 +297,8 @@ every known tradeoff with its reason.
 
 ## Status
 
-**0.1.0 — the first release.** Everything planned for it is implemented (M0–M4: the kernel, persistence and
+**0.1.1 — documentation and release tooling.** The library is unchanged from **0.1.0**, the first release,
+which implemented everything planned for it (M0–M4: the kernel, persistence and
 task-level recovery, retries and error classification, the resource pool with 7 acquisition algorithms,
 delayed continuations and write-behind batching, sharding and merged reports, five export shapes in three
 formats, entry-point plugins, external artifact backends, the fan-out helper, and the HTTP monitoring
