@@ -29,7 +29,7 @@ pyattacker run -c config.yaml [options]
 
 | Flag | Effect |
 |---|---|
-| `-c, --config PATH` | the config file: yaml, toml or json |
+| `-c, --config PATH` | the config file: yaml, toml or json. The suffix picks the parser; yaml needs the optional extra |
 | `--limit N` | run only the first N pipelines (a smoke test over a real dataset) |
 | `--store PATH` | override `run.store`. Used verbatim with `--shard`; otherwise a shard suffix is appended |
 | `--concurrency N` | override `run.concurrency` — attempts in flight, not pipelines alive |
@@ -157,6 +157,11 @@ raised, so it can never take a run down — but it also never fails silently.
 ---
 
 ## Config file reference
+
+The example below is YAML, but every command that takes `-c` accepts the same document as `.json` or
+`.toml`; the loader picks the parser from the suffix. Only the YAML parser is an optional dependency
+(`pip install "pyattacker[yaml]"`) — and a missing one is reported as a config error naming the extra,
+exit code 2, before anything runs.
 
 ```yaml
 run:

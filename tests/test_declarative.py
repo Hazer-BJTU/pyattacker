@@ -73,6 +73,7 @@ source:
 # ------------------------------------------------------------------ basic construction
 
 
+@pytest.mark.requires_yaml
 def test_load_spec_builds_pools_pipeline_run_and_source(tmp_path):
     cfg = _write(tmp_path, "full.yaml", FULL_CONFIG)
     spec = load_spec(cfg)
@@ -113,6 +114,7 @@ def test_load_spec_builds_pools_pipeline_run_and_source(tmp_path):
     assert [s.seed for s in spec.pipelines()] == [{"i": 0}, {"i": 1}, {"i": 2}, {"i": 3}]
 
 
+@pytest.mark.requires_yaml
 def test_describe_output_structure(tmp_path):
     cfg = _write(tmp_path, "full.yaml", FULL_CONFIG)
     spec = load_spec(cfg)
@@ -139,6 +141,7 @@ def test_describe_output_structure(tmp_path):
 # ------------------------------------------------------------- environment expansion
 
 
+@pytest.mark.requires_yaml
 def test_env_expansion_with_and_without_defaults(tmp_path, monkeypatch):
     monkeypatch.setenv("DECL_API_ID", "api-9")
     monkeypatch.setenv("DECL_API_KEY", "sk-secret")
@@ -194,6 +197,7 @@ def test_expand_env_strict_raises_config_error(monkeypatch):
         expand_env({"v": "${DECL_MISSING}"}, strict=True)
 
 
+@pytest.mark.requires_yaml
 def test_load_spec_strict_env_raises_and_resolve_target_errors(tmp_path, monkeypatch):
     monkeypatch.delenv("DECL_DEFINITELY_UNSET", raising=False)
     cfg = _write(
@@ -225,6 +229,7 @@ def test_load_spec_strict_env_raises_and_resolve_target_errors(tmp_path, monkeyp
 # ------------------------------------------------------------------ use resolution
 
 
+@pytest.mark.requires_yaml
 def test_use_builtin_shorthand_and_qualified_module_target(tmp_path, monkeypatch):
     module = tmp_path / "decl_custom_tasks.py"
     module.write_text(
@@ -269,6 +274,7 @@ def test_use_builtin_shorthand_and_qualified_module_target(tmp_path, monkeypatch
     assert spec.template.task_names() == ["mock.flaky", "custom.upper"]
 
 
+@pytest.mark.requires_yaml
 def test_task_entry_name_override_is_honored(tmp_path):
     """A task entry's ``name:`` should override the name carried by the use target."""
     cfg = _write(
@@ -286,6 +292,7 @@ def test_task_entry_name_override_is_honored(tmp_path):
     assert names == ["fetch"]  # the name in the config overrides the name carried by the use target
 
 
+@pytest.mark.requires_yaml
 def test_use_factory_args_dict_is_passed_as_keywords(tmp_path):
     """``args: {fail_times: 1}`` should be equivalent to ``flaky(fail_times=1)``."""
     cfg = _write(
@@ -305,6 +312,7 @@ def test_use_factory_args_dict_is_passed_as_keywords(tmp_path):
     assert task.retry.max_attempts == 2  # default retry budget of flaky(fail_times=1) = 1 + 1
 
 
+@pytest.mark.requires_yaml
 def test_use_unknown_target_raises_config_error(tmp_path):
     cfg = _write(
         tmp_path,
@@ -323,6 +331,7 @@ def test_use_unknown_target_raises_config_error(tmp_path):
 # ---------------------------------------------------------------- retry.on
 
 
+@pytest.mark.requires_yaml
 def test_retry_on_resolves_exception_names(tmp_path):
     cfg = _write(
         tmp_path,
@@ -353,6 +362,7 @@ def test_retry_on_resolves_exception_names(tmp_path):
     assert second.retry.max_attempts == 2
 
 
+@pytest.mark.requires_yaml
 def test_retry_bare_on_is_yaml_boolean_and_raises_with_hint(tmp_path):
     """YAML 1.1 parses a bare ``on`` as boolean true — it must raise with an actionable hint."""
     cfg = _write(
@@ -375,6 +385,7 @@ def test_retry_bare_on_is_yaml_boolean_and_raises_with_hint(tmp_path):
     assert '"on"' in message
 
 
+@pytest.mark.requires_yaml
 def test_retry_on_unknown_exception_name_raises(tmp_path):
     cfg = _write(
         tmp_path,
@@ -396,18 +407,21 @@ def test_retry_on_unknown_exception_name_raises(tmp_path):
 # ------------------------------------------------------------- config error paths
 
 
+@pytest.mark.requires_yaml
 def test_missing_pipeline_section_raises_config_error(tmp_path):
     cfg = _write(tmp_path, "no_pipeline.yaml", "pools: {}\nrun: {label: x}\n")
     with pytest.raises(ConfigError, match="pipeline"):
         load_spec(cfg)
 
 
+@pytest.mark.requires_yaml
 def test_empty_pipeline_tasks_raises_config_error(tmp_path):
     cfg = _write(tmp_path, "empty.yaml", "pipeline:\n  name: qa\n  tasks: []\n")
     with pytest.raises(ConfigError, match="tasks"):
         load_spec(cfg)
 
 
+@pytest.mark.requires_yaml
 def test_task_without_use_field_raises_config_error(tmp_path):
     cfg = _write(
         tmp_path,
@@ -431,6 +445,7 @@ def test_missing_config_file_raises_config_error(tmp_path):
 # --------------------------------------------------- pipelines(limit) and deduplication
 
 
+@pytest.mark.requires_yaml
 def test_pipelines_limit_counts_yielded_specs(tmp_path):
     cfg = _write(
         tmp_path,
@@ -458,6 +473,7 @@ def test_pipelines_limit_counts_yielded_specs(tmp_path):
     assert all(s.name == "qa" and s.n_tasks == 1 for s in all_specs)
 
 
+@pytest.mark.requires_yaml
 def test_pipelines_repeats_and_key_field_dedupe_semantics(tmp_path):
     seeds = tmp_path / "seeds.jsonl"
     seeds.write_text('{"i": 1}\n{"i": 1}\n{"i": 2}\n', encoding="utf-8")

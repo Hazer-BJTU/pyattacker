@@ -15,9 +15,14 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-dependencies = [
-    "pyyaml>=6.0",
-]
+# The kernel is the standard library only, and the declarative layer reads JSON and TOML with the
+# standard library too, so the base install pulls in nothing at all. PyYAML is the one optional extra
+# (below): only a .yaml/.yml config needs it, and the loader raises a message naming this extra when
+# it is missing.
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["pyyaml>=6.0"]
 
 [project.urls]
 Homepage = "https://github.com/Hazer-BJTU/pyattacker"
@@ -34,6 +39,10 @@ pyattacker = "pyattacker.cli:main"
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
+    # The optional extra, installed for development so that `uv run pytest` exercises the YAML path
+    # as well. The CI job that installs the base package only deselects the tests marked
+    # `requires_yaml` (below) instead of relying on them to skip.
+    "pyyaml>=6.0",
 ]
 
 [tool.ruff]
@@ -79,4 +88,12 @@ include = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q --strict-markers"
+# Reading a .yaml config is the one thing that needs the optional extra. Those tests are marked rather
+# than guarded with importorskip() so that the development suite *fails* when PyYAML goes missing
+# instead of quietly skipping a third of itself; the bare-install CI job deselects them explicitly with
+# `pytest -m "not requires_yaml"`. Registering the marker (and --strict-markers) keeps a typo from
+# silently turning into a no-op.
+markers = [
+    "requires_yaml: drives the declarative layer through a .yaml file, so it needs the optional `yaml` extra (pyyaml)",
+]

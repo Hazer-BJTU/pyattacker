@@ -16,6 +16,8 @@ import textwrap
 from pathlib import Path
 from typing import ClassVar
 
+import pytest
+
 from pyattacker.cli import main
 
 # demo is deliberately given a failure probability: by the exit code convention demo is always 0 (it is only a demo),
@@ -146,6 +148,7 @@ def test_export_returns_zero_and_writes_parseable_jsonl(tmp_path):
 # ------------------------------------------------------------------ validate
 
 
+@pytest.mark.requires_yaml
 def test_validate_returns_zero_and_prints_describe_json(tmp_path, capsys):
     cfg = _write_config(tmp_path, "spec.yaml", VALID_CONFIG)
 
@@ -180,6 +183,7 @@ run:
 """
 
 
+@pytest.mark.requires_yaml
 def test_run_warns_about_unresolved_env_instead_of_ignoring_it(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv("CLI_TEST_DEFINITELY_UNSET", raising=False)
     cfg = _write_config(tmp_path, "spec.yaml", RUN_CONFIG_WITH_MISSING_ENV)
@@ -191,6 +195,7 @@ def test_run_warns_about_unresolved_env_instead_of_ignoring_it(tmp_path, capsys,
     assert "Warning: unresolved environment variables ['CLI_TEST_DEFINITELY_UNSET']" in capsys.readouterr().err
 
 
+@pytest.mark.requires_yaml
 def test_run_strict_env_fails_fast_on_a_missing_variable(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv("CLI_TEST_DEFINITELY_UNSET", raising=False)
     cfg = _write_config(tmp_path, "spec.yaml", RUN_CONFIG_WITH_MISSING_ENV)
@@ -203,6 +208,7 @@ def test_run_strict_env_fails_fast_on_a_missing_variable(tmp_path, capsys, monke
     assert not db.exists()  # failed during load_spec, before the run ever started
 
 
+@pytest.mark.requires_yaml
 def test_run_resume_shares_the_same_env_warning_path(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv("CLI_TEST_DEFINITELY_UNSET", raising=False)
     cfg = _write_config(tmp_path, "spec.yaml", RUN_CONFIG_WITH_MISSING_ENV)
@@ -219,6 +225,7 @@ def test_run_resume_shares_the_same_env_warning_path(tmp_path, capsys, monkeypat
 # ------------------------------------------------------------- config errors → 2
 
 
+@pytest.mark.requires_yaml
 def test_config_errors_return_exit_code_two(tmp_path, capsys):
     missing = tmp_path / "missing.yaml"
     assert main(["validate", "-c", str(missing)]) == 2
@@ -383,6 +390,7 @@ def test_serve_missing_store_returns_config_error(tmp_path, capsys):
 # --------------------------------------------------------------------- --progress
 
 
+@pytest.mark.requires_yaml
 def test_run_with_progress_flag_completes_without_error(tmp_path, capsys):
     """``--progress`` opens a second read-only connection to the same store from a background
     thread while the run is in flight; it must not raise and must not stop the run from finishing.

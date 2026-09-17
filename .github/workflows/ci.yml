@@ -54,3 +54,62 @@ jobs:
 
       - name: Build sdist and wheel
         run: uv build
+
+  no-extra:
+    name: base install, no yaml extra
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+          # Both 3.11 jobs read the same lockfile, so without a suffix they compute the same cache
+          # key and setup-uv warns that one of them could not upload the cache it just built. The
+          # suffix is also honest: this job installs a different set of packages (pytest and the
+          # build backend, rather than the dev group).
+          cache-suffix: no-extra
+          python-version: "3.11"
+
+      - name: Install the library and nothing else
+        # Deliberately not `uv sync`: the dev group carries the yaml extra, and doing without it is
+        # the entire point of this job. Installing into /tmp keeps the venv out of the checkout.
+        run: |
+          uv venv /tmp/no-extra --python 3.11
+          uv pip install --python /tmp/no-extra/bin/python . pytest
+
+      - name: PyYAML really is absent, and importing pyattacker does not want it
+        run: |
+          /tmp/no-extra/bin/python -c "
+          import importlib.util, sys
+          assert importlib.util.find_spec('yaml') is None, 'pyyaml leaked into the base install'
+          import pyattacker
+          assert 'yaml' not in sys.modules, 'importing pyattacker pulled in pyyaml'
+          print('pyattacker imports cleanly with no pyyaml installed')
+          "
+
+      - name: The suite passes without it
+        # The `requires_yaml` tests are deselected rather than skipped, so an accidental loss of the
+        # extra in the *development* environment fails the ordinary suite instead of quietly skipping
+        # a third of it. The optional-dependency tests above are not marked, and run here for real.
+        run: /tmp/no-extra/bin/python -m pytest -q -m "not requires_yaml"
+
+      - name: A YAML config asks for the extra, a JSON one does not
+        run: |
+          /tmp/no-extra/bin/pyattacker --version
+          mkdir -p /tmp/no-extra-check
+          /tmp/no-extra/bin/pyattacker demo --pipelines 10 --store /tmp/no-extra-check/demo.db
+          printf 'pipeline:\n  name: x\n  tasks:\n    - {use: echo}\n' > /tmp/no-extra-check/x.yaml
+          printf '{"pipeline": {"name": "x", "tasks": [{"use": "echo"}]}}' > /tmp/no-extra-check/x.json
+          if /tmp/no-extra/bin/pyattacker validate -c /tmp/no-extra-check/x.yaml 2>/tmp/no-extra-check/err.txt; then
+            echo "::error::a YAML config was accepted without the extra installed"
+            exit 1
+          fi
+          grep -q 'pyattacker\[yaml\]' /tmp/no-extra-check/err.txt || {
+            echo "::error::the YAML error does not name the extra to install"
+            cat /tmp/no-extra-check/err.txt
+            exit 1
+          }
+          /tmp/no-extra/bin/pyattacker validate -c /tmp/no-extra-check/x.json > /dev/null
+          echo "yaml asked for the extra; json validated"

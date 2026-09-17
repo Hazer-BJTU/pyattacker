@@ -344,7 +344,8 @@ rather than asserted — lives in `examples/llm_eval/`.
 ### 6.2 Declarative (simple tasks)
 
 The declarative form only describes **composition and resources**; the logic still lives in Python
-(`use: myproj.tasks:ask_model`):
+(`use: myproj.tasks:ask_model`). The document may be YAML, TOML or JSON; the suffix picks the parser, and
+only the YAML one is an optional dependency (§8.13).
 
 ```yaml
 run:   { store: runs/demo.db, concurrency: 8, journal: full, label: demo }
@@ -539,6 +540,12 @@ depends on them.
 12. **The HTTP endpoint is unauthenticated and loopback-only by default.** It is a debug view over your
     run's payloads, not a service. Put it behind your own proxy if you need one, and think before binding
     it to a public interface.
+13. **YAML is an extra, not a dependency**: `dependencies` is empty, and the declarative layer reads JSON and
+    TOML with the standard library, so `pip install pyattacker` pulls in nothing. A `.yaml`/`.yml` config needs
+    `pip install "pyattacker[yaml]"`, and without it the loader raises a `ConfigError` naming the extra and the
+    file at the moment that file is read — the check is per file, from its suffix, never at import time. The
+    cost is one extra install step for the readers who want YAML; the benefit is that everyone else, including
+    every SDK-only user, pays nothing for a parser they never call.
 
 ---
 
@@ -578,6 +585,18 @@ depends on them.
   `journal=summary` keeping nothing anywhere, and **resume through a spilled checkpoint**.
 * `tests/test_packaging.py` — the version in `pyproject.toml` matches the running package, no accidental
   dependencies, every module imports, and every promised name is exported.
+* `tests/test_optional_yaml.py` — the optional extra as a user meets it (§8.13): the SDK runs with PyYAML
+  absent, JSON/TOML configs load, a `.yaml`/`.yml` file raises a `ConfigError` naming the file and the extra,
+  a *broken* PyYAML surfaces its own error rather than that hint, and the CLI turns the missing-extra case into
+  exit code 2. `sys.modules["yaml"] = None` simulates the absence, so all of this runs on every ordinary test
+  run rather than only in the job that has no PyYAML.
+* **The YAML-dependent tests are marked `requires_yaml`** instead of being guarded with `importorskip()`, so
+  the development suite *fails* when the extra goes missing rather than silently skipping a third of itself.
+  CI therefore runs the suite twice: with the extra (everything), and against a bare `pip install` of the
+  package with `-m "not requires_yaml"`. Which side is the guarantee is the point — the positive case is
+  tested normally, the negative case explicitly. The release workflow closes the loop on the built wheel, in
+  both directions: without the extra (PyYAML absent, JSON works, YAML asks for the extra) and with it (PyYAML
+  resolves from the published metadata and a YAML config validates).
 * `tests/test_artifact.py` / `test_store.py` / `test_declarative.py` / `test_cli.py` — codecs,
   store semantics and consistency between the two stores, config parsing, CLI end to end.
 * `tests/test_errors.py` — `error_class_of`/`is_retryable_class`/`retry_after_of` as pure functions: every

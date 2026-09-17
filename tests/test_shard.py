@@ -236,6 +236,7 @@ run:
 """
 
 
+@pytest.mark.requires_yaml
 def test_shards_with_retrying_resource_pool_pipelines_merge_cleanly(tmp_path, capsys, monkeypatch):
     """None of the three subsystems has ever been exercised together before this test:
 

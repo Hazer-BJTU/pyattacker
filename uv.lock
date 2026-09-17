@@ -42,22 +42,27 @@ wheels = [
 name = "pyattacker"
 version = "0.1.1"
 source = { editable = "." }
-dependencies = [
+
+[package.optional-dependencies]
+yaml = [
     { name = "pyyaml" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "ruff" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pyyaml", specifier = ">=6.0" }]
+requires-dist = [{ name = "pyyaml", marker = "extra == 'yaml'", specifier = ">=6.0" }]
+provides-extras = ["yaml"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "pytest", specifier = ">=8.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", specifier = ">=0.6" },
 ]
 

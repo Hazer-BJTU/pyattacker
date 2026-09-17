@@ -62,19 +62,21 @@ uploads to TestPyPI. Then check the result:
 uv venv /tmp/verify --python 3.11
 uv pip install --python /tmp/verify/bin/python \
   --index-url https://test.pypi.org/simple/ \
-  --extra-index-url https://pypi.org/simple/ \
-  --index-strategy unsafe-best-match \
   "pyattacker==X.Y.Z"
 /tmp/verify/bin/pyattacker --version   # must print X.Y.Z, not the previously released version
 /tmp/verify/bin/pyattacker demo --pipelines 20
 rm -rf /tmp/verify
 ```
 
-Every flag here is load-bearing. `--extra-index-url` is required because TestPyPI does not carry `pyyaml` —
-but `--extra-index-url` also *outranks* `--index-url` in uv, so `pyattacker` itself resolves from PyPI
-(where the last release lives, and `pyyaml` is fine) instead of from TestPyPI. That install succeeds and
-happily reports the *older* version, verifying nothing, which is why the pin and
-`--index-strategy unsafe-best-match` are both needed, and why `--version` is the actual assertion.
+Every flag here is load-bearing. `--index-url` is what makes the install come from TestPyPI rather than PyPI.
+One index is enough because the base package has **no dependencies at all** — PyYAML is the optional `yaml`
+extra (see the README) — so nothing has to be fetched from anywhere else. Two cases still need the wider form
+`--extra-index-url https://pypi.org/simple/ --index-strategy unsafe-best-match`: rehearsing an older release,
+whose metadata still required `pyyaml`, and rehearsing the extra itself (`"pyattacker[yaml]==X.Y.Z"`). TestPyPI's
+`pyyaml` is frozen at 3.11, and `--extra-index-url` *outranks* `--index-url` in uv, so as soon as a second index
+is in play `pyattacker` itself resolves from PyPI — where the last release lives — instead of from TestPyPI. That
+install succeeds and happily reports the *older* version, verifying nothing, which is why the pin, the strategy
+flag and the `--version` assertion belong together.
 
 **4. Tag and push.** This is the step that publishes:
 
