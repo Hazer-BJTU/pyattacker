@@ -23,6 +23,8 @@ dependencies = [
 Homepage = "https://github.com/Hazer-BJTU/pyattacker"
 Repository = "https://github.com/Hazer-BJTU/pyattacker"
 Issues = "https://github.com/Hazer-BJTU/pyattacker/issues"
+Changelog = "https://github.com/Hazer-BJTU/pyattacker/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md"
 Design = "https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/design.md"
 
 [project.scripts]

@@ -1,25 +1,60 @@
 # pyattacker
 
 [![CI](https://github.com/Hazer-BJTU/pyattacker/actions/workflows/ci.yml/badge.svg)](https://github.com/Hazer-BJTU/pyattacker/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-> An async task orchestration framework centered on the **artifact**, using the **pipeline** as the unit of completion, and the **resource pool** as the only shared surface.
-> Few dependencies (the core is only the standard library + PyYAML), resumable, observable, built for "tens of thousands of mutually independent tasks".
+> Run tens of thousands of independent tasks to completion — resumably, observably, and without
+> reimplementing endpoint pools, retries and "which rows already ran" for the fifth time.
 
-When you benchmark LLMs / agents, some things always get reimplemented: managing multiple endpoint configs,
-batched concurrent requests, the "which rows already ran" resume logic, retry and backoff, and recording the
-details of every request for later review. pyattacker extracts these concerns into a kernel that
-**does not touch the network** — you write the tasks, and it handles the rest.
+## The situation this is for
 
-**New here?** The step-by-step tutorial goes from a five-line program to a sharded, resumable model
-evaluation, and every snippet in it is executed by the test suite: [`docs/tutorial.md`](docs/tutorial.md).
+Picture a long workflow test, a model benchmark, or any experiment made of many independent items.
+Three hours in, one network request fails. The process dies — and you have no idea *which stage*
+each item actually reached. Rerunning from scratch means paying for every request that already
+succeeded, so you start writing a `results.jsonl` and a "skip what's already in there" check.
+
+Then the provider starts rate-limiting you. A single API key serialises your parallel requests into
+a queue, so you add a second key, a third, and now you need to decide which request goes where, what
+happens when one endpoint starts returning 429s, and whether a failure means *retry* or *give up*.
+Somewhere in there, `asyncio.Semaphore` stops being enough and you are writing a scheduler.
+
+pyattacker is that scheduler, extracted and made boring:
+
+* **a failure costs you one task, not the run** — every task's output is persisted the moment it is
+  produced, so `resume` restarts at the first task that produced nothing, and re-sends nothing that
+  already succeeded;
+* **endpoints are a pool, not a global variable** — capacity, health, and quota per endpoint, leased
+  through `async with`, with seven policies for choosing which one to use and how to wait;
+* **the record is queryable, not a log file** — every attempt, every retry decision (`{retry, reason,
+  delay_s, error_class}`), every intermediate artifact, in SQLite you can `SELECT` from while the run
+  is still going.
+
+It **does not touch the network**: you write the openai/anthropic calls, it handles everything around
+them. The core dependency list is the standard library plus PyYAML.
+
+**New here?** The [tutorial](docs/tutorial.md) goes from a five-line program to a sharded, resumable
+model evaluation. Every snippet in it is executed by the test suite.
+
+## Install
 
 ```bash
-uv sync
-uv run pyattacker demo            # run once with zero configuration to verify the installation
-uv run pytest                     # the whole suite, zero network, a few seconds
+uv add pyattacker            # or: pip install pyattacker
 ```
 
+From a clone:
+
+```bash
+git clone https://github.com/Hazer-BJTU/pyattacker && cd pyattacker
+uv sync
+uv run pyattacker demo       # zero-config smoke test: 50 simulated pipelines, retries, a report
+```
+
+Requires Python 3.11+.
+
 ## Core Model
+
+Five concepts, and that is the whole vocabulary:
 
 | Concept | Meaning | In one line |
 |---|---|---|
@@ -89,6 +124,21 @@ async with ctx.acquire(resource) as lease:   # ← the only recommended form
 * **Waiting is measured.** Pool stats report `waits_total`, `wait_ms_avg`, `p50`, `p95` and `max`, and a wait
   beyond `slow_wait_ms` emits an `acquire.slow_wait` event you can alert on.
 
+## Semantic Recovery
+
+Every successful task persists its artifact and advances the checkpoint. On resume:
+
+```python
+runner.run(template.map(rows), resume=True)   # or pyattacker resume -c config.yaml
+```
+
+* Already successful pipelines → skipped outright;
+* Failed pipelines → continue from **the first task that produced no artifact**: **if task C died, only task C
+  reruns, and task B's request is not re-sent**;
+* The seed artifact is persisted too → recovery **does not depend on the original dataset file**;
+* Changed a task's source code (`spec_digest` includes source digests) → treated as a new pipeline, so old
+  results are not incorrectly reused.
+
 ## Running It Across Processes (Sharding)
 
 SQLite takes one writer and the kernel is a single event loop, so scale means **processes with their own
@@ -113,22 +163,9 @@ uv run pyattacker export runs/qa.shard*of4.db runs/tasks.csv --rows tasks --form
 `--rows` picks the shape: `pipelines` (nested, default), `tasks`, `attempts` (including each retry `decision`),
 `events`, `artifacts`. `--format` picks `jsonl`, `json` or `csv`.
 
-## Semantic Recovery
-
-Every successful task persists its artifact and advances the checkpoint. On resume:
-
-```python
-runner.run(template.map(rows), resume=True)   # or pyattacker resume -c config.yaml
-```
-
-* Already successful pipelines → skipped outright;
-* Failed pipelines → continue from **the first task that produced no artifact**: **if task C died, only task C
-  reruns, and task B's request is not re-sent**;
-* The seed artifact is persisted too → recovery **does not depend on the original dataset file**;
-* Changed a task's source code (`spec_digest` includes source digests) → treated as a new pipeline, so old
-  results are not incorrectly reused.
-
 ## Declarative (Simple Tasks)
+
+The YAML describes **composition and resources**; the logic stays in Python (`use: my_pkg.tasks:ask`).
 
 ```yaml
 run:   { store: runs/demo.db, concurrency: 8, label: demo }
@@ -157,6 +194,7 @@ uv run pyattacker plugins                        # installed plugins
 ```
 
 Exit codes: `0` all succeeded / `1` some failed / `2` config error / `130` interrupted.
+Every flag of every subcommand: [`docs/cli.md`](docs/cli.md).
 
 ## Records and Monitoring
 
@@ -184,7 +222,7 @@ uv run pyattacker plugins                 # what is installed, and what failed t
 ```
 
 Built-ins resolve first (a plugin cannot shadow `echo`), and a plugin that raises on import is
-recorded rather than fatal. A complete worked example: `examples/plugin_package/`.
+recorded rather than fatal. A complete worked example: [`examples/plugin_package/`](examples/plugin_package/README.md).
 
 **Large payloads** can live outside the database:
 
@@ -204,14 +242,24 @@ uv run pyattacker serve runs/qa.db        # http://127.0.0.1:8787
 # /  dashboard   /stats  /events  /pipelines  /resources  /errors   (JSON)
 ```
 
-It opens a fresh read-only connection per request, so it runs happily beside a live run. It has no
-authentication and binds to loopback: treat it as a debug view.
+It opens a fresh read-only connection per request, so it runs happily beside a live run. It has **no
+authentication** and binds to loopback: it exposes your payloads, so treat it as a debug view and do not
+put it on a public interface without your own proxy in front.
 
 **Branching inside a step** — `fanout(a, b)` runs several tasks on the same input concurrently and
 returns `{task_name: value}`. Retry granularity becomes the group, which is the honest price of not
 turning pipelines into a DAG. The group is the only spec the Runner sees, so `resource`, `algorithm` and
 `timeout_s` are inherited from the children when all of them agree (a `timeout_s` then bounds the whole
 group).
+
+## Documentation
+
+| Document | What is in it |
+|---|---|
+| [`docs/tutorial.md`](docs/tutorial.md) | fourteen runnable steps, from "one task" to a sharded evaluation; each one executed by the test suite |
+| [`docs/cli.md`](docs/cli.md) | every subcommand, every flag, exit codes, config reference |
+| [`docs/design.md`](docs/design.md) | conceptual model, the six invariants, the lease contract, data model, tradeoffs |
+| [`CHANGELOG.md`](CHANGELOG.md) | what changed, release by release |
 
 ## Examples
 
@@ -232,10 +280,28 @@ uv run pyattacker run -c examples/qa_eval.yaml --limit 40
 
 ## Out of Scope
 
-Network requests (you write the openai/anthropic protocols yourself), **semantic reduction** (accuracy / pass@k
-and other cross-pipeline aggregation), DAG orchestration (a pipeline is a linear chain; branch inside a task with
-`fanout`), a serving gateway (the only HTTP surface is the read-only debug endpoint above), and distributed
-scheduling (scale out with `--shard`). See sections 1 and 11 of [`docs/design.md`](docs/design.md).
+These are design decisions, not missing features:
+
+* **Network requests** — you write the openai/anthropic protocols yourself. The kernel never opens a socket.
+* **Semantic reduction** — accuracy, pass@k, F1 and any cross-pipeline aggregation. Export the artifacts and
+  compute it outside, or write a sink pipeline out of the primitives.
+* **DAG orchestration** — a pipeline is a linear chain; branch inside a task with `fanout`.
+* **A serving gateway** — the only HTTP surface is the read-only debug endpoint above.
+* **Distributed scheduling** — scale out with `--shard`; multi-process is the ceiling.
+
+Sections 1 and 11 of [`docs/design.md`](docs/design.md) state the boundary precisely, and section 8 lists
+every known tradeoff with its reason.
+
+## Status
+
+**0.1.0 — the first release.** Everything planned for it is implemented (M0–M4: the kernel, persistence and
+task-level recovery, retries and error classification, the resource pool with 7 acquisition algorithms,
+delayed continuations and write-behind batching, sharding and merged reports, five export shapes in three
+formats, entry-point plugins, external artifact backends, the fan-out helper, and the HTTP monitoring
+endpoint). The API is young: it follows semantic versioning from here, but expect refinement before 1.0.
+
+Left for later: a distributed scheduler, Parquet export, blob garbage collection, and first-class
+`Parallel`/`Gather` nodes.
 
 ## Development
 
@@ -247,8 +313,10 @@ uv run pyattacker demo       # end-to-end smoke test
 uv build                     # sdist + wheel
 ```
 
-Tutorial: [`docs/tutorial.md`](docs/tutorial.md) — fourteen runnable steps from "one task" to "sharded
-evaluation", each one executed by the test suite.
+Tests are offline and deterministic (time goes through an injectable `Clock`). The tutorial's code blocks are
+extracted and executed by `tests/test_tutorial.py`, so documentation that rots fails CI.
 
-Design document: [`docs/design.md`](docs/design.md) (conceptual model, the six core invariants, data model,
-known tradeoffs, milestones).
+## License
+
+MIT — see [LICENSE](LICENSE).
+
