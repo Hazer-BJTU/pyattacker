@@ -60,7 +60,7 @@ from pyattacker.export import (
 )
 from pyattacker.merge import merge_reports
 from pyattacker.shard import shard_specs
-from pyattacker.store import ITER_BATCH_SIZE, PagedStore, Store
+from pyattacker.store import ITER_BATCH_SIZE, PagedStore, Store, TaskRecord
 from pyattacker.store.writebehind import WriteBehindStore
 from pyattacker.tasks import flaky
 
@@ -345,30 +345,38 @@ def test_events_export_past_one_hundred_thousand_is_complete(big_event_store):
 def test_events_export_reads_bounded_batches_not_the_whole_table(big_event_store):
     """The batching claim, measured: SQLite's own trace of the statements the export really runs.
 
-    One bounded query per batch (``LIMIT ITER_BATCH_SIZE``), and reaching the first row costs
-    exactly one of them — so the Python-side working set is a batch, not the table.
+    One high-water query plus one bounded page per batch (``ORDER BY event_id LIMIT
+    ITER_BATCH_SIZE``, restricted to the mark), and reaching the first row costs exactly one page —
+    so the Python-side working set is a batch, not the table.
     """
     statements: list[str] = []
     big_event_store._conn.set_trace_callback(statements.append)
 
-    def event_selects() -> list[str]:
-        return [sql for sql in statements if "FROM events" in sql]
+    def selects(*needles: str) -> list[str]:
+        return [sql for sql in statements if all(needle in sql for needle in needles)]
 
     try:
         rows = iter_rows(big_event_store, kind="events")
         first = next(rows)
-        after_first_row = event_selects()
+        after_first_row = selects("FROM events", "ORDER BY event_id")
         consumed = 1 + sum(1 for _ in rows)
+        pages = selects("FROM events", "ORDER BY event_id")
+        marks = selects("FROM events", "MAX(event_id)")
+        statements_seen = len(statements)
     finally:
         big_event_store._conn.set_trace_callback(None)
 
+    mark = big_event_store._conn.execute("SELECT MAX(event_id) FROM events").fetchone()[0]
     assert first["kind"] == "event.0"
     assert consumed == BIG_EVENT_COUNT
-    assert len(after_first_row) == 1
-    assert event_selects() and all(
-        f"ORDER BY event_id LIMIT {ITER_BATCH_SIZE}" in sql for sql in event_selects()
+    assert len(after_first_row) == 1  # the first row costs one bounded page
+    assert marks == ["SELECT MAX(event_id) FROM events"]  # the live-store bound, taken once
+    assert pages and all(
+        f"ORDER BY event_id LIMIT {ITER_BATCH_SIZE}" in sql and f"event_id<={mark}" in sql
+        for sql in pages
     )
-    assert len(event_selects()) == ceil(BIG_EVENT_COUNT / ITER_BATCH_SIZE)
+    assert len(pages) == ceil(BIG_EVENT_COUNT / ITER_BATCH_SIZE)
+    assert statements_seen == len(pages) + 1  # pages plus the single mark query
 
 
 def _peak_bytes(work: Any) -> int:
@@ -393,6 +401,135 @@ def test_events_export_memory_is_a_batch_not_the_table(big_event_store):
     streamed = _peak_bytes(lambda: sum(1 for _ in iter_rows(big_event_store, kind="events")))
 
     assert streamed * 8 < materialized  # one bounded batch against the whole table
+
+
+@pytest.fixture()
+def tied_store(tmp_path):
+    """One pipeline holding ``ITER_BATCH_SIZE + 1`` tasks/artifacts that all share ``(pid, seq)``.
+
+    The schema allows it — ``tasks`` is keyed by ``task_run_id`` and ``artifacts`` by
+    ``artifact_id``, and neither ``(pipeline_id, seq)`` nor ``seq`` is unique — and nothing in the
+    store API forbids writing such rows. The keyset cursor therefore must not be the non-unique
+    prefix, or a page boundary inside the tie silently drops the rest of it.
+    """
+    store = SqliteStore(str(tmp_path / "ties.db"))
+    try:
+        store.upsert_pipeline(
+            PipelineRecord(pipeline_id="p1", run_id="run-1", name="qa", key="k1", created_at=1000.0)
+        )
+        for index in range(ITER_BATCH_SIZE + 1):
+            store.record_task(
+                TaskRecord(
+                    task_run_id=f"p1:0:{index:04d}",
+                    pipeline_id="p1",
+                    run_id="run-1",
+                    name="ask",
+                    seq=0,
+                )
+            )
+            store.put_artifact(
+                Artifact(
+                    id=f"p1:0:{index:04d}",
+                    pipeline_id="p1",
+                    task_name="ask",
+                    seq=0,
+                    type_name="dict",
+                    codec="json",
+                    digest=f"d{index:04d}",
+                    size=2,
+                    payload=b"{}",
+                    created_at=1000.0,
+                )
+            )
+        yield store
+    finally:
+        store.close()
+
+
+def test_ties_on_the_non_unique_cursor_prefix_do_not_lose_rows(tied_store):
+    """The page boundary lands inside a tie: every tied row must still be exported exactly once."""
+    tasks = list(iter_rows(tied_store, kind="tasks"))
+    assert len(tasks) == ITER_BATCH_SIZE + 1  # the whole tie, not just the first page
+    assert len({row["task_run_id"] for row in tasks}) == ITER_BATCH_SIZE + 1
+    assert [row["task_run_id"] for row in tasks] == sorted(row["task_run_id"] for row in tasks)
+
+    artifacts = list(iter_rows(tied_store, kind="artifacts"))
+    assert len(artifacts) == ITER_BATCH_SIZE + 1
+    assert len({row["artifact_id"] for row in artifacts}) == ITER_BATCH_SIZE + 1
+    assert [row["artifact_id"] for row in artifacts] == sorted(
+        row["artifact_id"] for row in artifacts
+    )
+
+
+def test_events_export_is_bounded_to_the_mark_taken_when_it_starts(tmp_path):
+    """A live store: ``event_id`` is monotonic, so the export is bounded by its high-water mark.
+
+    Without the bound the iterator chases a moving tail: the page after the producer's write would
+    pick up rows that did not exist when the export began.
+    """
+    store = SqliteStore(str(tmp_path / "live.db"))
+    try:
+        for index in range(ITER_BATCH_SIZE):
+            store.emit_event(EventRecord(ts=float(index), kind=f"event.{index}", run_id="run-1"))
+
+        rows = iter_rows(store, kind="events")
+        first_page = [next(rows) for _ in range(ITER_BATCH_SIZE)]  # exactly one full page
+        store.emit_event(EventRecord(ts=1.0, kind="event.late", run_id="run-1"))
+        rest = [*rows]
+
+        exported = [*first_page, *rest]
+        assert len(exported) == ITER_BATCH_SIZE
+        assert "event.late" not in {row["kind"] for row in exported}
+
+        # the mark is per export, not permanent: a later export does see the new event
+        later = [row["kind"] for row in iter_rows(store, kind="events")]
+        assert len(later) == ITER_BATCH_SIZE + 1 and later[-1] == "event.late"
+    finally:
+        store.close()
+
+
+def test_task_export_is_a_best_effort_traversal_of_a_live_store(tmp_path):
+    """``tasks`` has no monotonic key, so it is documented as a traversal, not a snapshot.
+
+    A row appended ahead of the cursor is exported; one appended behind it is not. Both directions
+    are pinned here so the contract cannot drift silently.
+    """
+    store = SqliteStore(str(tmp_path / "live.db"))
+    try:
+        for index in range(ITER_BATCH_SIZE):
+            store.record_task(
+                TaskRecord(
+                    task_run_id=f"p1:{index:04d}",
+                    pipeline_id="p1",
+                    run_id="run-1",
+                    name="ask",
+                    seq=index,
+                )
+            )
+
+        rows = iter_rows(store, kind="tasks")
+        first_page = [next(rows) for _ in range(ITER_BATCH_SIZE)]
+        store.record_task(
+            TaskRecord(
+                task_run_id="p1:9999",
+                pipeline_id="p1",
+                run_id="run-1",
+                name="ask",
+                seq=ITER_BATCH_SIZE,
+            )
+        )
+        store.record_task(
+            TaskRecord(task_run_id="p1:-001", pipeline_id="p1", run_id="run-1", name="ask", seq=-1)
+        )
+        rest = [*rows]
+
+        assert len(first_page) == ITER_BATCH_SIZE
+        assert [row["task_run_id"] for row in rest] == ["p1:9999"]  # ahead of the cursor: exported
+        assert "p1:-001" not in {
+            row["task_run_id"] for row in [*first_page, *rest]
+        }  # behind it: not exported
+    finally:
+        store.close()
 
 
 @pytest.fixture()
@@ -438,7 +575,9 @@ def test_pipelines_and_artifacts_exports_page_the_pipeline_table(paged_store):
     """Neither kind may read the whole pipelines table up front, and the tie must not lose a row.
 
     Instrumented at the SQL layer again: ``artifacts`` used to collect every pipeline id with one
-    unbounded SELECT before reading any artifact.
+    unbounded SELECT before reading any artifact. The pipeline cursor is already total —
+    ``pipeline_id`` is the primary key — so this tie is safe by construction; the non-unique
+    ``tasks``/``artifacts`` cursors are covered by ``test_ties_on_the_non_unique_cursor_prefix_...``.
     """
     statements: list[str] = []
     paged_store._conn.set_trace_callback(statements.append)

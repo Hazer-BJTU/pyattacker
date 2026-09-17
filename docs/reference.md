@@ -1000,10 +1000,16 @@ in memory (an export of a large store) goes through the `iter_*` helpers instead
 | Helper | Yields, in this order |
 |---|---|
 | `iter_pipelines(store, *, run_id=None, state=None)` | `PipelineRecord`, `created_at` then `pipeline_id` |
-| `iter_tasks(store, pipeline_id=None, *, run_id=None)` | `TaskRecord`, `pipeline_id` then `seq` |
+| `iter_tasks(store, pipeline_id=None, *, run_id=None)` | `TaskRecord`, `pipeline_id`, `seq`, then `task_run_id` |
 | `iter_attempts(store, *, run_id=None, pipeline_id=None)` | `AttemptRecord`, `attempt_id` (write order) |
 | `iter_events(store, *, pipeline_id=None, run_id=None)` | `EventRecord`, `event_id` (write order, oldest first) |
-| `iter_artifacts(store, *, pipeline_id)` | `Artifact` of one pipeline, by `seq` |
+| `iter_artifacts(store, *, pipeline_id)` | `Artifact` of one pipeline, `seq` then `artifact_id` |
+
+Every one of those orders **ends in a unique key**, and that is not decoration: `tasks` is keyed by
+`task_run_id` and `artifacts` by `artifact_id`, so `(pipeline_id, seq)` and `seq` are not unique by
+contract. A page cursor is a strict `>`, so paging on the non-unique prefix alone would silently drop
+every row that ties with the last row of a page. `pipeline_id` (primary key), `event_id` and
+`attempt_id` (monotonic counters) are unique on their own.
 
 ```python
 from pyattacker.store import iter_events
@@ -1018,6 +1024,20 @@ above, reads at most `ITER_BATCH_SIZE` (1000) rows per query, and yields in the 
 `SqliteStore` implements all five with keyset pagination (`WHERE <key> > <last row of the batch>
 ORDER BY <key> LIMIT 1000`), so no query returns more than a batch and no read cursor stays open while
 a row is being processed. `MemoryStore` walks its live containers; for it, bounded memory is inherent.
+
+**Reading a store that is still being written.** Each page is its own statement — there is no
+long-lived read transaction and no point-in-time snapshot of the whole store. What an iterator
+guarantees depends on whether its key is monotonic:
+
+* `events` and `attempts` are **bounded by a high-water mark** (`MAX(event_id)` / `MAX(attempt_id)`
+  among the matching rows, taken when the first page is read). Rows appended after that are not part
+  of that traversal, so a long export cannot chase a moving tail; a new iterator sees them. Both
+  kinds are append-only, so the mark is a true snapshot of the key range.
+* `pipelines`, `tasks` and `artifacts` are a **best-effort traversal**: no monotonic key exists to
+  bound (`created_at` is caller-supplied, `task_run_id`/`artifact_id` are not ordered by time), so a
+  row inserted ahead of the cursor can appear in the export and one inserted behind it cannot. An
+  export of a live store is "everything that existed and was reachable while I walked", not a
+  snapshot; re-export a finished store when you need reproducibility.
 
 The compatibility rule for a store that does not implement the extension — the third-party store
 plugin layer is public API, and existing plugins were written against the list methods:
@@ -1225,10 +1245,10 @@ One row per kind, in the order `limit` truncates:
 | `kind` | One row per | Order |
 |---|---|---|
 | `pipelines` (default) | pipeline, nested — tasks and artifacts included | `created_at`, then `pipeline_id` |
-| `tasks` | task: final state, duration, error, leases used | `pipeline_id`, then `seq` |
+| `tasks` | task: final state, duration, error, leases used | `pipeline_id`, `seq`, then `task_run_id` |
 | `attempts` | attempt, including each retry `decision` | `attempt_id` (write order) |
 | `events` | structured event | `event_id` (write order, oldest first) |
-| `artifacts` | artifact, intermediate ones included | pipeline order, then `seq` |
+| `artifacts` | artifact, intermediate ones included | pipeline order, then `seq`, then `artifact_id` |
 
 `limit` means the same thing for every kind — it counts rows of that kind, including `artifacts`,
 where it used to count pipelines:
@@ -1241,7 +1261,8 @@ where it used to count pipelines:
 (`export_stores` applies the limit per store, so each store contributes at most its first N rows.)
 
 Every order ends in a key that is unique, so a read that crosses a batch boundary can neither drop nor
-duplicate a row — including when many pipelines share one `created_at`.
+duplicate a row — including when many pipelines share one `created_at`, or when several tasks or
+artifacts share a `(pipeline_id, seq)` / `seq`, which the schema does not forbid.
 
 ```python
 from pyattacker import export_store, iter_rows
@@ -1258,6 +1279,13 @@ export_store(store, "attempts.csv", kind="attempts", fmt="csv")
 `pipelines` rows are nested — tasks and artifacts included — which is why it is the default. CSV takes its
 header from the first rows and folds later keys into an `extra` column, so memory stays flat and no field is
 dropped silently.
+
+**Exporting a live store.** An export is not a transaction: it reads one page at a time, so what it
+guarantees depends on the kind (the details are in [stores](#paged-reads-and-third-party-stores)).
+`events` and `attempts` are bounded by the high-water mark of their monotonic key taken when the
+export starts — rows written afterwards are not included, and a fresh export sees them.
+`pipelines`, `tasks` and `artifacts` are a best-effort traversal: a row written ahead of the cursor
+can appear, one written behind it cannot. Export a finished store when you need a reproducible file.
 
 **Where streaming holds, and where it does not.** `jsonl` and `json` write row by row, and `csv` buffers
 only the `header_rows` prefix it needs for the header. On the store side, `tasks`/`attempts`/`events` are

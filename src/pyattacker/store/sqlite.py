@@ -453,27 +453,52 @@ class SqliteStore:
     # a row, and rather than `fetchall` so the Python-side working set is one batch, not the table.
     def _iter_keyset(
         self,
-        select: str,
+        table: str,
         where: list[str],
         args: list[Any],
         *,
         columns: tuple[str, ...],
         mapper: Any,
+        bound: str | None = None,
     ) -> Iterator[Any]:
+        """Page through one table with a keyset predicate, one bounded batch per query.
+
+        ``columns`` must end in a **unique** key. The tables are keyed by ``task_run_id`` /
+        ``artifact_id`` while the natural order is by ``(pipeline_id, seq)`` / ``seq``, and those
+        prefixes are not unique; a strict ``>`` cursor over a non-unique prefix silently skips every
+        row that ties with the last row of a page.
+
+        ``bound`` names a monotonic column (``event_id`` / ``attempt_id``). The high-water mark among
+        the matching rows is captured before the first page and every page is restricted to it, so
+        rows appended while the caller consumes the iterator are never exported. Without it, the
+        traversal is best-effort over a live table: rows appended ahead of the cursor can appear.
+        """
+        filters = list(where)
+        params = list(args)
+        if bound is not None:
+            clause = (" WHERE " + " AND ".join(filters)) if filters else ""
+            mark = self._conn.execute(
+                f"SELECT MAX({bound}) FROM {table}{clause}", params
+            ).fetchone()[0]
+            if mark is None:
+                return  # nothing matched when the iterator started
+            filters.append(f"{bound}<=?")
+            params.append(mark)
+
         predicate = _keyset_predicate(columns)
         order = ", ".join(columns)
         cursor: tuple[Any, ...] | None = None
         while True:
-            sql = select
-            params = list(args)
-            if where:
-                sql += " WHERE " + " AND ".join(where)
+            sql = f"SELECT * FROM {table}"
+            page_params = list(params)
+            if filters:
+                sql += " WHERE " + " AND ".join(filters)
             if cursor is not None:
-                sql += (" AND " if where else " WHERE ") + predicate
-                params += _keyset_params(cursor)
+                sql += (" AND " if filters else " WHERE ") + predicate
+                page_params += _keyset_params(cursor)
             sql += f" ORDER BY {order} LIMIT ?"
-            params.append(ITER_BATCH_SIZE)
-            rows = self._conn.execute(sql, params).fetchall()
+            page_params.append(ITER_BATCH_SIZE)
+            rows = self._conn.execute(sql, page_params).fetchall()
             if not rows:
                 return
             for row in rows:
@@ -485,6 +510,8 @@ class SqliteStore:
     def iter_pipelines(
         self, *, run_id: str | None = None, state: str | None = None
     ) -> Iterator[PipelineRecord]:
+        """``created_at`` then ``pipeline_id`` — total, because ``pipeline_id`` is the primary key
+        and the upsert never rewrites ``created_at``."""
         where: list[str] = []
         args: list[Any] = []
         if run_id:
@@ -494,13 +521,14 @@ class SqliteStore:
             where.append("state=?")
             args.append(state)
         yield from self._iter_keyset(
-            "SELECT * FROM pipelines", where, args,
+            "pipelines", where, args,
             columns=("created_at", "pipeline_id"), mapper=_to_pipeline,
         )
 
     def iter_tasks(
         self, pipeline_id: str | None = None, *, run_id: str | None = None
     ) -> Iterator[TaskRecord]:
+        """``pipeline_id``, ``seq``, then ``task_run_id`` — the last one makes the cursor unique."""
         where: list[str] = []
         args: list[Any] = []
         if pipeline_id:
@@ -510,13 +538,14 @@ class SqliteStore:
             where.append("run_id=?")
             args.append(run_id)
         yield from self._iter_keyset(
-            "SELECT * FROM tasks", where, args,
-            columns=("pipeline_id", "seq"), mapper=_to_task,
+            "tasks", where, args,
+            columns=("pipeline_id", "seq", "task_run_id"), mapper=_to_task,
         )
 
     def iter_attempts(
         self, *, run_id: str | None = None, pipeline_id: str | None = None
     ) -> Iterator[AttemptRecord]:
+        """``attempt_id`` (total, monotonic); bounded by the mark taken when iteration starts."""
         where: list[str] = []
         args: list[Any] = []
         if run_id:
@@ -526,12 +555,14 @@ class SqliteStore:
             where.append("pipeline_id=?")
             args.append(pipeline_id)
         yield from self._iter_keyset(
-            "SELECT * FROM attempts", where, args, columns=("attempt_id",), mapper=_to_attempt
+            "attempts", where, args,
+            columns=("attempt_id",), mapper=_to_attempt, bound="attempt_id",
         )
 
     def iter_events(
         self, *, pipeline_id: str | None = None, run_id: str | None = None
     ) -> Iterator[EventRecord]:
+        """``event_id`` (total, monotonic); bounded by the mark taken when iteration starts."""
         where: list[str] = []
         args: list[Any] = []
         if pipeline_id:
@@ -541,13 +572,16 @@ class SqliteStore:
             where.append("run_id=?")
             args.append(run_id)
         yield from self._iter_keyset(
-            "SELECT * FROM events", where, args, columns=("event_id",), mapper=_to_event
+            "events", where, args,
+            columns=("event_id",), mapper=_to_event, bound="event_id",
         )
 
     def iter_artifacts(self, *, pipeline_id: str) -> Iterator[Artifact]:
+        """``seq`` then ``artifact_id`` — the last one makes the cursor unique within a pipeline."""
         yield from self._iter_keyset(
-            "SELECT * FROM artifacts", ["pipeline_id=?"], [pipeline_id],
-            columns=("seq",), mapper=lambda row: _hydrate(_to_artifact(row), self.backend),
+            "artifacts", ["pipeline_id=?"], [pipeline_id],
+            columns=("seq", "artifact_id"),
+            mapper=lambda row: _hydrate(_to_artifact(row), self.backend),
         )
 
     def pipelines(

@@ -27,11 +27,16 @@ All notable changes to this project are documented here. The format follows
 
 * **Paged store reads (`pyattacker.store.iter_*`).** Whole-kind reads for exports no longer have to
   materialize a table: `iter_pipelines` / `iter_tasks` / `iter_attempts` / `iter_events` /
-  `iter_artifacts` stream records in the documented order, using an optional `PagedStore` extension
-  when the store has one and falling back to the list API when it does not — so third-party stores
-  keep working unchanged. `SqliteStore` implements the extension with keyset pagination
-  (`WHERE key > last ORDER BY key LIMIT`), and `WriteBehindStore` flushes before every paged read
-  exactly as its list APIs do. See [stores](docs/reference.md#paged-reads-and-third-party-stores).
+  `iter_artifacts` stream records in the documented order — and every order ends in a unique key
+  (`task_run_id` / `artifact_id` are part of the `tasks` / `artifacts` cursors, because the natural
+  `(pipeline_id, seq)` / `seq` prefixes are not unique), so a batch boundary can neither drop nor
+  duplicate a row. They use an optional `PagedStore` extension when the store has one and fall back
+  to the list API when it does not — so third-party stores keep working unchanged. `SqliteStore`
+  implements the extension with keyset pagination (`WHERE key > last ORDER BY key LIMIT 1000`);
+  reading a store that is still being written is defined per kind (`events`/`attempts` are bounded
+  by the high-water mark of their monotonic keys, `pipelines`/`tasks`/`artifacts` are a best-effort
+  traversal); and `WriteBehindStore` flushes before every paged read exactly as its list APIs do.
+  See [stores](docs/reference.md#paged-reads-and-third-party-stores).
 
 * **`pyattacker bench` — a simulation that compares the acquire algorithms.** A scenario states the
   assumptions about a provider as data (a capacity cycle, a token bucket that tightens when pushed,

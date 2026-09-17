@@ -19,6 +19,7 @@ this is the only verifiable way to check "was the record really appended?".
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -441,6 +442,56 @@ def test_paged_iterators_match_the_list_apis(store):
 
     # a lazy stream, not a materialized list — that is the whole point of the extension
     assert isinstance(store.iter_events(), Iterator)
+
+
+def test_paged_iterators_break_cursor_ties_on_the_primary_key(store):
+    """Rows may share ``(pipeline_id, seq)`` / ``seq``; the cursor must end in a unique key.
+
+    The schema keys ``tasks`` by ``task_run_id`` and ``artifacts`` by ``artifact_id``, and the list
+    APIs order by the non-unique prefix alone, so this pins the iterator contract directly instead
+    of comparing it with an order the store never promised.
+    """
+    store.upsert_pipeline(_pipeline("p1", created_at=1000.0))
+    store.record_task(
+        TaskRecord(task_run_id="p1:0", pipeline_id="p1", run_id="run-1", name="ask", seq=0)
+    )
+    store.record_task(
+        TaskRecord(task_run_id="p1:0-alt", pipeline_id="p1", run_id="run-1", name="ask", seq=0)
+    )
+    store.put_artifact(_artifact(pipeline_id="p1", seq=0))
+    store.put_artifact(dataclasses.replace(_artifact(pipeline_id="p1", seq=0), id="p1:0-alt"))
+
+    assert [t.task_run_id for t in store.iter_tasks()] == ["p1:0", "p1:0-alt"]
+
+    # MemoryStore keys artifacts by (pipeline_id, seq), so it stores one of the two; SqliteStore
+    # keys them by artifact_id and stores both. Either way the iterator's order is the documented
+    # key, `(seq, artifact_id)`.
+    stored = store.artifacts("p1")
+    assert [a.id for a in store.iter_artifacts(pipeline_id="p1")] == [
+        a.id for a in sorted(stored, key=lambda a: (a.seq, a.id))
+    ]
+
+
+def test_paged_iterators_mirror_the_live_store_semantics(store):
+    """``events``/``attempts`` are bounded by the mark taken when iteration starts.
+
+    Both backends have to agree: the mark is per iterator (a later read sees the new rows), and a
+    row appended after the mark is not exported by an iterator that is already running.
+    """
+    store.emit_event(EventRecord(ts=1.0, kind="first", run_id="run-1"))
+    store.emit_event(EventRecord(ts=2.0, kind="second", run_id="run-1"))
+    store.record_attempt(_attempt(attempt_no=1, outcome="failed", run_id="run-1"))
+
+    events = store.iter_events()
+    attempts = store.iter_attempts()
+    assert (next(events).kind, next(attempts).attempt_no) == ("first", 1)  # marks fixed here
+    store.emit_event(EventRecord(ts=3.0, kind="late", run_id="run-1"))
+    store.record_attempt(_attempt(attempt_no=2, outcome="succeeded", run_id="run-1"))
+
+    assert [event.kind for event in events] == ["second"]
+    assert list(attempts) == []
+    assert [event.kind for event in store.iter_events()] == ["first", "second", "late"]
+    assert [a.attempt_no for a in store.iter_attempts()] == [1, 2]
 
 
 # ----------------------------------------------------------------- export_rows

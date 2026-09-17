@@ -161,7 +161,8 @@ keys into an `extra` column, so memory stays flat and no field is silently dropp
 Every kind is exported in full: a store with more than 100 000 events used to lose everything older than
 the newest 100 000 from `--rows events`. Rows come out oldest-first for `events`/`attempts` and in
 pipeline/`seq` order for `tasks`/`artifacts`, read from the store in bounded batches — [the export
-reference](reference.md#export) has the exact per-kind order, the `limit` rule and the memory notes.
+reference](reference.md#export) has the exact per-kind order, the `limit` rule, the memory notes and what
+an export of a store that is still being written does and does not guarantee.
 
 ## `serve` — read-only HTTP view
 

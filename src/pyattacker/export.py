@@ -151,19 +151,30 @@ def iter_rows(
 ) -> Iterator[dict[str, Any]]:
     """Yield export rows of one kind. ``run_id=None`` means "everything in this store".
 
-    Order — the front of it is what ``limit`` truncates, and every kind orders by a key that is
-    unique, so a paged read can neither drop nor duplicate a row:
+    Order — the front of it is what ``limit`` truncates, and every kind ends its order in a key that
+    is unique, so a paged read can neither drop nor duplicate a row:
 
-    * ``pipelines`` — ``created_at``, ties broken by ``pipeline_id``;
-    * ``tasks`` — ``pipeline_id``, then ``seq``;
+    * ``pipelines`` — ``created_at``, then ``pipeline_id`` (the primary key);
+    * ``tasks`` — ``pipeline_id``, then ``seq``, then ``task_run_id``;
     * ``attempts`` — ``attempt_id`` (insertion order, oldest first);
     * ``events`` — ``event_id`` (insertion order, oldest first);
-    * ``artifacts`` — pipeline order (as above), then ``seq``.
+    * ``artifacts`` — pipeline order (as above), then ``seq``, then ``artifact_id``.
+
+    ``tasks`` and ``artifacts`` need that last component: the tables are keyed by ``task_run_id`` /
+    ``artifact_id``, so ``(pipeline_id, seq)`` and ``seq`` are not unique by contract and a cursor
+    over them alone would skip rows that tie across a page boundary.
 
     ``limit`` counts rows of the requested kind — including ``artifacts``, where it used to count
     pipelines — and means the same thing for every kind: ``None`` (the default) exports the complete
     history, ``0`` exports nothing, a positive N exports the first N rows in the order above, and a
     negative value raises :class:`~pyattacker.errors.ConfigError`.
+
+    Live stores: ``events`` and ``attempts`` are bounded by the high-water mark of their monotonic
+    keys, taken when the export starts, so rows appended while it runs are not exported and the
+    iterator cannot chase a moving tail. ``pipelines``, ``tasks`` and ``artifacts`` have no
+    monotonic key, so they are a **best-effort traversal** of the live store: a row inserted ahead
+    of the cursor can appear, one inserted behind it cannot. Nothing here is a long-lived read
+    transaction or a point-in-time snapshot of the whole store.
 
     Rows stream out of the store: no kind is materialized whole. With ``kind="pipelines"`` a single
     row nests that pipeline's tasks and artifacts, so one pipeline is the memory unit; the other

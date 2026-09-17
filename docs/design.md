@@ -298,10 +298,13 @@ later optimization and does not affect the interface.
 
 **Read policy**: the list queries above may materialize their result — a report wants a list. A whole-kind
 read that must stay bounded (an export of a large store) goes through the optional paged-iteration
-extension instead: keyset batches of `ITER_BATCH_SIZE` rows, ordered by a unique key so a batch boundary
-can neither drop nor duplicate a row; a nested `pipelines` row materializes one pipeline, which is the
-documented memory unit. `Store` is unchanged, so a third-party store that implements only the list API
-stays complete, just not bounded in memory — see
+extension instead: keyset batches of `ITER_BATCH_SIZE` rows, ordered by a key that ends in a unique column
+so a batch boundary can neither drop nor duplicate a row; a nested `pipelines` row materializes one
+pipeline, which is the documented memory unit. Where the key is monotonic (`event_id`, `attempt_id`) the
+iterator is bounded by the high-water mark taken when it starts, so an export of a live store cannot chase
+a moving tail; `pipelines`/`tasks`/`artifacts` have no monotonic key and are documented as a best-effort
+traversal of the live store. `Store` is unchanged, so a third-party store that implements only the list
+API stays complete, just not bounded in memory — see
 [the store reference](reference.md#paged-reads-and-third-party-stores).
 
 ---

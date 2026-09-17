@@ -340,11 +340,17 @@ class PagedStore(Protocol):
     delegate to the list API. Implement the methods here when a whole-kind read must not
     materialize the table (``SqliteStore`` does):
 
-    * yield in the documented order (see :func:`pyattacker.export.iter_rows`), and order by a
-      unique key so a paged read can neither drop nor duplicate a row;
+    * yield in the documented order (see :func:`pyattacker.export.iter_rows`) and **end that order in
+      a unique key**. The tables are keyed by ``task_run_id`` / ``artifact_id`` while the natural
+      order is by ``(pipeline_id, seq)`` / ``seq``, and paging with a strict ``>`` cursor over a
+      non-unique prefix skips every row that ties with the last row of a page;
     * read at most ``ITER_BATCH_SIZE`` rows per query;
     * keep the Python-side working set at one batch — for the *nested* per-pipeline data, one
-      pipeline is the documented unit (see ``docs/reference.md`` § Stores).
+      pipeline is the documented unit (see ``docs/reference.md`` § Stores);
+    * where the order key is monotonic (``event_id`` / ``attempt_id``), capture its high-water mark
+      before the first page and bound every page to it, so an export of a live store cannot chase
+      rows appended after it started. Where it is not (``pipelines`` / ``tasks`` / ``artifacts``),
+      the traversal is best-effort over the live table and must be documented as such.
     """
 
     def iter_pipelines(
@@ -373,7 +379,11 @@ def iter_pipelines(
 
     The tie-break is what makes a paged read safe: ``created_at`` alone is not unique (a fast
     scheduler writes many pipelines inside one clock tick), and paging on a non-unique key can
-    skip or repeat a row.
+    skip or repeat a row. ``pipeline_id`` is the primary key and the upsert never rewrites
+    ``created_at``, so this cursor is total and stable.
+
+    Live-store semantics: best-effort traversal. A pipeline inserted ahead of the cursor while the
+    iterator runs can appear; one inserted behind it cannot.
     """
     native = getattr(store, "iter_pipelines", None)
     if callable(native):
@@ -387,7 +397,13 @@ def iter_pipelines(
 def iter_tasks(
     store: Store, pipeline_id: str | None = None, *, run_id: str | None = None
 ) -> Iterator[TaskRecord]:
-    """Stream tasks ordered by ``pipeline_id``, then ``seq`` (see :func:`iter_pipelines` for the fallback)."""
+    """Stream tasks ordered by ``pipeline_id``, ``seq``, then ``task_run_id``.
+
+    ``(pipeline_id, seq)`` alone is not unique — the table is keyed by ``task_run_id`` — so the id
+    is part of the cursor; without it a page boundary inside a tie drops the rest of the tie.
+    Live-store semantics: best-effort traversal (see :func:`iter_pipelines`); the fallback for a
+    store without the extension is the list API.
+    """
     native = getattr(store, "iter_tasks", None)
     if callable(native):
         yield from native(pipeline_id=pipeline_id, run_id=run_id)
@@ -398,7 +414,12 @@ def iter_tasks(
 def iter_attempts(
     store: Store, *, run_id: str | None = None, pipeline_id: str | None = None
 ) -> Iterator[AttemptRecord]:
-    """Stream attempts in insertion order (``attempt_id``), oldest first."""
+    """Stream attempts in insertion order (``attempt_id``), oldest first.
+
+    ``attempt_id`` is monotonic, so the iterator is bounded by the high-water mark taken when its
+    first page is read: attempts recorded after that are not part of this traversal (per iterator,
+    not permanent — a new iterator sees them).
+    """
     native = getattr(store, "iter_attempts", None)
     if callable(native):
         yield from native(run_id=run_id, pipeline_id=pipeline_id)
@@ -412,7 +433,9 @@ def iter_events(
     """Stream events in insertion order (``event_id``), oldest first.
 
     ``event_id`` is the store's own monotonic counter, so this order is total and paging on it
-    cannot drop or duplicate a row.
+    cannot drop or duplicate a row. The iterator is bound to the high-water mark taken when its
+    first page is read: events emitted after that are not part of this traversal (per iterator, not
+    permanent — a new iterator sees them).
     """
     native = getattr(store, "iter_events", None)
     if callable(native):
@@ -425,7 +448,11 @@ def iter_events(
 
 
 def iter_artifacts(store: Store, *, pipeline_id: str) -> Iterator[Artifact]:
-    """Stream one pipeline's artifacts ordered by ``seq``."""
+    """Stream one pipeline's artifacts ordered by ``seq``, then ``artifact_id``.
+
+    ``seq`` alone is not unique — the table is keyed by ``artifact_id`` — so the id is part of the
+    cursor. Live-store semantics: best-effort traversal (see :func:`iter_pipelines`).
+    """
     native = getattr(store, "iter_artifacts", None)
     if callable(native):
         yield from native(pipeline_id=pipeline_id)
