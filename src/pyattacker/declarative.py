@@ -376,12 +376,14 @@ def _validate_resource(raw: Any, path: str) -> None:
     for key in ("options", "tags"):
         if section.get(key) is not None:
             _mapping(section[key], f"{path}.{key}")
-    if section.get("capacity") is not None:
+    # Presence, not non-None value: these are read with int()/float() downstream, so an explicit
+    # `capacity:` with no value would crash the builder rather than be a config error.
+    if "capacity" in section:
         _integer(section["capacity"], f"{path}.capacity", minimum=1)
     for key in ("degrade_after", "dead_after"):
-        if section.get(key) is not None:
+        if key in section:
             _integer(section[key], f"{path}.{key}", minimum=1)
-    if section.get("cooldown_s") is not None:
+    if "cooldown_s" in section:
         _number(section["cooldown_s"], f"{path}.cooldown_s", minimum=0)
 
 
@@ -398,14 +400,14 @@ def _validate_pools(raw: Any) -> None:
         _unknown(path, section, _POOL_FIELDS)
         if section.get("kind") is not None:
             _text(section["kind"], f"{path}.kind")
-        if section.get("capacity") is not None:
+        if "capacity" in section:
             _integer(section["capacity"], f"{path}.capacity", minimum=1)
         for key in ("degrade_after", "dead_after"):
-            if section.get(key) is not None:
+            if key in section:
                 _integer(section[key], f"{path}.{key}", minimum=1)
-        if section.get("cooldown_s") is not None:
+        if "cooldown_s" in section:
             _number(section["cooldown_s"], f"{path}.cooldown_s", minimum=0)
-        if section.get("deadlock_warn_s") is not None:
+        if "deadlock_warn_s" in section:
             _number(section["deadlock_warn_s"], f"{path}.deadlock_warn_s", minimum=0, exclusive=True)
         if "algorithm" in section:
             _algorithm(section["algorithm"], f"{path}.algorithm")
@@ -484,7 +486,9 @@ def _validate_pipeline(raw: Any, pool_names: Sequence[str]) -> None:
             _text(section[key], f"pipeline.{key}")
     if section.get("tags") is not None:
         _mapping(section["tags"], "pipeline.tags")
-    if section.get("include_code") is not None:
+    if "include_code" in section:
+        # `include_code: null` would silently mean False (dropping source digests from the
+        # fingerprint), so only an explicit boolean is accepted here.
         _flag(section["include_code"], "pipeline.include_code")
     if section.get("resource") is not None and section["resource"] not in pool_names:
         _fail("pipeline.resource", f"unknown resource pool {section['resource']!r} (declared: {sorted(pool_names)})")
@@ -505,13 +509,14 @@ def _validate_source(raw: Any) -> None:
     if kind not in _SOURCE_FIELDS:
         _fail("source.kind", f"unknown source kind {kind!r}; available: {sorted(_SOURCE_FIELDS)}")
     _unknown("source", section, _SOURCE_FIELDS[kind])
-    if section.get("n") is not None:
-        _integer(section["n"], "source.n", minimum=0)
-    if section.get("limit") is not None:
-        _integer(section["limit"], "source.limit", minimum=0)
-    if section.get("repeats") is not None:
+    # Presence, not non-None value: these reach range()/int() downstream, where an explicit
+    # `n:` with no value would be a TypeError rather than a config error.
+    for key in ("n", "limit"):
+        if key in section:
+            _integer(section[key], f"source.{key}", minimum=0)
+    if "repeats" in section:
         _integer(section["repeats"], "source.repeats", minimum=1)
-    if section.get("key_field") is not None:
+    if "key_field" in section:
         _text(section["key_field"], "source.key_field")
     if kind == "jsonl" and section.get("path") is None:
         _fail("source.path", "is required when source.kind is 'jsonl'")

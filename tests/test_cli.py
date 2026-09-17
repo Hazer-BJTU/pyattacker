@@ -654,6 +654,18 @@ INVALID_CONFIGS = [
         {"pipeline": {"name": "x", "tasks": [{"use": "echo"}]}, "source": {"kind": "jsonl"}},
         "source.path",
     ),
+    (
+        {"pipeline": {"name": "x", "tasks": [{"use": "echo"}]}, "source": {"kind": "jsonl", "path": "d.jsonl", "limit": None}},
+        "source.limit",
+    ),
+    (
+        {"pools": {"apis": {"capacity": None}}, "pipeline": {"name": "x", "tasks": [{"use": "echo"}]}},
+        "pools.apis.capacity",
+    ),
+    (
+        {"pipeline": {"name": "x", "include_code": None, "tasks": [{"use": "echo"}]}},
+        "pipeline.include_code",
+    ),
 ]
 
 
