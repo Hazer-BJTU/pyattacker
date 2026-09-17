@@ -1,0 +1,231 @@
+name: Release
+
+# Publishing is driven by a tag, so the artifact is always traceable to an exact commit.
+# Pushing v0.2.0 builds, verifies and publishes to PyPI, then attaches the files to a GitHub
+# Release. `workflow_dispatch` runs everything except the PyPI upload, which is how you rehearse
+# a release without spending a version number: PyPI refuses a re-upload, and a version, once
+# published, can be deleted but never reused.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish_to_testpypi:
+        description: "Publish to TestPyPI (a dry run needs no version number)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # never interrupt an upload in progress
+
+permissions: {}
+
+jobs:
+  # The gate. A tag can point at any commit, including one that never passed CI, so the release
+  # re-runs the full suite instead of trusting that it did.
+  verify:
+    name: verify python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true # a release is all-or-nothing; stop at the first failure
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run ruff check
+
+      - name: Test
+        run: uv run pytest
+
+      - name: CLI smoke test
+        run: uv run pyattacker demo --pipelines 25 --store runs/demo.db
+
+      - name: Example smoke tests
+        run: |
+          uv run python examples/quickstart.py
+          uv run python examples/sharded.py
+          uv run python -m examples.llm_eval.demo
+
+  build:
+    name: build and check artifacts
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.11"
+
+      - name: Build sdist and wheel
+        run: |
+          rm -rf dist
+          uv build
+
+      - name: Read the version being released
+        id: version
+        run: |
+          version="$(uv run --no-project --with ./dist/*.whl \
+            python -c 'import pyattacker; print(pyattacker.__version__)')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "building version $version"
+
+      # A tag that disagrees with the package version produces a release nobody can find again.
+      - name: Check the tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          if [ "$tag" != "$VERSION" ]; then
+            echo "::error::tag v$tag does not match __version__ $VERSION — fix one of them and re-tag"
+            exit 1
+          fi
+          echo "tag v$tag matches the package version"
+
+      # Metadata has to render on PyPI, and the sdist has to be self-sufficient: these two checks
+      # are what caught a leaked local config file and 16 README links that break off GitHub.
+      - name: Check metadata renders
+        run: uvx twine check --strict dist/*
+
+      - name: Check the sdist carries no local tooling state
+        run: |
+          if tar tzf dist/*.tar.gz | grep -E '(^|/)\.(claude|venv|env|idea|vscode)/|\.pyc$'; then
+            echo "::error::the sdist contains local tooling state; tighten the include list in pyproject.toml"
+            exit 1
+          fi
+          echo "sdist contains no local tooling state"
+
+      - name: Check the sdist rebuilds and passes its own tests
+        run: |
+          mkdir -p /tmp/sdist && tar xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
+          cd /tmp/sdist
+          uv venv .venv --python 3.11
+          uv pip install --python .venv/bin/python -e . pytest
+          .venv/bin/python -m pytest -q
+
+      - name: Check the wheel installs and runs
+        run: |
+          uv venv /tmp/wheel-check --python 3.11
+          uv pip install --python /tmp/wheel-check/bin/python dist/*.whl
+          /tmp/wheel-check/bin/pyattacker --version
+          /tmp/wheel-check/bin/pyattacker demo --pipelines 10 --store /tmp/wheel-check/demo.db
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # Publishing lives in its own job so the OIDC token is scoped to it alone: no test or build step
+  # ever holds a credential that can upload a release.
+  testpypi:
+    name: publish to TestPyPI
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_to_testpypi
+    needs: build
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write # mint the OIDC token trusted publishing exchanges for an upload token
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # --check-url lets a re-run skip files already uploaded instead of failing the job.
+      - name: Publish
+        run: |
+          uv publish \
+            --trusted-publishing always \
+            --publish-url https://test.pypi.org/legacy/ \
+            --check-url https://test.pypi.org/simple/ \
+            dist/*
+
+  pypi:
+    name: publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Publish
+        run: |
+          uv publish \
+            --trusted-publishing always \
+            --check-url https://pypi.org/simple/ \
+            dist/*
+
+  github_release:
+    name: create the GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    # `pypi` gates this on the upload having succeeded; `build` is also required because
+    # needs.build.outputs is only readable from a job that lists build as a dependency.
+    needs: [build, pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload the artifacts to it
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # The section for this version in CHANGELOG.md, so the release notes are the notes we wrote
+      # rather than a list of commit subjects.
+      - name: Extract the changelog section
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          if awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" {found=1; next}
+            found && /^## \[/ {exit}
+            found {print}
+          ' CHANGELOG.md > notes.md && [ -s notes.md ]; then
+            echo "using the CHANGELOG.md section for $VERSION"
+          else
+            echo "No changelog section for $VERSION." > notes.md
+            echo "::warning::CHANGELOG.md has no section for $VERSION; publishing with a placeholder"
+          fi
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          gh release create "${GITHUB_REF#refs/tags/}" \
+            --title "pyattacker $VERSION" \
+            --notes-file notes.md \
+            --verify-tag \
+            dist/*

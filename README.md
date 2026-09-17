@@ -261,6 +261,7 @@ group).
 | [`docs/cli.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/cli.md) | every subcommand, every flag, exit codes, config reference |
 | [`docs/design.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/design.md) | conceptual model, the six invariants, the lease contract, data model, tradeoffs |
 | [`CHANGELOG.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/CHANGELOG.md) | what changed, release by release |
+| [`docs/releasing.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/releasing.md) | for maintainers: how a release is cut and published |
 
 ## Examples
 
