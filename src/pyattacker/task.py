@@ -39,7 +39,28 @@ from .errors import (
 )
 from .resource import Lease, Pool, Resource
 
-__all__ = ["Retrying", "TaskSpec", "task", "TaskContext"]
+__all__ = ["UNSET", "Retrying", "TaskSpec", "task", "TaskContext"]
+
+
+class _Unset:
+    """Marker type of :data:`UNSET`; only the singleton is ever meant to be used."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+UNSET: Any = _Unset()
+"""Sentinel for "no override was given", as opposed to an explicit ``None``.
+
+:meth:`TaskSpec.with_overrides` uses it so that a caller forwarding a dict built from an optional
+configuration (the declarative layer does exactly that) can leave a field alone by putting
+``UNSET`` in it, while a real ``None`` still means "clear this field".
+"""
+
+# TaskSpec fields for which None is a meaningful value, so an override may set them back to it.
+_CLEARABLE_FIELDS = frozenset({"resource", "algorithm", "timeout_s", "version"})
 
 
 @dataclass(frozen=True)
@@ -229,7 +250,27 @@ class TaskSpec:
         return self._algorithm_snapshot.runtime() if self._algorithm_snapshot is not None else None
 
     def with_overrides(self, **kwargs: Any) -> "TaskSpec":
-        return replace(self, **{k: v for k, v in kwargs.items() if v is not None})
+        """Return a copy of this spec with the given fields replaced.
+
+        Override semantics: an **omitted** keyword keeps the current value, and an explicit
+        ``None`` **clears** a field that supports being empty — ``resource``, ``algorithm``,
+        ``timeout_s`` and ``version``. ``UNSET`` (the sentinel re-exported by this module) is
+        treated as "not provided", which is what lets a caller forward a dict whose keys come
+        from an optional config without clearing everything it did not mention.
+
+        Passing ``None`` for a field that cannot be empty (``name``, ``fn``, ``retry``,
+        ``children``, ``config``, ``parameters`` and the derived identity fields) is a
+        :class:`~pyattacker.errors.ConfigError` rather than a silent no-op, because it could only
+        ever produce a broken spec.
+        """
+        changes = {key: value for key, value in kwargs.items() if value is not UNSET}
+        cleared = sorted(key for key, value in changes.items() if value is None and key not in _CLEARABLE_FIELDS)
+        if cleared:
+            raise ConfigError(
+                f"task field(s) {cleared} cannot be cleared with None; "
+                f"only {sorted(_CLEARABLE_FIELDS)} support it"
+            )
+        return replace(self, **changes)
 
     def __or__(self, other: Any) -> Any:
         from .pipeline import Chain
@@ -395,11 +436,29 @@ def build_task_spec(
         if not (any((name, resource, algorithm, retry, timeout_s, children))
                 or config is not None or version is not None or parameters is not None):
             return fn
-        return fn.with_overrides(
-            name=name, resource=resource, algorithm=algorithm, timeout_s=timeout_s,
-            retry=_as_retrying(retry) if retry is not None else None,
-            config=config, version=version, children=children or None, parameters=parameters,
-        )
+        # Only the arguments that were actually provided become overrides: with_overrides now
+        # treats an explicit None as "clear", so forwarding its own defaults would wipe fields
+        # the caller never mentioned (a factory's own resource/retry, for example).
+        changes: dict[str, Any] = {}
+        if name is not None:
+            changes["name"] = name
+        if resource is not None:
+            changes["resource"] = resource
+        if algorithm is not None:
+            changes["algorithm"] = algorithm
+        if retry is not None:
+            changes["retry"] = _as_retrying(retry)
+        if timeout_s is not None:
+            changes["timeout_s"] = timeout_s
+        if children:
+            changes["children"] = children
+        if config is not None:
+            changes["config"] = config
+        if version is not None:
+            changes["version"] = version
+        if parameters is not None:
+            changes["parameters"] = parameters
+        return fn.with_overrides(**changes)
     if not callable(fn):
         raise ConfigError(f"task must be callable, got {fn!r}")
 

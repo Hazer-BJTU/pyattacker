@@ -456,10 +456,15 @@ def test_runner_artifact_backend_uri_spills_and_records_the_backend_name(tmp_pat
     try:
         run = store.get_run(report.run_id)
         assert run.status == "completed"
+        # The manifest records the effective write-behind mode and, when it is on, the batch knobs
+        # that mode is using (which is what makes a configured write_batch/flush_interval checkable
+        # from the run record rather than only from the store object).
         assert run.config == {
             "concurrency": 4,
             "journal": "full",
             "write_behind": True,
+            "write_batch": 128,
+            "flush_interval": 1.0,
             "artifact_backend": "file",
         }
     finally:

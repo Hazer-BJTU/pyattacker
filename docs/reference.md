@@ -125,7 +125,20 @@ Immutable description of a task. You rarely construct one; you receive them from
 | `is_async` | whether `fn` is a coroutine function |
 | `fingerprint(*, include_code=True)` | the dict that feeds `spec_digest`; includes nested specs |
 | `runtime_algorithm()` | a runtime algorithm derived from the captured identity configuration |
-| `with_overrides(**kwargs)` | a new spec with fields replaced |
+| `with_overrides(**kwargs)` | a new spec with the given fields replaced |
+
+`with_overrides` has three distinct cases, and they are user-visible:
+
+* a keyword that is **not passed** keeps the current value;
+* an explicit `None` **clears** a field that supports being empty — `resource`, `algorithm`,
+  `timeout_s`, `version`. This is how a factory's own `resource=` or `algorithm=` is removed;
+* `UNSET` (exported as `pyattacker.UNSET`) means "not passed" even when the key is present, so a
+  builder that always emits the same set of keys can forward its dict without clearing everything the
+  caller did not mention. The declarative loader does exactly that.
+
+`None` for a field that cannot be empty (`name`, `fn`, `retry`, `children`, `config`, `parameters`)
+is a `ConfigError` rather than a silent no-op. Clearing `config` means `config={}`; clearing `children`
+means `children=()`.
 
 Two `TaskSpec`s compose with `|` into a `Chain`. `spec | other` validates nothing on its own; the check
 happens in `pipeline(...)`.
@@ -1203,6 +1216,17 @@ print(spec.describe())                       # what `pyattacker validate` prints
 with Runner(pools=spec.pools, **spec.run) as runner:
     report = runner.run(spec.pipelines(limit=100))
 ```
+
+`load_spec` is the shared validation entry: `run`, `validate` and every `--shards` child go through it, and
+a config it refuses is exit code `2` before a store exists. It checks unknown fields, field types, numeric
+ranges, pool references (including the `resource` a `use:` factory declares itself), algorithm names and
+parameters, and the `source:` declaration — always naming the field path. It is a declaration check only:
+no dataset is opened and no artifact backend is constructed. [`docs/cli.md`](cli.md#validate--check-a-config-without-running)
+lists what is covered.
+
+A field the config does not mention keeps whatever the `use:` target declares; an explicit `field: null`
+clears `resource`, `algorithm`, `timeout_s` or `version`. The rule and its SDK spelling
+([`TaskSpec.with_overrides`](#taskspec)) are the same one.
 
 | `DeclarativeSpec` member | Meaning |
 |---|---|

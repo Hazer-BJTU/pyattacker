@@ -77,7 +77,7 @@ from .runner import RunConfig, Runner, RunReport
 from .server import StatsServer
 from .shard import in_shard, parse_shard, shard_index, shard_specs, shard_store_path
 from .store import AttemptRecord, EventRecord, MemoryStore, PipelineRecord, SqliteStore, open_store
-from .task import Retrying, TaskContext, TaskSpec, build_task_spec, task
+from .task import UNSET, Retrying, TaskContext, TaskSpec, build_task_spec, task
 from .tasks import (
     boom,
     delay,
@@ -111,6 +111,7 @@ __all__ = [
     "Retrying",
     "TaskSpec",
     "TaskContext",
+    "UNSET",
     "build_task_spec",
     "Chain",
     "PipelineSpec",

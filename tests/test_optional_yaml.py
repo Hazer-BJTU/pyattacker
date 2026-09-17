@@ -142,3 +142,39 @@ def test_cli_reports_the_missing_extra_as_a_config_error(tmp_path, monkeypatch, 
     err = capsys.readouterr().err
     assert err.startswith("Config error:")
     assert "pyattacker[yaml]" in err
+
+
+def test_the_cli_validates_json_and_toml_configs_without_the_extra(tmp_path, monkeypatch, capsys):
+    """The shared validation entry is standard-library code: adding it to the `validate`/`run` path
+    must not make either of them want PyYAML. The same config is checked (and refused) either way."""
+    _without_pyyaml(monkeypatch)
+    good = _write(tmp_path, "good.json", JSON_CONFIG)
+
+    assert main(["validate", "-c", str(good)]) == 0
+    capsys.readouterr()
+
+    bad_json = _write(
+        tmp_path,
+        "bad.json",
+        '{"pipeline": {"name": "x", "tasks": [{"use": "echo"}]}, "run": {"concurency": 4}}',
+    )
+    bad_toml = _write(
+        tmp_path,
+        "bad.toml",
+        """
+        [pipeline]
+        name = "x"
+
+        [[pipeline.tasks]]
+        use = "echo"
+
+        [run]
+        concurency = 4
+        """,
+    )
+
+    for cfg in (bad_json, bad_toml):
+        assert main(["validate", "-c", str(cfg)]) == 2
+        err = capsys.readouterr().err
+        assert "Config error" in err
+        assert "concurency" in err

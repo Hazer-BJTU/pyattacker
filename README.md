@@ -71,29 +71,61 @@ Five concepts, and that is the whole vocabulary:
 
 ## 30-Second Quickstart (SDK)
 
+The program below is complete: it defines every name it uses, runs offline, and is executed by the test
+suite on every commit. Only the built-in simulation is involved — no API key, no network.
+
 ```python
+# example/readme_quickstart.py
+"""A first run: one custom task, a pool of two simulated endpoints, four pipelines, one report."""
 from pyattacker import Pool, Resource, Retrying, Runner, pipeline, task
 
-@task("ask", resource="apis", algorithm="backoff",
+
+@task("fetch", resource="apis", algorithm="backoff",
       retry=Retrying(max_attempts=4, base=0.5, cap=30.0), timeout_s=60)
+async def fetch(row: dict, ctx) -> dict:
+    async with ctx.acquire() as lease:                     # returned on exit; returned on exception too
+        await ctx.clock.sleep(0.001)                       # stand-in for the network call
+        lease.report(ok=True, usage={"tokens": 128})       # report health/quota back to the pool
+        return {"q": row["q"], "a": f"answer from {lease.resource.id}"}
+
+
+def dataset_rows():
+    """Your dataset. A generator works too: `map` streams it, so memory stays O(concurrency)."""
+    return [{"q": f"question-{i}"} for i in range(4)]
+
+
+pool = Pool("apis",
+            [Resource.create("llm", id=f"api-{i}", capacity=4) for i in range(1, 3)],
+            algorithm="backoff")
+
+template = pipeline("qa", fetch)
+
+with Runner(store="runs/qa.db", pools=[pool], concurrency=8) as runner:
+    report = runner.run(template.map(dataset_rows()))
+    print(report.summary())
+    report.export_jsonl("runs/qa.jsonl")
+```
+
+`ctx.acquire()` falls back to the task's declared `resource`, and `lease.report(ok=...)` feeds the pool's
+health and quota accounting.
+
+Where the real call goes — this part is yours, and it comes after the framework is already working:
+
+```python
+@task("ask", resource="apis", retry={"max_attempts": 3}, timeout_s=60)
 async def ask(row: dict, ctx) -> dict:
-    async with ctx.acquire(model="gpt-4o") as lease:     # returned on exit; returned on exception too
+    async with ctx.acquire(model="gpt-4o") as lease:
         text = await lease.client.chat(row["q"])         # lease.client is built by resource.factory
-        lease.report(ok=True, usage={"tokens": 128})     # report health/quota back to the pool
         return {"q": row["q"], "a": text}
 
 pool = Pool("apis",
             [Resource.create("llm", capacity=4, options={"model": "gpt-4o"},
                              factory=lambda res: MyClient(res.options)) for _ in range(8)],
             algorithm="backoff")
-
-template = pipeline("qa", ask)
-
-with Runner(store="runs/qa.db", pools=[pool], concurrency=64) as runner:
-    report = runner.run(template.map(dataset_rows))   # a generator, streaming, memory O(concurrency)
-    print(report.summary())
-    report.export_jsonl("runs/qa.jsonl")
 ```
+
+`MyClient` is your client class. `factory` is called once per resource, lazily, on the first lease, and
+whatever it returns is `lease.client` — pyattacker never opens a socket itself.
 
 Want pass@k? `template.map(rows, repeats=3)` — the same seed expands into three independent pipelines.
 
@@ -181,7 +213,11 @@ Reading a `.yaml`/`.yml` file is the only part of pyattacker that needs a third-
 in the `yaml` extra; the same config written as JSON or TOML is read with the standard library. The loader
 decides per file, from the suffix, and says which extra to install when the parser is missing.
 
+The block below is a complete config — every `use:` target is a built-in, so it validates as it stands.
+Save it as `qa.yaml`; `examples/qa_eval.yaml` is the same shape with more comments.
+
 ```yaml
+# example/readme_qa_eval.yaml
 run:   { store: runs/demo.db, concurrency: 8, label: demo }
 pools:
   apis:
@@ -192,14 +228,20 @@ pipeline:
   name: qa
   tasks:
     - { use: pyattacker.tasks:echo }
-    - { use: pyattacker.tasks:simulate_llm, resource: apis, algorithm: backoff,
-        retry: { max_attempts: 3, on: [RetryableError, TimeoutError] } }
+    - use: pyattacker.tasks:simulate_llm            # a factory: `kwargs` are its arguments
+      resource: apis
+      algorithm: backoff
+      kwargs: { latency_ms: 5, fail_rate: 0.1, tokens: 64 }
+      retry: { max_attempts: 3, "on": [RetryableError, TimeoutError] }
 source: { kind: range, n: 100 }
 ```
 
+A bare `on:` is a YAML 1.1 boolean key, not the retry field: retry keys must be quoted. The loader
+detects the mistake and says so rather than silently ignoring the policy.
+
 ```bash
-uv run pyattacker validate -c examples/qa_eval.yaml
-uv run pyattacker run      -c examples/qa_eval.yaml --progress
+uv run pyattacker validate -c qa.yaml            # parse, check, print the effective config
+uv run pyattacker run      -c qa.yaml --progress
 uv run pyattacker watch    runs/demo.db          # open another process to monitor it live
 uv run pyattacker report   runs/demo.db --errors 20
 uv run pyattacker export   runs/demo.db out.jsonl

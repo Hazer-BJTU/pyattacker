@@ -293,6 +293,105 @@ def test_task_entry_name_override_is_honored(tmp_path):
     assert names == ["fetch"]  # the name in the config overrides the name carried by the use target
 
 
+# ------------------------------------------- overrides: absent keeps, explicit null clears
+
+# A task that declares its own defaults -- the whole point of the UNSET sentinel is that a config
+# which does not mention a field must leave these alone, while `field: null` really does clear it.
+_DEFAULTS_TASK_MODULE = '''
+from pyattacker import task
+
+
+@task("defaults.task", resource="apis", algorithm="wait", timeout_s=5.0, version="v1",
+      config={"model": "model-a"})
+def defaults_task(value, ctx):
+    return value
+'''
+
+
+def _write_defaults_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "decl_defaults_tasks.py").write_text(textwrap.dedent(_DEFAULTS_TASK_MODULE), encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+
+_DEFAULTS_TASK_CONFIG = """
+pools:
+  apis:
+    capacity: 1
+    resources: [{{id: api-1}}]
+pipeline:
+  name: {name}
+  tasks:
+    - use: decl_defaults_tasks:defaults_task
+{overrides}
+"""
+
+
+@pytest.mark.requires_yaml
+def test_absent_task_fields_keep_what_the_task_declares(tmp_path, monkeypatch):
+    _write_defaults_module(tmp_path, monkeypatch)
+    cfg = _write(
+        tmp_path,
+        "keep.yaml",
+        _DEFAULTS_TASK_CONFIG.format(name="keep", overrides="      name: renamed"),
+    )
+    task = load_spec(cfg).template.tasks[0]
+
+    assert task.name == "renamed"  # the one field the config did mention
+    assert task.resource == "apis"
+    assert task.algorithm == "wait"
+    assert task.runtime_algorithm().name == "wait"
+    assert task.timeout_s == 5.0
+    assert task.version == "v1"
+    assert dict(task.config) == {"model": "model-a"}
+
+
+@pytest.mark.requires_yaml
+def test_explicit_null_clears_the_supported_task_fields(tmp_path, monkeypatch):
+    _write_defaults_module(tmp_path, monkeypatch)
+    cfg = _write(
+        tmp_path,
+        "clear.yaml",
+        _DEFAULTS_TASK_CONFIG.format(
+            name="clear",
+            overrides="      resource: null\n      algorithm: null\n      timeout_s: null\n      version: null",
+        ),
+    )
+    task = load_spec(cfg).template.tasks[0]
+
+    assert task.resource is None
+    assert task.algorithm is None
+    assert task.runtime_algorithm() is None
+    assert task.timeout_s is None
+    assert task.version is None
+
+
+@pytest.mark.requires_yaml
+def test_a_pool_only_the_task_declares_is_still_validated(tmp_path, monkeypatch):
+    """A pool reference can come from the factory (``@task(resource=...)``) rather than from a
+    config field; the preflight has to see that one too, or the run fails per pipeline with exit 1
+    instead of refusing the config with exit 2."""
+    _write_defaults_module(tmp_path, monkeypatch)
+    cfg = _write(
+        tmp_path,
+        "no_pool.yaml",
+        """
+        pipeline:
+          name: no-pool
+          tasks:
+            - use: decl_defaults_tasks:defaults_task
+        """,
+    )
+    with pytest.raises(ConfigError, match="unknown resource pool 'apis'"):
+        load_spec(cfg)
+
+    cfg = _write(
+        tmp_path,
+        "with_pool.yaml",
+        _DEFAULTS_TASK_CONFIG.format(name="with-pool", overrides=""),
+    )
+    assert load_spec(cfg).template.tasks[0].resource == "apis"
+
+
 @pytest.mark.requires_yaml
 def test_use_factory_args_dict_is_passed_as_keywords(tmp_path):
     """``args: {fail_times: 1}`` should be equivalent to ``flaky(fail_times=1)``."""

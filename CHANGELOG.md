@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+* **`TaskSpec.with_overrides` distinguishes "not given" from `None`.** An omitted keyword keeps the
+  current value (as before), an explicit `None` now **clears** `resource`, `algorithm`, `timeout_s`
+  or `version` instead of being silently dropped, and `UNSET` (exported from `pyattacker`) means
+  "not given" even when the key is present — which is how the declarative loader forwards a config
+  without clearing what it did not mention. `None` for a field that cannot be empty is a
+  `ConfigError`, not a no-op.
+* **One shared validation entry (`load_spec`) for `validate` and every `run` mode.** Unknown fields
+  (with a "did you mean" for typos), wrong types, out-of-range numbers, unknown pool references
+  (including the `resource` a `use:` factory declares itself), unresolvable algorithms and a bad
+  `source:` declaration are exit code `2` before a store or a shard child exists, and each message
+  names the field path. The `run:` block now also accepts `artifact_backend`, `write_behind`,
+  `write_batch` and `flush_interval`, which the CLI used to filter out silently.
+
 ### Added
 
 * **`pyattacker bench` — a simulation that compares the acquire algorithms.** A scenario states the
@@ -25,6 +40,14 @@ All notable changes to this project are documented here. The format follows
   question outside a run. Behaviour is unchanged; `tests/test_retry_policy.py` pins the rules directly.
 
 ### Fixed
+
+* `--no-write-behind` now applies in every mode (one process, `--shard`, and the children of
+  `--shards`), and `--artifact-backend` reaches those children instead of being dropped from their
+  command line. `runs.config_json` records the effective backend and write-behind mode, plus the
+  batch knobs when batching is on.
+* The README quickstart is a complete program that runs offline with no undefined names, and the
+  README/CLI-reference YAML examples quote the retry key (`"on"`), which YAML 1.1 otherwise parses
+  as the boolean `true`. The examples in both documents are now executed by the test suite.
 
 * Resume now rejects an existing pipeline key whose task or seed digest differs, preserving its
   historical result/checkpoint and raising `PipelineIdentityConflict` (CLI exit 2). In-flight
