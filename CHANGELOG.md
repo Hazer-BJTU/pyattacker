@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+* **`pyattacker bench` — a simulation that compares the acquire algorithms.** A scenario states the
+  assumptions about a provider as data (a capacity cycle, a token bucket that tightens when pushed,
+  log-normal latency with a slow tail, independent failures plus correlated storms, three endpoints of
+  different character, declared quotas); a closed loop of workers drives the real `Pool`, the real
+  `TaskContext` and the real algorithm against it; time is simulated, so a ten-minute scenario costs
+  seconds. It reports a vector of metrics — throughput, job tail latency, refusals provoked, capacity
+  utilisation, endpoint fairness — with the spread over seeds, and names the best algorithm per metric
+  instead of inventing a weighted score. The world is a black box by construction, each request's draws
+  are indexed by `(endpoint, ordinal)` so two algorithms meet the same world, and the same seed
+  reproduces the numbers exactly. `docs/benchmark.md` documents the assumptions, the metrics, the
+  current results and their limits.
+* **`Retrying.decide`** — the retry decision (retry or give up, and after how long) is now a method on
+  the policy rather than a block inside the Runner's attempt loop, so the benchmark can ask the same
+  question outside a run. Behaviour is unchanged; `tests/test_retry_policy.py` pins the rules directly.
+
 ### Changed
 
 * **PyYAML is no longer a dependency — it is the optional `yaml` extra.** `pip install pyattacker` now

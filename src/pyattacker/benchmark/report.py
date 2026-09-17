@@ -8,6 +8,7 @@ algorithms tie" or "this metric does not separate them".
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,6 +23,12 @@ __all__ = ["BenchmarkReport", "default_algorithms", "run_benchmark"]
 # Two means within this relative distance are reported as a tie rather than as a winner: at three
 # seeds, a 1% gap is not evidence of anything.
 TIE_TOLERANCE = 0.01
+
+# The second, larger guard: a row is only a win if the gap survives the seed-to-seed noise. The
+# threshold is this many standard errors of the difference between the two means (about 95% for a
+# normal difference), computed from the seeds actually run. One seed has no spread to test against,
+# which is exactly why a single-seed report crowns the top scorer and warns the reader.
+SIGNIFICANCE_K = 2.0
 
 
 def default_algorithms() -> list[str]:
@@ -66,7 +73,18 @@ class BenchmarkReport:
         return self.aggregates(algorithm).get(metric, {}).get("stdev", 0.0)
 
     def winners(self, metric: str) -> list[str]:
-        """Algorithms whose mean is best (or within `TIE_TOLERANCE` of it) on this metric."""
+        """The algorithms that can claim this metric: the best mean, and anyone within noise of it.
+
+        Two guards against reading a table too hard. A relative `TIE_TOLERANCE` (1%) covers the case of
+        a metric with tiny variance; the seed-to-seed spread covers the far more common case where the
+        variance is the whole story — a 1.3% edge on a metric that moves 4% between seeds is not a
+        result, and a report that crowns it is lying politely.
+
+        Each challenger is compared against the leader with `SIGNIFICANCE_K` standard errors of their
+        difference (sample `stdev` over the seeds, so `sd_best^2/n + sd_other^2/n` under the hood).
+        Comparing against the leader rather than against the growing group keeps the rule one line
+        long and its meaning obvious.
+        """
         direction = METRICS[metric].better
         if direction == "neutral":
             return []
@@ -79,11 +97,22 @@ class BenchmarkReport:
         if best == 0 and all(value == 0 for value in means.values()):
             return []
         scale = abs(best) if abs(best) > 1e-12 else 1.0
-        return [
+        if direction == "higher":
+            leader = max(means, key=lambda name: means[name])
+        else:
+            leader = min(means, key=lambda name: means[name])
+        leader_sd = self.stdev(leader, metric)
+        seeds = max(1, len(self.seeds))
+        winners = [
             name
             for name, value in means.items()
-            if abs(value - best) <= TIE_TOLERANCE * scale
+            if abs(value - best)
+            <= max(
+                TIE_TOLERANCE * scale,
+                SIGNIFICANCE_K * math.sqrt((leader_sd**2 + self.stdev(name, metric) ** 2) / seeds),
+            )
         ]
+        return sorted(winners, key=lambda name: (-means[name] if direction == "higher" else means[name]))
 
     # ------------------------------------------------------------------ serialisation
     def to_dict(self) -> dict[str, Any]:
@@ -130,7 +159,10 @@ class BenchmarkReport:
             f"{self.scenario.jobs} jobs, {self.scenario.steps_per_job} steps, {self.scenario.calls_per_step} calls each | "
             f"wall {self.wall_s:.1f}s"
         )
-        lines.append("* best mean on that row (ties within 1% share the mark); '.' means no algorithm separates on it")
+        lines.append(
+            "* best mean; anyone whose gap is inside the 1% tolerance or two standard errors of the "
+            "difference shares the mark. Rows without a mark separate nobody."
+        )
         return "\n".join(lines)
 
     def render_markdown(self, *, metrics: list[str] | None = None) -> str:

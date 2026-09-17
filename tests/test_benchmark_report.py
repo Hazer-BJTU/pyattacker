@@ -71,19 +71,26 @@ def test_percentile_matches_the_textbook_definition():
 # ------------------------------------------------------------------ winners
 
 
-def _handmade(metrics: dict[str, dict[str, float]]) -> BenchmarkReport:
-    """A report assembled by hand, so the winner logic can be tested at its edges."""
-    runs = [
-        RunResult(
-            scenario="unit",
-            algorithm=algorithm,
-            seed=1,
-            metrics={name: values[algorithm] for name, values in metrics.items()},
-        )
-        for algorithm in next(iter(metrics.values()))
-    ]
+def _handmade(metrics: dict[str, dict[str, float]], spreads: dict[str, float] | None = None) -> BenchmarkReport:
+    """A report assembled by hand, so the winner logic can be tested at its edges.
+
+    `spreads` gives each algorithm a seed-to-seed standard deviation, which needs at least two runs.
+    """
+    algorithms = list(next(iter(metrics.values())))
+    runs = []
+    for algorithm in algorithms:
+        for offset in range(2 if spreads else 1):
+            jitter = (spreads or {}).get(algorithm, 0.0) * (1 if offset else -1)
+            runs.append(
+                RunResult(
+                    scenario="unit",
+                    algorithm=algorithm,
+                    seed=1 + offset,
+                    metrics={name: values[algorithm] + jitter for name, values in metrics.items()},
+                )
+            )
     scenario = _small()
-    return BenchmarkReport(scenario=scenario, seeds=[1], runs=runs)
+    return BenchmarkReport(scenario=scenario, seeds=[1, 2] if spreads else [1], runs=runs)
 
 
 def test_winners_respect_the_direction_of_each_metric():
@@ -104,6 +111,19 @@ def test_a_gap_inside_the_tolerance_is_reported_as_a_tie():
     report = _handmade({"jobs_done": {"a": 100.0, "b": 99.5, "c": 80.0}})
 
     assert sorted(report.winners("jobs_done")) == ["a", "b"]
+
+
+def test_a_gap_smaller_than_the_seed_to_seed_spread_is_a_tie():
+    """The polite lie this guards against: a 2% edge on a metric that moves 10% between seeds."""
+    report = _handmade({"jobs_done": {"a": 102.0, "b": 100.0}}, spreads={"a": 5.0, "b": 5.0})
+
+    assert sorted(report.winners("jobs_done")) == ["a", "b"]
+
+
+def test_a_gap_wider_than_the_spread_is_a_win():
+    report = _handmade({"jobs_done": {"a": 150.0, "b": 100.0}}, spreads={"a": 1.0, "b": 1.0})
+
+    assert report.winners("jobs_done") == ["a"]
 
 
 def test_a_metric_that_is_zero_for_everyone_crowns_nobody():

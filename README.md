@@ -260,6 +260,31 @@ turning pipelines into a DAG. The group is the only spec the Runner sees, so `re
 `timeout_s` are inherited from the children when all of them agree (a `timeout_s` then bounds the whole
 group).
 
+## Benchmarking the Algorithms
+
+Which acquisition algorithm should a workload use? The pool ships seven, and the honest answer depends
+on the provider — so there is a simulation for it. A scenario states the assumptions (a capacity cycle,
+a token bucket that tightens under pressure, latency with a slow tail, independent failures and
+correlated storms, three endpoints of different character), the client is a closed loop of workers
+driving the real `Pool` and the real algorithm, and time is simulated, so a ten-minute scenario costs
+seconds.
+
+```bash
+uv run pyattacker bench                       # every algorithm x 3 seeds, about 20 seconds
+uv run pyattacker bench --list                # the scenarios, the algorithms, and what each metric means
+uv run pyattacker bench --algorithms wait,backoff --seeds 5 --json runs/bench.json
+```
+
+It is a black box on purpose: the provider never exposes its state to the algorithm, its mood is a
+function of time rather than of who is asking, and each request's draws are indexed by its ordinal — so
+two algorithms meet the same world and the comparison is between algorithms rather than between moods.
+It reports a vector of metrics (throughput, tail latency, refusals provoked, capacity utilisation,
+fairness across endpoints) instead of one weighted score, and it names the winner per metric —
+including when the winner is "nobody".
+
+[`docs/benchmark.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/benchmark.md) has the assumptions, the metrics, the current numbers, and
+what they do not say.
+
 ## Documentation
 
 | Document | What is in it |
@@ -268,6 +293,7 @@ group).
 | [`docs/reference.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md) | every public class and function: signatures, parameters, examples |
 | [`docs/cli.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/cli.md) | every subcommand, every flag, exit codes, config reference |
 | [`docs/design.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/design.md) | conceptual model, the six invariants, the lease contract, data model, tradeoffs |
+| [`docs/benchmark.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/benchmark.md) | the algorithm benchmark: what the scenarios assume, what the metrics mean, how to read the table |
 | [`CHANGELOG.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/CHANGELOG.md) | what changed, release by release |
 | [`docs/releasing.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/releasing.md) | for maintainers: how a release is cut and published |
 
@@ -321,6 +347,7 @@ uv sync                      # create the venv + install the dev group (which in
 uv run pytest                # the whole suite: zero network, a few seconds
 uv run ruff check            # lint (configuration lives in pyproject.toml, with reasons for each exception)
 uv run pyattacker demo       # end-to-end smoke test
+uv run pyattacker bench      # compare the acquire algorithms in simulation (about 20 seconds)
 uv build                     # sdist + wheel
 ```
 
