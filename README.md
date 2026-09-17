@@ -257,6 +257,7 @@ group).
 | Document | What is in it |
 |---|---|
 | [`docs/tutorial.md`](docs/tutorial.md) | fourteen runnable steps, from "one task" to a sharded evaluation; each one executed by the test suite |
+| [`docs/reference.md`](docs/reference.md) | every public class and function: signatures, parameters, examples |
 | [`docs/cli.md`](docs/cli.md) | every subcommand, every flag, exit codes, config reference |
 | [`docs/design.md`](docs/design.md) | conceptual model, the six invariants, the lease contract, data model, tradeoffs |
 | [`CHANGELOG.md`](CHANGELOG.md) | what changed, release by release |

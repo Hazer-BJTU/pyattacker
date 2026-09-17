@@ -1,54 +1,45 @@
 # Tutorial: from one task to a resumable model evaluation
 
-This is the systematic, step-by-step guide to pyattacker. It starts from a five-line program and ends with
-a small but realistic model evaluation that retries, survives a provider outage, resumes from a checkpoint,
-and can be split across processes.
+A step-by-step guide to using pyattacker, from a five-line program to a resumable, sharded model evaluation.
 
-Who it is for: you are running LLM / agent evaluations in Python, you already know `asyncio`, and what you
-want is *not* another agent framework — it is the boring part (endpoint pools, concurrency, retries,
-"which rows already ran", a record of every request).
+**Who it is for:** you run LLM or agent evaluations in Python, you know `asyncio`, and you want the
+infrastructure part — endpoint pools, concurrency, retries, "which rows already ran", a record of every
+request.
 
-How to read it:
+**How to read it:**
 
-* Every step is a **complete program**. Run it, read the output, then read the notes under it.
-* Code blocks that begin with a `# tutorial/step_NN_....py` comment are extracted from this file and
-  executed by [`tests/test_tutorial.py`](../tests/test_tutorial.py) on every test run, so the code you see
-  is the code that runs. Save a block as the file named in that comment and `python` it directly.
-* Nothing here touches the network. Where a real program would do `await self.http.post(...)`, the examples
-  do `await asyncio.sleep(...)`; the comment `# <- your HTTP call` marks the exact spot.
-* Reference material lives elsewhere: [`docs/design.md`](design.md) for the model and the tradeoffs,
-  [`docs/cli.md`](cli.md) for every command-line flag, [`README.md`](../README.md) for the compact API
-  tour, [`examples/`](../examples) for full programs.
+* Every step is a complete program. Run it, read the output, then read the notes.
+* Code blocks starting with `# tutorial/step_NN_....py` are extracted from this file and executed by
+  [`tests/test_tutorial.py`](../tests/test_tutorial.py) on every test run. Save one as the file named in the
+  comment and run it directly.
+* Nothing here touches the network. Where a real program would `await self.http.post(...)`, these examples
+  `await asyncio.sleep(...)` — the comment `# <- your HTTP call` marks the spot.
 
-## Look up by feature, not just by step
+**Other documents:** [`docs/reference.md`](reference.md) documents every class and function;
+[`docs/cli.md`](cli.md) covers the command line; [`docs/design.md`](design.md) explains why the framework
+is shaped this way; [`examples/`](../examples) holds complete programs.
 
-The steps below are meant to be read in order the first time. Once you already know the basics and just
-want "how does X work", use this table instead of scanning headings:
+## Find what you need
 
-| Feature | This tutorial | `design.md` | Source |
-|---|---|---|---|
-| Core concepts (artifact/task/pipeline/runner) | [Step 1](#step-1--one-seed-one-task-one-run) | [§3](design.md#3-conceptual-model) | `pipeline.py`, `task.py`, `runner.py` |
-| `map`/streaming, pass@k (`repeats=`) | [Step 2](#step-2--many-inputs-at-once) | [§3](design.md#3-conceptual-model) | `pipeline.py` |
-| Pipeline composition, artifact-type chaining | [Step 3](#step-3--chaining-tasks) | [§3](design.md#3-conceptual-model) | `pipeline.py` |
-| Checkpoint/artifact, content addressing, `spec_digest` | [Step 4](#step-4--the-checkpoint-is-the-artifact) | [§4.1](design.md#41-task-level-checkpoint-and-recovery) | `artifact.py`, `runner.py` |
-| Resource pools, basics | [Step 5](#step-5--endpoints-as-a-pool) | [§4.3](design.md#43-resource-pool) | `resource.py` |
-| Resource pool state machine (READY/DEGRADED/DEAD/REVOKED) | *no tutorial step yet — only appears as bare config in Step 11* | [§4.3](design.md#43-resource-pool) | `resource.py` |
-| Publish/subscribe bus (`ctx.subscribe`/`ctx.publish_resource`) | *no tutorial step yet* | [§4.3](design.md#43-resource-pool) | `resource.py` (`Bus`, `Pool.subscribe`) |
-| Acquire algorithms (wait/backoff/least\_busy/failover/sticky/quota\_aware) | [Step 6](#step-6--choosing-how-to-wait) | [§4.4](design.md#44-algorithm-and-retry-are-two-orthogonal-axes) | `algorithm.py` |
-| Lease safety contract | [Step 7](#step-7--the-lease-contract) | [§4.2](design.md#42--lease-safety-contract) | `task.py`, `resource.py` |
-| Error classification, retry/backoff policy | [Step 8](#step-8--failures-classify-retry-record) | [§4.4](design.md#44-algorithm-and-retry-are-two-orthogonal-axes) | `errors.py`, `algorithm.py` |
-| Resume / recovery | [Step 9](#step-9--resume-what-reruns-and-what-does-not) | [§4.1](design.md#41-task-level-checkpoint-and-recovery) | `runner.py` |
-| Scheduler internals (`DelayQueue`, write-behind batching) | *mentioned only in passing (end of Step 8, troubleshooting notes) — no dedicated step* | [§4.5](design.md#45-delayed-continuations-and-batched-facts-m2) | `scheduler.py`, `store/writebehind.py` |
-| Data model / store tables, export | [Step 10](#step-10--reading-the-record) | [§5](design.md#5-data-model-sqlite-wal--synchronousnormal) | `store/`, `export.py` |
-| Declarative config | [Step 11](#step-11--the-declarative-path-and-the-cli) | [§6.2](design.md#62-declarative-simple-tasks) | `declarative.py` |
-| CLI reference (`validate`/`run`/`resume`/`report`/`watch`/`export`/`serve`/`plugins`/`demo`) | [Step 0](#step-0--install-and-sanity-check), [Step 11](#step-11--the-declarative-path-and-the-cli), [Step 12](#step-12--sharding-and-merging); every flag in [`docs/cli.md`](cli.md) | — | `cli.py` |
-| Sharding and merging | [Step 12](#step-12--sharding-and-merging) | [§6.3](design.md#63-sharding-merging-and-export-m3) | `shard.py`, `merge.py` |
-| Monitoring / HTTP endpoint | *one sentence at the end of Step 14 — no runnable example* | [§4.6](design.md#46-monitoring-cares-about-traffic-and-blocking-not-about-metrics), [§6.4](design.md#64-plugins-backends-and-the-monitoring-endpoint-m4) | `server.py`, `monitor.py` |
-| Custom types / codecs, artifact backends, plugins | [Step 14](#step-14--your-own-types-blobs-plugins) | [§6.4](design.md#64-plugins-backends-and-the-monitoring-endpoint-m4) | `artifact.py`, `backends.py`, `plugins.py` |
-| Fan-out / branching, integration-scale example | [Step 13](#step-13--capstone-a-small-model-evaluation) | — | `tasks/__init__.py` (`fanout`) |
+Read the steps in order the first time. Afterwards, use this table.
 
-Rows marked "no tutorial step yet" are real gaps in this tutorial, not omissions from this table.
-The `design.md`/source columns are the actual reference for those until a step is written.
+| I want to… | Step | Reference |
+|---|---|---|
+| write my first task and run it | [Step 1](#step-1--one-seed-one-task-one-run) | [Tasks](reference.md#tasks) |
+| run a whole dataset, or k samples per row | [Step 2](#step-2--many-inputs-at-once) | [`map`](reference.md#map) |
+| chain several steps together | [Step 3](#step-3--chaining-tasks) | [Pipelines](reference.md#pipelines) |
+| understand what gets saved, and when | [Step 4](#step-4--the-checkpoint-is-the-artifact) | [Artifacts](reference.md#artifacts-and-codecs) |
+| spread load over several endpoints or keys | [Step 5](#step-5--endpoints-as-a-pool) | [Resources](reference.md#resources) |
+| choose how to wait when everything is busy | [Step 6](#step-6--choosing-how-to-wait) | [Algorithms](reference.md#acquire-algorithms) |
+| use a resource safely | [Step 7](#step-7--the-lease-contract) | [`Lease`](reference.md#lease) |
+| retry failures, and see why something gave up | [Step 8](#step-8--failures-classify-retry-record) | [`Retrying`](reference.md#retrying), [Errors](reference.md#errors) |
+| pick up after a crash without re-paying for work | [Step 9](#step-9--resume-what-reruns-and-what-does-not) | [`Runner`](reference.md#runner) |
+| query the record, export results | [Step 10](#step-10--reading-the-record) | [Stores](reference.md#stores), [Export](reference.md#export) |
+| drive it from YAML and the CLI | [Step 11](#step-11--the-declarative-path-and-the-cli) | [`docs/cli.md`](cli.md) |
+| use more than one process | [Step 12](#step-12--sharding-and-merging) | [Sharding](reference.md#sharding-and-merging) |
+| branch inside a step | [Step 13](#step-13--capstone-a-small-model-evaluation) | [`fanout`](reference.md#fanout) |
+| store custom types or large payloads, ship a plugin | [Step 14](#step-14--your-own-types-blobs-plugins) | [Codecs](reference.md#codecregistry), [Backends](reference.md#artifact-backends), [Plugins](reference.md#plugins) |
+| monitor a run in progress | [Step 14](#step-14--your-own-types-blobs-plugins) | [Monitoring](reference.md#monitoring) |
 
 ---
 
@@ -109,24 +100,23 @@ pipeline b3265e1db9b8 state=succeeded tasks=1/1
 final artifact: {'doubled': 42, 'n': 21}
 ```
 
-Five concepts are already in play, and they are the whole framework:
+Five concepts, and they are the whole vocabulary:
 
-| Concept | In this program | What it means |
+| Concept | In this program | What it is |
 |---|---|---|
-| **artifact** | `{"n": 21, "doubled": 42}` | the persisted state of one task, content-addressed, written as soon as it is produced |
-| **task** | `double` | a unary function `(artifact) -> artifact`; sync or async, no framework base class |
-| **pipeline** | `pipeline("doubling", double)` | a linear chain of tasks; the unit of *completion* and *resume* |
-| **seed** | `[{"n": 21}]` | one dataset row; `template.map(seeds)` turns each row into an independent pipeline |
-| **runner** | `Runner(store=..., concurrency=2)` | the scheduler: owns the store, the pools, and the worker slots |
+| **artifact** | `{"n": 21, "doubled": 42}` | the persisted output of one task, written as soon as it is produced |
+| **task** | `double` | a unary function `(artifact) -> artifact`; sync or async, no base class |
+| **pipeline** | `pipeline("doubling", double)` | a linear chain of tasks; the unit of completion and resume |
+| **seed** | `[{"n": 21}]` | one dataset row; `template.map(seeds)` makes one pipeline per row |
+| **runner** | `Runner(store=..., concurrency=2)` | the scheduler: owns the store, the pools and the worker slots |
 
-Notes worth knowing early:
+Three things to know now:
 
-* A task takes **one** positional parameter, or **two** (`value, ctx`) when it needs the framework context.
-  Three parameters is a configuration error, not a runtime surprise — wrap extra state in a closure.
-* `Runner` is a context manager and closing it closes the store. Reading a **file-backed** store after
-  the `with` block has ended will fail; read inside, or reopen the file later (Step 10). An in-memory
-  store is unaffected.
-* `store=":memory:"` is the default and is perfect for tests; a path gives you a durable SQLite file.
+* A task takes **one** parameter, or **two** (`value, ctx`) when it needs the framework context. Anything else
+  raises `ConfigError` at decoration time. Put extra state in a closure.
+* `Runner` is a context manager, and closing it closes the store. Read a **file-backed** store inside the
+  `with` block, or reopen the file later (Step 10). In-memory stores are unaffected.
+* `store=":memory:"` is the default and is what you want in tests; a path gives you a durable SQLite file.
 
 ---
 
@@ -183,19 +173,17 @@ run run-... status=completed  wall=0.07s
   repeat=2 key=055e9cb3f519
 ```
 
-* `map()` takes **any iterable**, including a generator, and yields `PipelineSpec` objects lazily. The
-  producer/worker queue keeps memory at O(`concurrency`), so a 10-million-row dataset costs the same as
-  a 10-row one.
-* `concurrency=4` means *four attempts in flight*, not four pipelines alive: a pipeline waiting out a
-  retry backoff holds no worker slot (Step 8).
-* 12 × 20 ms of work at concurrency 4 takes ~0.07 s, not 0.24 s — parallelism comes from `asyncio`
-  tasks inside the runner, so your task body must actually await something to overlap.
-* `repeats=3` gives you **pass@k / self-consistency sampling** for free: one seed, three pipelines, three
-  independent checkpoints. `key_of=` lets you supply your own stable ids (e.g. your dataset's primary key)
-  instead of the content-addressed default.
-* `spec.key` (== `pipeline_id`) is derived from *the task chain + the seed content + the repeat index*.
-  Re-running the same dataset therefore produces the same ids — that is what makes resume and sharding
-  possible.
+* `map()` takes **any iterable**, including a generator, and yields lazily. Memory stays at
+  O(`concurrency`), so a 10-million-row dataset costs the same as a 10-row one.
+* `concurrency=4` means four **attempts in flight**, not four pipelines alive — a pipeline waiting out a retry
+  backoff holds no worker slot (Step 8).
+* Your task body must actually `await` something for work to overlap. 12 × 20 ms at concurrency 4 finishes in
+  ~0.07 s; a task that blocks the event loop would take 0.24 s.
+* `repeats=3` is pass@k and self-consistency sampling: one seed, three pipelines, three independent
+  checkpoints. Use `key_of=lambda row: row["qid"]` to supply your own ids instead of the content-addressed
+  default.
+* `spec.key` (the same value as `pipeline_id`) comes from the task chain plus the seed content plus the repeat
+  index, so re-running the same dataset produces the same ids. That is what makes resume and sharding work.
 
 ---
 
@@ -272,23 +260,20 @@ artifacts (the seed, then one per task):
 final artifact: {'answer': "answer to 'why is the sky blue?'", 'question': 'why is the sky blue?', 'score': 2}
 ```
 
-* Type checking uses the **annotations**: a task returning `Question` chains into a task taking `Question`
-  (subclasses are accepted), `Any` or no annotation is permissive, and a bare container accepts its
-  parameterised form (`dict` ← `dict[str, Any]`). Mismatches raise `PipelineBuildError` immediately.
-* `seq` is the task's position in the chain. `seq=-1` is the seed — the dataset row itself is a stored
-  artifact, which matters for resume (Step 9).
-* The final artifact is simply the last task's output; `is_final=True` marks it, and `export` can hand it
-  to you per pipeline.
-* A pipeline is deliberately **linear**. If a step genuinely branches — three judges, k samples, several
-  metrics — keep the branch inside one task with `fanout(...)` (Step 13). Turning pipelines into a DAG is
-  out of scope, and that is what keeps completion and resume this simple.
+* Chain checking uses the **annotations**: a task returning `Question` chains into a task taking `Question`
+  (subclasses are fine), `Any` or no annotation is permissive, and a bare container accepts its parameterised
+  form (`dict` ← `dict[str, Any]`). A mismatch raises `PipelineBuildError` when you build the pipeline.
+* `seq` is a task's position in the chain. `seq=-1` is the seed: the dataset row is itself a stored artifact,
+  which is what lets a resumed run work without the original file (Step 9).
+* The final artifact is the last task's output, marked `is_final=True`.
+* A pipeline is **linear**. When a step genuinely branches — three judges, k samples, several metrics — keep
+  the branch inside one task with `fanout(...)` (Step 13).
 
 ---
 
 ## Step 4 — the checkpoint is the artifact
 
-This is the property the whole design exists for: **every successful task persists its artifact
-immediately**, so the checkpoint granularity is the task.
+Every successful task persists its artifact immediately, so the checkpoint granularity is the task.
 
 ```python
 # tutorial/step_04_checkpoint.py
@@ -370,31 +355,26 @@ changed task source -> new pipeline: True
 old spec_digest: 5808fe46061bad55 new spec_digest: 01b60826ed0465ea
 ```
 
-Four things just happened, in order, for every successful task: the artifact bytes are written, the task
-row is finalised, `n_tasks_done` advances, and only then does the next task start.
+For every successful task, four things happen in order: the artifact bytes are written, the task row is
+finalised, `n_tasks_done` advances, and only then does the next task start.
 
-* **Content addressing.** `seq=-1` and `seq=0` share a digest here because `fetch` returns the seed
-  unchanged — identical payloads are identical bytes. Digests are `blake2b`, and the artifact's identity
-  is `(pipeline_id, seq)`.
+* **Content addressing.** `seq=-1` and `seq=0` share a digest here because `fetch` returns the seed unchanged
+  — identical payloads are identical bytes, so they cost storage once. An artifact's identity is
+  `(pipeline_id, seq)`.
 * **Dataclasses round-trip.** Annotating the return type (`-> Answer`) registers the class, so a restored
-  checkpoint is an `Answer`, not a `dict`. For your own binary types, register a codec (Step 14).
-* **Change the task, get a new pipeline.** The pipeline key includes a digest of each task's *source code*,
-  plus its name, resource and `timeout_s`, plus five fields of its retry policy (`max_attempts`, `base`,
-  `factor`, `cap`, `jitter` — the parts that change how long a step takes, not `on` / `retry_unknown` /
-  `max_total_s`). Editing a task body therefore abandons the old
-  checkpoints instead of silently reusing results produced by different code. Pass `include_code=False` on
-  `pipeline(...)` if you deliberately want code changes to reuse them.
-* **Re-running the same seeds is a no-op.** The second run reports `skipped=2` and total=0: a skipped
-  pipeline is not rewritten, so its row still belongs to the run that actually did the work. Nothing was
-  recomputed and no artifact was touched.
+  checkpoint is an `Answer`, not a `dict`. For binary types, register a codec (Step 14).
+* **Change a task's code, get a new pipeline.** The pipeline key includes a digest of each task's source, so
+  editing a task body abandons the old checkpoints rather than reusing results produced by different code.
+  Pass `include_code=False` to `pipeline(...)` when you want code changes to keep reusing them.
+* **Re-running the same seeds is a no-op.** The second run reports `skipped=2`. A skipped pipeline is not
+  rewritten, so its row still belongs to the run that did the work.
 
 ---
 
 ## Step 5 — endpoints as a pool
 
-A `Resource` is one concrete capability (an endpoint, a key, a local worker). A `Pool` is a group of them
-plus a policy for waiting. Tasks get one through `ctx.acquire(...)`, and the pool is the **only** shared
-surface in the framework.
+A `Resource` is one concrete capability (an endpoint, a key, a local worker). A `Pool` is a group of them plus
+a policy for waiting. Tasks get one through `ctx.acquire(...)`.
 
 ```python
 # tutorial/step_05_pool.py
@@ -468,22 +448,18 @@ pool totals: leases=6 ok=6 waiting=0 utilization=0.0
 usage reported through lease.report(): {'tokens': 81.0}
 ```
 
-* `capacity` belongs to the **resource**, not the pool: `api-a` and `api-b` allow 2 concurrent leases
-  each, `api-c` allows 4, so this pool can have 8 requests in flight. Total pool capacity is the number
-  you compare against `concurrency`.
-* `factory=` is called **once per resource**, lazily, the first time that resource is leased, and every
-  lease then shares the same client object — that is where you put your connection pool / SDK client.
-  If the factory raises, the resource is treated as unusable: the lease is refused with
-  `ResourceUnavailable` (never a lease whose `client` is `None`), the reason is recorded as a
-  `resource.factory_failed` event, and repeated refusals eventually mark the resource `dead`.
-* The selector (`ctx.acquire(model="gpt-4o-mini")`) matches against `options`, `tags`, `id` and `kind`,
-  and supports dot paths into nested options (`"quota.tokens"`). Two models cannot be served by one
-  resource, so the selector is how you route to the right client.
-* `lease.report(...)` is how the pool learns: `ok=False` feeds circuit-breaking, `latency_ms` maintains an
-  EMA, and `usage={"tokens": n}` accumulates quota you can rank on (Step 6). All of it shows up in
-  `pool.stats()` and in the run's resource table.
-* `pool.snapshot()` is a per-resource view, `pool.stats()` the aggregate. Both are safe to call while a
-  run is in flight, which is what the HTTP monitor does (Step 14).
+* `capacity` belongs to the **resource**, not the pool: `api-a` and `api-b` allow 2 concurrent leases each,
+  `api-c` allows 4, so this pool can serve 8 requests at once. Compare that total against `concurrency` —
+  more workers than capacity means workers queueing on the pool.
+* `factory=` is called **once per resource**, lazily, on first lease; every lease of that resource then shares
+  the client object. That is where your SDK client or connection pool goes. If the factory raises, the lease
+  is refused with `ResourceUnavailable` (never a lease whose `client` is `None`), a `resource.factory_failed`
+  event is recorded, and repeated failures eventually mark the resource `dead`.
+* The selector (`ctx.acquire(model="gpt-4o-mini")`) matches on `options`, `tags`, `id` and `kind`, including
+  dot paths into nested options (`"quota.tokens"`). This is how you route to the right client.
+* `lease.report(...)` is how the pool learns anything: `ok=False` feeds circuit-breaking, `latency_ms`
+  maintains an EMA, `usage={"tokens": n}` accumulates quota you can rank on (Step 6).
+* `pool.snapshot()` is the per-resource view, `pool.stats()` the aggregate. Both are safe to call during a run.
 
 > **Gotcha:** with the default `wait` algorithm, a selector that matches **no** resource blocks forever.
 > Either make sure every selector has a resource, or pass `timeout=` / use `algorithm="immediate"` so you
@@ -608,15 +584,14 @@ sticky    : {'first': 'p-sticky-0', 'same': True, 'second': 'p-sticky-0'}
 | `quota_aware` | ranks by remaining *ratio*, then absolute headroom | budget-limited endpoints, `options={"quota": {"tokens": N}}` |
 | `immediate` | raises `ResourceUnavailable` right away | you would rather shed load than queue |
 
-Two details the output makes visible:
+Two things the output makes visible:
 
-* `immediate` failed 3 of 4 pipelines. `ResourceUnavailable` is classified as `unknown`, and the default
-  retry policy does not retry unknown errors — that is intentional, so a capacity mistake is loud. Set
-  `Retrying(max_attempts=3, retry_unknown=True)` if you want capacity retries.
-* `quota_aware` picked `p-quota-1` first (both resources were fresh, so the larger absolute headroom won
-  the tie-break), then `p-quota-0` (still untouched, therefore the better ratio), then back to
-  `p-quota-1` once the 1 000-token resource had been consumed. Quota is a *preference*, never a hard
-  stop: refusing to work is worse than overspending.
+* `immediate` failed 3 of 4 pipelines. `ResourceUnavailable` classifies as `unknown`, and the default retry
+  policy does not retry `unknown`. Set `Retrying(max_attempts=3, retry_unknown=True)` if you want capacity
+  retries.
+* `quota_aware` picked `p-quota-1` first (both fresh, so the larger absolute headroom won the tie-break), then
+  `p-quota-0` (untouched, so the better ratio), then `p-quota-1` again once the 1 000-token resource was
+  spent. Quota is a preference, not a hard stop — for a hard limit, track the budget in your task and raise.
 
 Acquire-time backoff (`backoff`) and retry-time backoff (`Retrying`) are **different knobs**: the first
 decides how long to wait for a slot, the second how long to wait after a failure.
@@ -625,8 +600,7 @@ decides how long to wait for a slot, the second how long to wait after a failure
 
 ## Step 7 — the lease contract
 
-Acquiring and releasing resources is the most critical interaction between your code and the framework, so
-this is where the guarantees are hardest.
+`async with ctx.acquire(...)` returns the resource on every exit path. This step demonstrates each of them.
 
 ```python
 # tutorial/step_07_lease_safety.py
@@ -727,27 +701,22 @@ print("   pool afterwards: active =", pool.stats().active,
 | `await ctx.acquire_lease()` and you forget the release | force-reclaimed when the task ends, `lease.leaked` + `resource.leaked` recorded |
 | still holding a lease after the task returns | impossible — reclamation runs before the task row is written |
 
-The reason it holds: **reclaim is a pure synchronous function**. `ctx.reclaim_now()` and
-`lease.release_now()` contain no `await`, so `CancelledError`, an `asyncio` timeout or any exception
-cannot interrupt them. Pool state transitions are synchronous too, so under a single-threaded event loop
-there is no "checked-then-preempted" window and no lock is needed.
+What to do with that:
 
-Practical consequences:
-
-* Use `async with ctx.acquire(...) as lease:` and hold the lease only around the request. Long holds are
-  legal but they are what starves the pool.
-* A forgotten release is a *bug you are told about*, not a silent capacity loss: `report.leases_leaked`,
-  the two events, and `strict_leases=True` when you want it to fail the task instead.
-* Holding a resource from a pool while asking the same pool for a second one is a deadlock shape; the pool
-  emits `acquire.suspected_deadlock` (after `deadlock_warn_s`, default 5 s) instead of hanging silently.
+* Use `async with ctx.acquire(...) as lease:` and hold the lease only around the request. Long holds are legal,
+  and they are what starves a pool.
+* A forgotten release is reported, not hidden: check `report.leases_leaked`, watch for the `lease.leaked`
+  event, and set `strict_leases=True` in CI so it fails the task instead.
+* Holding a resource from a pool while asking the same pool for a second one is a deadlock shape. The pool
+  emits `acquire.suspected_deadlock` after `deadlock_warn_s` (default 5 s) rather than hanging silently.
   Acquire both up front, or use two pools.
 
 ---
 
 ## Step 8 — failures: classify, retry, record
 
-Failures are ordinary Python exceptions. The framework classifies them with one pure function and then asks
-your policy what to do — and every attempt, including every *decision*, lands in the record.
+Failures are ordinary Python exceptions. The framework classifies them, asks your policy what to do, and
+records every attempt and every decision.
 
 ```python
 # tutorial/step_08_retry.py
@@ -831,36 +800,33 @@ retried pipeline: {'succeeded': 1} | requests made: 3
 fatal pipeline:   {'failed': 1} | attempts used: 1 of max_attempts=5 -> fatal
 ```
 
-Classes: `retryable`, `rate_limit`, `timeout`, `connection`, `upstream` (retried by default),
-`invalid`, `fatal`, `cancelled`, `unknown` (not retried by default). `error_class_of()` recognises
-`TimeoutError`, `ConnectionError`, an `error_class` attribute, and HTTP status codes on
-`status` / `status_code` / `http_status` / `code` (falling back to `exc.response.status_code`;
-408/504 → timeout, 425/429 → rate_limit, 500/502/503/505/507/529 → upstream, any other 4xx → fatal),
-which covers the exception types of the usual
-SDKs without importing them.
+Retried by default: `retryable`, `rate_limit`, `timeout`, `connection`, `upstream`. Not retried by default:
+`invalid`, `fatal`, `cancelled`, `unknown`. Classification reads `TimeoutError`, `ConnectionError`, an
+`error_class` attribute, and HTTP status codes on `status` / `status_code` / `http_status` / `code` (falling
+back to `exc.response.status_code`) — which covers the usual provider SDKs without importing them. The full
+table is in [the reference](reference.md#error-classes).
 
-`Retrying` fields:
+The `Retrying` fields you will reach for most:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `max_attempts` | `1` | total attempts, **so the default is "no retries"** — failures are not hidden |
-| `on` | `()` | extra exception types that count as retryable (your own classes) |
-| `retry_classified` | `True` | retry the classes above |
-| `retry_unknown` | `False` | also retry `unknown` (e.g. `ResourceUnavailable`) |
+| `max_attempts` | `1` | total attempts — **the default is no retries** |
+| `on` | `()` | extra exception types to treat as retryable |
+| `retry_unknown` | `False` | also retry `unknown`, e.g. `ResourceUnavailable` |
 | `base`, `factor`, `cap` | `0.5`, `2.0`, `30.0` | exponential backoff bounds |
-| `jitter` | `"full"` | `none` / `full` / `equal` — full jitter is the safe default for many clients |
-| `max_total_s` | `None` | give up once attempts + delays exceed this budget |
+| `max_total_s` | `None` | give up once attempts plus delays exceed this budget |
 
 Ways to steer it:
 
-* `raise RetryableError("rate limited", error_class="rate_limit", retry_after=0.01)` — carry the class, and
-  honour a server-suggested delay. `retry_after` is also read from a `Retry-After` header if the exception
+* `raise RetryableError("rate limited", error_class="rate_limit", retry_after=0.01)` — carry the class and
+  honour a server-suggested delay. `retry_after` is also read from a `Retry-After` header when the exception
   exposes one.
-* `raise FatalError(...)` — never retried, whatever `max_attempts` says (see the second pipeline above).
-* `with_retry(ask, max_attempts=5)` — adjust one task's policy inside an existing chain.
-* Retry backoff does **not** hold a worker: the pipeline is parked in a delay queue and the worker moves on,
-  so `concurrency` stays honest. The parked pipeline is still counted as unfinished — a run ending during a
-  backoff records it as `interrupted` with its checkpoint intact.
+* `raise FatalError(...)` — never retried, whatever `max_attempts` says.
+* `with_retry(ask, max_attempts=5)` — reuse a task under a different policy.
+
+A retry backoff does not hold a worker: the pipeline is parked and the worker takes other work, so
+`concurrency` stays honest. A run ending during a backoff records the parked pipeline as `interrupted` with its
+checkpoint intact, so `resume` picks it up.
 
 ---
 
@@ -939,39 +905,37 @@ round 2: {'succeeded': 3} | requests sent: {'ask': 3, 'judge': 9} | skipped: 0
   the seed is a stored artifact too: seq=-1 -> dict d6125621c2
 ```
 
-The recovery rules, in order:
+The rules, in the order they are applied:
 
-1. The pipeline already `succeeded` → skip it entirely (`skipped` counter, no task rows rewritten). Unless
-   you pass `retry_succeeded=True` / `--retry-succeeded`, which re-runs it.
-2. The pipeline is `failed` or `interrupted` with `n_tasks_done > 0` → load the artifact at
-   `n_tasks_done - 1` and continue at the next `seq`. **This is why `ask` sent nothing in round 2**: the
-   judge is the first task with no artifact, so only the judge ran.
-3. The artifact row is gone, or its payload was not kept (`journal=summary`) → the pipeline restarts
-   from `seq=0` and records `pipeline.checkpoint_missing`.
-4. The artifact is there but cannot be decoded (a removed codec, a dataclass that changed shape) → the
-   same restart, recorded as `pipeline.checkpoint_unusable` so the two causes stay distinguishable.
-5. Otherwise the pipeline is new, and `Runner` stores the seed artifact before the first task.
+1. The pipeline already `succeeded` → skipped entirely. Pass `retry_succeeded=True` / `--retry-succeeded` to
+   re-run it anyway.
+2. The pipeline is `failed` or `interrupted` with `n_tasks_done > 0` → load the artifact at `n_tasks_done - 1`
+   and continue at the next `seq`. **This is why `ask` sent nothing in round 2**: the judge was the first task
+   with no artifact, so only the judge ran.
+3. The artifact row is gone, or its payload was not kept (`journal=summary`, `null` backend) → the pipeline
+   restarts from `seq=0` and records `pipeline.checkpoint_missing`.
+4. The artifact is there but cannot be decoded (a removed codec, a changed dataclass) → the same restart,
+   recorded as `pipeline.checkpoint_unusable` so the two causes stay distinguishable.
+5. Otherwise the pipeline is new, and the seed artifact is stored before the first task runs.
 
-Two consequences worth internalising:
+Three things to note:
 
-* `skipped=0` in round 2 is correct — nothing had succeeded, three pipelines were *failed* and got
-  resumed. `skipped` counts rule 1, not "work that was not repeated".
-* The dataset stream's only job at resume time is to *identify* the pipelines (the key comes from the seed
-  content); the resumed task's input comes from the store, never from re-reading the row. A run that was
-  interrupted mid-pipeline therefore does not depend on the dataset file still being around, only on the
-  same seeds being enumerated.
-* Every attempt keeps its `run_id`, so the record shows exactly which run did which work — attempt 1 of
-  `judge` belongs to the first run, attempt 1 of the resumed `judge` to the second.
-* Events to alert on: `pipeline.resumed`, `pipeline.skipped`, `pipeline.checkpoint_missing`,
-  `pipeline.checkpoint_unusable`, `pipeline.deferred_interrupted`.
+* `skipped=0` in round 2 is correct: nothing had succeeded, three pipelines were *failed* and got resumed.
+  `skipped` counts rule 1 only, not "work that was not repeated".
+* At resume time the dataset stream only *identifies* pipelines — the resumed task's input comes from the
+  store. A run interrupted mid-pipeline does not need the dataset file to still exist, only the same seeds to
+  be enumerated.
+* Every attempt keeps its `run_id`, so the record shows which run did which work.
+
+Events worth alerting on: `pipeline.resumed`, `pipeline.skipped`, `pipeline.checkpoint_missing`,
+`pipeline.checkpoint_unusable`, `pipeline.deferred_interrupted`.
 
 ---
 
 ## Step 10 — reading the record
 
-Everything the framework knows lives in a handful of tables. Five of them are keyed by `pipeline_id`,
-are the ones you will actually query, and are the five exportable row kinds (`--rows`); `runs` (keyed by
-`run_id`) and `resources` (keyed by pool + resource id) have Python readers but no export path.
+Everything the framework knows lives in a handful of tables. Five are keyed by `pipeline_id` and are the five
+exportable row kinds (`--rows`); `runs` and `resources` have Python readers but no export path.
 
 ```python
 # tutorial/step_10_records.py
@@ -1082,15 +1046,15 @@ reopened: 4 pipelines, 8 attempts, 13 events
 | `events` | event | the structured stream: every task/pipeline/resource transition | `store.events(...)`, `kind="events"` |
 | `artifacts` | artifact | payload, digest, codec, type, `blob_ref` | `store.artifacts(pid)`, `kind="artifacts"` |
 
-* `report.summary()` is for humans, `report.to_dict()` for dashboards, `runner.stats()` for a live view
-  (it is safe to call mid-run), and `store.errors()` for the failure list.
-* `attempts` is the table that answers "why did this take 40 seconds": it has each attempt's duration, its
-  lease log, and the decision (`retry`, `reason`, `delay_s`, `error_class`).
-* Export shapes: `--rows pipelines|tasks|attempts|events|artifacts` × `--format jsonl|json|csv`. `csv`
-  flattens nested values into compact JSON, so it opens cleanly in a spreadsheet.
-* Writes are batched for the append-only tables (attempts, events) and synchronous for state (artifacts,
-  checkpoints): `SIGKILL` can cost you the last batch of history, never a checkpoint. `--no-write-behind`
-  commits every event immediately.
+* `report.summary()` is for humans, `report.to_dict()` for dashboards, `runner.stats()` for a live view (safe
+  mid-run), `store.errors()` for the failure list.
+* `attempts` is the table that answers "why did this take 40 seconds": each attempt's duration, its lease log,
+  and its decision (`retry`, `reason`, `delay_s`, `error_class`).
+* Export shapes: `--rows pipelines|tasks|attempts|events|artifacts` × `--format jsonl|json|csv`. CSV flattens
+  nested values into compact JSON, so it opens cleanly in a spreadsheet.
+* Append-only tables (attempts, events) are written in batches; state (artifacts, checkpoints) is written
+  synchronously. `SIGKILL` can cost the last batch of history, never a checkpoint. `--no-write-behind` commits
+  everything immediately.
 
 ---
 
@@ -1185,24 +1149,24 @@ Config sections:
 
 Details that save time:
 
-* `use:` is resolved by shape, not by one global list: a name containing a colon is
-  `module:attribute` and is imported directly; a bare name is looked up in the built-ins first and then
-  in the installed plugins, so a plugin can never shadow `echo`. `pyattacker.tasks:simulate_llm` and
-  `your_pkg.tasks:ask_model` are both valid (no plugin needed); a factory (a callable returning a
-  `TaskSpec`) is called with `args`/`kwargs`.
-* `${VAR}` and `${VAR:-default}` are expanded in every string *value* of the file (keys are left alone);
-  unresolved names are reported by `validate` and by `describe()["unresolved_env"]`.
-* **YAML 1.1 pitfall:** a bare `on:` key parses as boolean `true`. Write `"on": [RetryableError, TimeoutError]`
-  — the loader detects the mistake and says so.
-* Exit codes: `0` all pipelines succeeded, `1` some failed, `2` config error, `130` interrupted.
+* `use:` is resolved by shape: a name containing a colon is `module:attribute` and is imported directly; a bare
+  name is looked up in the built-ins first and then in installed plugins, so a plugin cannot shadow `echo`.
+  `pyattacker.tasks:simulate_llm` and `your_pkg.tasks:ask_model` are both valid with no plugin. A factory (a
+  callable returning a `TaskSpec`) is called with `args`/`kwargs`.
+* `${VAR}` and `${VAR:-default}` are expanded in every string *value* (keys are left alone). Unresolved names
+  are reported by `validate` and by `describe()["unresolved_env"]`; `--strict-env` makes them an error.
+* **YAML 1.1 pitfall:** a bare `on:` key parses as boolean `true`. Write
+  `"on": [RetryableError, TimeoutError]` — the loader detects the mistake and says so.
+* Exit codes: `0` all succeeded, `1` some failed, `2` config error, `130` interrupted.
+
+Every flag of every command is in [`docs/cli.md`](cli.md).
 
 ---
 
 ## Step 12 — sharding and merging
 
-SQLite takes one writer and the kernel is a single event loop, so scaling out means **processes with their
-own stores**, joined afterwards. A pipeline's shard comes from its content-addressed key, so the same
-dataset always splits the same way.
+Scaling out means several processes with their own stores, joined afterwards. A pipeline's shard comes from its
+content-addressed key, so the same dataset always splits the same way.
 
 ```python
 # tutorial/step_12_shards.py
@@ -1282,15 +1246,14 @@ uv run pyattacker report runs/qa.shard*of4.db
 uv run pyattacker export runs/qa.shard*of4.db runs/all.jsonl
 ```
 
-* `shard_index(key, N) = int(blake2b(key, digest_size=16).hexdigest()[:16], 16) % N` — a real hash, not
-  Python's `hash()` (which is salted per process), so it is stable across runs and machines. `--shard 2/4
-  --resume` therefore puts every pipeline back where it was, and shard sizes are *roughly* equal (6/2/4
-  above is normal for 12 pipelines).
-* Merging de-duplicates by `pipeline_id` and keeps the best state (succeeded > failed > interrupted, then
-  the latest finish), then recomputes the statistics from the merged rows — so a partially-overlapping
-  re-run, or a store accidentally counted twice, still produces one answer.
-* Merge is a library call too: `merge_reports([...])` returns a `MergedReport` with `.summary()`,
-  `.stats()`, `.errors()` and `.export(path, fmt=..., kind=...)`.
+* `shard_index(key, N)` hashes the key with `blake2b` rather than Python's `hash()` (which is salted per
+  process), so the split is stable across runs and machines. `--shard 2/4 --resume` therefore puts every
+  pipeline back where it was. Sizes are *roughly* equal — 6/2/4 for 12 pipelines is normal.
+* Merging de-duplicates by `pipeline_id`, keeps the best state (succeeded > failed > interrupted, then the
+  latest finish), and recomputes statistics from the merged rows. A partially-overlapping re-run, or a store
+  counted twice, still produces one answer.
+* `merge_reports([...])` returns a `MergedReport` with `.summary()`, `.stats()`, `.errors()` and
+  `.export(path, fmt=..., kind=...)`.
 
 ---
 
@@ -1446,33 +1409,31 @@ final artifact: {'n_models': 3, 'qid': 'q1',
 the grouped shape re-sent verdicts that were already persisted: 4 of 6 requests in round 2
 ```
 
-What each piece demonstrates:
+What each piece does:
 
-* **`ask` makes two requests inside one task.** The task model is unary, so a multi-turn conversation, a
-  tool loop or a "retry the parse until it validates" loop all belong *inside* one task. The checkpoint
-  grain then matches your mental model: one step, one artifact.
-* **`fanout(...)` keeps the branch inside a task.** Three judges run concurrently on the same input and
-  return `{task_name: value}`. Children share the parent's context, so their leases and events stay in one
-  coherent record. The Runner only ever sees the *group* spec, so the fan-out lifts what the children agree
-  on (`resource`, `algorithm`, `timeout_s`, and the most forgiving retry policy) onto it — here that is the
-  `judges` pool and `least_busy`, and it is why the declaration has to be identical on all three children.
+* **`ask` makes two requests inside one task.** A multi-turn conversation, a tool loop, or a "retry the parse
+  until it validates" loop all belong inside one task. One step, one artifact.
+* **`fanout(...)` keeps the branch inside a task.** Three judges run concurrently on the same input and return
+  `{task_name: value}`. Children share the parent's context, so their leases and events land in one record. The
+  Runner only sees the group spec, so `resource`, `algorithm` and `timeout_s` are lifted from the children only
+  when all of them agree — which is why the three judges declare the same pool and algorithm.
 * **Pools per role.** `models` has one resource with capacity 4; `judges` has one resource per model with
   capacity 1, so the three branches never queue behind each other.
-* **The outage is data.** `judge-b`'s `RetryableError(error_class="upstream")` is classified, retried by
-  the group's policy, and ends as a recorded failure with the failed task named — not as a stack trace in
-  a log file.
-* **The resume is honest about its cost.** Round 2 re-ran the *whole* judges group, so `judge-a` and
-  `judge-c` were sent again even though their verdicts were already on disk. Four of the six requests in
-  round 2 were repeats. That is the price of putting three requests in one checkpoint.
+* **The outage becomes data.** `judge-b`'s `RetryableError(error_class="upstream")` is classified, retried by
+  the group's policy, and recorded as a failure with the failing task named.
+* **The resume shows its cost.** Round 2 re-ran the whole judges group, so `judge-a` and `judge-c` were sent
+  again even though their verdicts were on disk — four of six requests were repeats.
 
-The alternative shape — C1 → C2 → C3 as three tasks instead of one fan-out — makes the checkpoint finer:
-the same failure resumes at C2, re-sends nothing that succeeded, and costs two extra pipeline steps.
-[`examples/llm_eval/`](../examples/llm_eval/README.md) implements both shapes over the same tasks and
-measures them: with one judge endpoint down, the grouped shape re-sent 2 judge requests that had already
-succeeded, and the split shape re-sent 0. The rule of thumb that falls out of it:
+That last point is the choice you have to make when a step branches:
 
-> If a request is expensive or slow, give it its own task. If a step is a fan-out of cheap calls, one task
-> and one checkpoint is the better trade.
+> If a request is expensive or slow, give it its own task. If a step fans out over cheap calls, one task and
+> one checkpoint is the better trade.
+
+Three judges as three tasks (`C1 | C2 | C3`) makes the checkpoint finer: the same failure resumes at `C2` and
+re-sends nothing that succeeded, at the cost of two extra pipeline steps.
+[`examples/llm_eval/`](../examples/llm_eval/README.md) implements both shapes over the same tasks and measures
+them — with one judge endpoint down, the grouped shape re-sent 2 already-successful requests and the split
+shape re-sent 0.
 
 ---
 
@@ -1578,20 +1539,24 @@ blobs on disk: 3 files, [11, 27, 1536] bytes
 ```
 
 * **Codecs** need four members: `name`, `can_encode(obj)`, `dumps(obj) -> bytes`, `loads(bytes) -> obj`.
-  Register with `registry.register(codec, for_types=(MyType,))`, and pass the *same* registry to
-  `pipeline(..., registry=...)` (seeds) and to `Runner(registry=...)` (artifacts). Later registrations win,
-  so a specialised codec always beats the built-in JSON catch-all.
-* **Artifact backends** decide where payloads live: `None`/`"inline"` (in the database), `"null"` (drop
-  bytes, keep digests), or `"file:///data/blobs"` / `{"kind": "file", "root": ..., "min_bytes": 262144}`.
-  Files are content-addressed, written atomically and re-hydrated on read, so a resumed run reuses spilled
-  checkpoints transparently. In the example `min_bytes=0` spills everything, which is why the artifact row
-  above shows a reference instead of bytes.
-* **Plugins** are ordinary `importlib.metadata` entry points — install a package and its names become
-  usable from any config: `pyattacker.tasks`, `pyattacker.algorithms`, `pyattacker.codecs`,
-  `pyattacker.stores` (keyed by URI scheme, so `store = "s3://bucket/runs.db"` works). Built-ins resolve
-  first, and a plugin that raises on import is *recorded* rather than fatal —
-  `pyattacker plugins` shows both. A complete worked package is
+  Register with `registry.register(codec, for_types=(MyType,))` and pass the *same* registry to
+  `pipeline(..., registry=...)` for seeds and to `Runner(registry=...)` for artifacts. A codec that claims a
+  payload beats the built-in JSON catch-all.
+* **Artifact backends** decide where payload bytes live: `None`/`"inline"` keeps them in the database, `"null"`
+  drops them and keeps digests, `"file:///data/blobs"` (or
+  `{"kind": "file", "root": ..., "min_bytes": 262144}`) spills to content-addressed files that are hydrated
+  back on read. `min_bytes=0` above spills everything, which is why the artifact row shows a reference instead
+  of bytes.
+* **Plugins** are `importlib.metadata` entry points in four groups: `pyattacker.tasks`,
+  `pyattacker.algorithms`, `pyattacker.codecs`, and `pyattacker.stores` (keyed by URI scheme, so
+  `store = "s3://bucket/runs.db"` works). Built-ins resolve first, and a plugin that raises on import is
+  recorded rather than fatal — `pyattacker plugins` shows both. A complete worked package is
   [`examples/plugin_package/`](../examples/plugin_package/README.md).
+
+**Monitoring a run in progress.** `pyattacker watch runs/qa.db` gives you a terminal view from a second
+process, and `pyattacker serve runs/qa.db` an HTTP dashboard plus JSON at `/stats`, `/events`, `/pipelines`,
+`/resources` and `/errors`. Both open read-only connections, so they are safe beside a live run. The HTTP
+endpoint has no authentication and serves your payloads — keep it on loopback.
 * **Monitoring**: `pyattacker serve runs/qa.db` is a zero-dependency read-only HTTP view (`/`,
   `/stats`, `/events`, `/pipelines`, `/resources`, `/errors`) that opens a fresh connection per request,
   so it runs happily beside a live run. It binds to loopback and has no authentication — treat it as a
@@ -1620,11 +1585,7 @@ blobs on disk: 3 files, [11, 27, 1536] bytes
 | branch inside a step | `fanout(task_a, task_b)` |
 | make my code usable from YAML | no plugin: `use: my_pkg.tasks:my_task`; with an entry point in `pyattacker.tasks`: `use: my_task` |
 
-The six invariants everything else is built on — pipelines share nothing but the resource pools; a task is
-a unary `(artifact) -> artifact` with no branching or joining; artifacts are persisted as soon as they are
-produced; failure is an exception, not a state machine; a resource is only usable through a lease that must
-be returned; the store writes facts, never metrics — are stated and justified in
-[`docs/design.md`](design.md) §2.
+Every class and function, with signatures and parameter tables: [`docs/reference.md`](reference.md).
 
 ## Troubleshooting
 
@@ -1664,13 +1625,14 @@ parked right now.
 
 ## Where to look next
 
-Looking for a specific feature rather than a whole document? See
-[Look up by feature, not just by step](#look-up-by-feature-not-just-by-step) near the top.
+Looking for a specific feature rather than a whole document? See [Find what you need](#find-what-you-need)
+near the top.
 
 | Resource | What is in it |
 |---|---|
+| [`docs/reference.md`](reference.md) | every public class and function: signatures, parameters, examples |
 | [`docs/cli.md`](cli.md) | every subcommand and flag, exit codes, the config file reference |
-| [`docs/design.md`](design.md) | conceptual model, six invariants, lease contract, data model, tradeoffs, milestones |
+| [`docs/design.md`](design.md) | conceptual model, six invariants, lease contract, data model, tradeoffs |
 | [`README.md`](../README.md) | the compact tour: scheduling guarantees, sharding, plugins, out of scope |
 | [`examples/quickstart.py`](../examples/quickstart.py) | the SDK in 60 lines, with a resume round |
 | [`examples/llm_eval/`](../examples/llm_eval/README.md) | the full evaluation, two pipeline shapes, measured checkpoint granularity |

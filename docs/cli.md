@@ -198,5 +198,6 @@ Anything it cannot express is a reason to use the SDK, not a reason to add YAML 
 ## See also
 
 * [`docs/tutorial.md`](tutorial.md) — the guided path, with runnable programs
+* [`docs/reference.md`](reference.md) — every class and function the SDK exposes
 * [`docs/design.md`](design.md) — why the CLI has these commands and no others
 * [`README.md`](../README.md) — the compact tour
