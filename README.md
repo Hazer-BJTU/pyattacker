@@ -1,4 +1,4 @@
-# pyattacker
+# <img src="https://raw.githubusercontent.com/Hazer-BJTU/pyattacker/main/assets/logo/icon.png" width="34" alt=""> pyattacker
 
 [![PyPI](https://img.shields.io/pypi/v/pyattacker)](https://pypi.org/project/pyattacker/)
 [![CI](https://github.com/Hazer-BJTU/pyattacker/actions/workflows/ci.yml/badge.svg)](https://github.com/Hazer-BJTU/pyattacker/actions/workflows/ci.yml)
@@ -382,12 +382,34 @@ every known tradeoff with its reason.
 
 ## Status
 
-**0.1.1 — documentation and release tooling.** The library is unchanged from **0.1.0**, the first release,
-which implemented everything planned for it (M0–M4: the kernel, persistence and
-task-level recovery, retries and error classification, the resource pool with 7 acquisition algorithms,
+**0.2.0 — a benchmark, stricter identity, and three correctness fixes.** New: `pyattacker bench`, a
+simulated provider world that compares the acquire algorithms on a vector of metrics instead of a weighted
+score ([`docs/benchmark.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/benchmark.md));
+`Retrying.decide`, the retry decision as a method on the policy; and paged whole-kind reads
+(`pyattacker.store.iter_*`, backed by the optional `PagedStore` extension) so exporting a large store no
+longer materialises it. 0.1.x itself had implemented everything planned for M0–M4: the kernel, persistence
+and task-level recovery, retries and error classification, the resource pool with 7 acquisition algorithms,
 delayed continuations and write-behind batching, sharding and merged reports, five export shapes in three
 formats, entry-point plugins, external artifact backends, the fan-out helper, and the HTTP monitoring
-endpoint). The API is young: it follows semantic versioning from here, but expect refinement before 1.0.
+endpoint.
+
+Three changes are worth reading before upgrading. **PyYAML is no longer a dependency** — the base install
+has none at all, so a `.yaml`/`.yml` config needs `pip install "pyattacker[yaml]"`. **`with_overrides`
+distinguishes "not given" from `None`**: an omitted keyword keeps the value, an explicit `None` now clears
+`resource`/`algorithm`/`timeout_s`/`version`, and the new `UNSET` sentinel means "not given" when a caller
+forwards a dict. **One shared validation entry** now backs `validate` and every `run` mode, so a config it
+accepts is one that can run: unknown fields, wrong types, bad pool references, malformed artifact backends
+and typos fail with exit 2 and a field path before anything starts. Export `limit` also means one thing per
+row kind now, and `None` means complete.
+
+Fixed since 0.1.1: `shell_run` leaked its child when the task was cancelled and killed without reaping on
+timeout — every exit path, process creation included, now kills and reaps, and on POSIX it signals the whole
+process group; exporting events silently stopped at the newest 100 000 rows; the declarative `run:` block
+dropped `artifact_backend`, write-behind and the batch knobs, `--no-write-behind` was never applied in a
+single process, and `--artifact-backend` never reached shard children; resume now rejects a pipeline key
+whose task or seed digest changed instead of quietly reusing a stale result; and the benchmark collected a
+list of its own fixes (see the changelog). The API is young: it follows semantic versioning from here, but
+expect refinement before 1.0.
 
 Left for later: a distributed scheduler, Parquet export, blob garbage collection, and first-class
 `Parallel`/`Gather` nodes.

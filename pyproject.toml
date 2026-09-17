@@ -1,6 +1,6 @@
 [project]
 name = "pyattacker"
-version = "0.1.1"
+version = "0.2.0"
 description = "Artifact-centric, resumable async task orchestration: pipeline / task / resource pool."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -77,6 +77,7 @@ include = [
     "src/pyattacker",
     "tests",
     "docs",
+    "assets",
     "examples",
     "README.md",
     "CHANGELOG.md",
