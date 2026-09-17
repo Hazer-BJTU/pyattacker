@@ -54,9 +54,9 @@ the scenario tests assert (`tests/test_benchmark_scenario.py::test_the_base_scen
 | The world's mood is a function of time, not of the caller: capacity is arithmetic in `t`, and `storm_until(endpoint, t)` is a pure function of `(seed, endpoint, t)` — a storm runs from its time window's start, so the weather does not depend on when requests arrive | `provider.py` (`capacity_at`, `storm_until`, `_storm_window`) | `tests/test_benchmark_provider.py::test_storm_state_does_not_depend_on_request_cadence` compares two *different* traffic schedules at the same timestamps, and `::test_the_storm_interval_is_anchored_to_its_window` pins the anchoring |
 | Common random numbers: latency and failure rolls come from `random.Random(f"{seed}:{endpoint}:{ordinal}")`, indexed by the request's ordinal *at that endpoint*. Two algorithms therefore share the same **exogenous** randomness — the same dice and the same weather — though not the same realized provider state, which diverges because the bucket and the in-flight count react to what each of them did | `provider.py` (`perform`) | `tests/test_benchmark_provider.py::test_each_request_sees_the_world_by_its_ordinal_whatever_the_timing`; `tests/test_benchmark_harness.py::test_two_algorithms_see_the_same_exogenous_draws` compares every ordinal both reached and refuses to pass on fewer than 20 shared requests |
 | Client-side randomness follows the logical identity, not the worker: the acquire algorithm and the retry policy each draw from `Random(f"{seed}:{{acquire,retry}}:{job}:{step}:{attempt}")` | `harness.py` (`acquire_stream`, `retry_stream`) | `tests/test_benchmark_harness.py::test_client_randomness_follows_the_logical_identity_not_the_worker` |
-| An algorithm that completes almost nothing cannot be crowned on a conditional metric; the excluded ones are named in the table and the JSON | `report.py` (`COMPLETION_FLOOR`, `excluded_by_completion`) | `tests/test_benchmark_report.py::test_a_conditional_metric_cannot_crown_an_algorithm_that_completed_almost_nothing` |
 | A scenario declares the algorithms it cannot exercise, and they are not ranked on numbers that cannot mean anything | `scenario.py` (`Scenario.unsuited`), `report.py` (`default_algorithms`, `winners`) | `tests/test_benchmark_harness.py::test_a_scenario_declares_which_algorithms_it_cannot_exercise`, `::test_an_algorithm_the_scenario_cannot_exercise_is_marked_not_ranked` |
-| A wait that only a cooldown can end is a real timer on the pool's clock, so simulated time reaches it and the waiters are woken | `resource.py` (`_ensure_cooldown_notifier`) | `tests/test_lease_safety.py::test_a_wait_that_only_a_cooldown_can_end_actually_ends` (a kernel regression test: it times out without the fix), `tests/test_benchmark_harness.py::test_a_wait_that_only_a_cooldown_can_end_advances_simulated_time` |
+| A wait that only a cooldown can end is a real timer on the pool's clock, so simulated time reaches it and the waiters are woken — and the *earliest* pending deadline owns that timer | `resource.py` (`_ensure_cooldown_notifier`, `_cooldown_deadline`) | `tests/test_lease_safety.py::test_a_wait_that_only_a_cooldown_can_end_actually_ends` and `::test_a_cooldown_that_ends_earlier_than_the_armed_one_replaces_it` (kernel regression tests: both time out or wake late without the fix), `tests/test_benchmark_harness.py::test_a_wait_that_only_a_cooldown_can_end_advances_simulated_time` |
+| An algorithm that completes almost nothing cannot be crowned on a conditional metric; the excluded ones are named in the table and the JSON, the baseline ignores algorithms the scenario declares unsuited, and a row with a single eligible contestant has no winner at all | `report.py` (`COMPLETION_FLOOR`, `excluded_by_completion`, `comparable`, `unrivaled`, `winners`) | `tests/test_benchmark_report.py::test_a_conditional_metric_cannot_crown_an_algorithm_that_completed_almost_nothing`, `::test_the_completion_baseline_ignores_an_algorithm_the_scenario_cannot_exercise`, `::test_one_eligible_contestant_is_not_crowned` |
 | Nothing hands the algorithm a reference to the environment: the harness builds a `Pool` and a `TaskContext` and nothing else, `SimulatedProvider` is private to it, and `capacity_at()` is public only so the metrics can integrate the capacity on offer | `harness.py` (`_context`, `_call_sequence`) | `tests/test_benchmark_harness.py::test_the_algorithm_is_handed_the_pool_but_never_the_environment` walks everything a spy algorithm is given and fails if the scenario or the provider is reachable |
 | The same seed reproduces the numbers exactly (every metric except `wall_s`) | `scenario.seed` -> `Harness.seed` -> per-run streams | `tests/test_benchmark_harness.py::test_the_same_seed_and_scenario_reproduce_the_same_numbers` |
 | No sockets, and nothing in the package can reach the network | stdlib-only imports | `tests/test_benchmark_harness.py::test_the_benchmark_opens_no_network_connections`; `::test_the_benchmark_package_imports_nothing_that_can_reach_the_network` |
@@ -92,15 +92,17 @@ rather than as a hang. On `bursty_provider` with `jobs=120, concurrency=6, horiz
 | metric | `VirtualClock` | `ScaledClock(speedup=10.0)` |
 |---|---|---|
 | `jobs_done` | 120.0 | 120.0 |
-| `makespan_s` | 81.819 | 82.293 |
+| `makespan_s` | 80.253 | 81.916 |
 | `refusal_rate` | 0.000 | 0.000 |
-| `error_rate` | 0.028 | 0.028 |
-| `utilization` | 0.308 | 0.311 |
-| `throughput_rps` | 1.467 | 1.458 |
+| `error_rate` | 0.029 | 0.029 |
+| `utilization` | 0.316 | 0.310 |
+| `throughput_rps` | 1.495 | 1.465 |
 
-Agreement is within 0.6% on makespan and 1% on utilisation, for 8.4s of wall clock for the pair. This
-confirms time-keeping and throughput, not the refusal path: in this small world demand never saturates
-capacity and both clocks report zero refusals.
+Agreement is within 2% on makespan and 2% on utilisation, for 8.3s of wall clock for the pair.
+`throughput_rps` is `jobs_done / makespan_s` on each clock, so the two agreeing on throughput is the
+same statement as their agreeing on makespan — not a third, independent measurement. This confirms
+time-keeping and throughput, not the refusal path: in this small world demand never saturates capacity
+and both clocks report zero refusals.
 
 **A wait the clock could otherwise miss.** A degraded resource recovers *lazily* — the cooldown expires
 when somebody asks `state_at(now)` — and that expiry emits no event of its own. A pool whose every
@@ -109,10 +111,15 @@ waiters park on the broadcast, and the deadline they are actually waiting for pa
 simulated clock that is a hang (reproduced: `timers=0`, twelve waiters parked, simulated time frozen);
 in real time it is a starvation bug that resolves only when unrelated activity happens to notify the
 pool. `Pool` now arms one task per pool, only while somebody is waiting, that sleeps on the pool's clock
-until the earliest *future* cooldown on a DEGRADED slot and then broadcasts. Two details matter and both
-were bugs first: a slot whose cooldown has already expired must not arm a zero-delay timer (that is a
-livelock that advances no simulated time at all), and DEAD or REVOKED slots must be ignored (they never
-come back, and their stale `blocked_until` would keep re-arming).
+until the earliest *future* cooldown on a DEGRADED slot and then broadcasts. Three details matter and all
+three were bugs first: a slot whose cooldown has already expired must not arm a zero-delay timer (that is
+a livelock that advances no simulated time at all); DEAD or REVOKED slots must be ignored (they never
+come back, and their stale `blocked_until` would keep re-arming); and the armed *deadline*, not just the
+armed task, has to be tracked, because a cooldown that starts later can still end earlier — B breaking at
+t=5 with a 5s cooldown while A's 30s notifier is already sleeping. Keeping the old timer wakes the waiters
+at t=30 instead of t=10, twenty simulated seconds after the resource they were waiting for came back
+(`tests/test_lease_safety.py::test_a_cooldown_that_ends_earlier_than_the_armed_one_replaces_it` pins both
+numbers with `VirtualClock`).
 
 **A world with nothing left to lease.** If every endpoint ends up DEAD or REVOKED — the framework retires
 one for good after `dead_after` consecutive failures — no lease can ever be handed out again, so the
@@ -135,13 +142,15 @@ and `bench --list`; a test asserts the harness emits exactly that set
 | Metric | Unit | Better | Meaning |
 |---|---|---|---|
 | `jobs_done` | jobs | higher | Jobs that finished successfully before the horizon |
-| `jobs_failed` | jobs | lower | Jobs that gave up: a step exhausted its retry budget |
-| `jobs_unstarted` | jobs | lower | Jobs the workers never began because the horizon arrived first |
-| `makespan_s` | s | neutral | Simulated seconds until the last job finished or gave up; read it next to `jobs_done` |
-| `throughput_rps` | jobs/s | higher * | Completed jobs per simulated second of the scenario's budget — a fixed denominator, so abandoning work quickly cannot inflate it |
+| `jobs_failed` | jobs | neutral | Jobs that gave up: a step exhausted its retry budget. Diagnostic: an algorithm can shrink it by never starting the jobs it would have failed |
+| `jobs_unstarted` | jobs | neutral | Jobs the workers never began because the horizon arrived first. Diagnostic: an algorithm can shrink it by starting everything and failing it |
+| `makespan_s` | s | neutral | Simulated seconds until the last worker stopped (the horizon, plus a step still in flight); read it next to `jobs_done` |
+| `throughput_rps` | jobs/s | higher * | Completed jobs per simulated second of the run's *own* makespan — the observed rate, not the budget's capacity |
 | `requests` | requests | neutral | Requests sent, including refusals and retries |
-| `attempts_per_job` | attempts | lower * | Step attempts per *completed* job (1.0 = no retries) |
-| `retry_rate` | ratio | lower | Failed step attempts as a fraction of all step attempts |
+| `attempts_per_completed_job` | attempts | lower * | Step attempts spent per completed job. The zero-retry baseline is `steps_per_job`, not 1.0, and attempts spent on jobs that later failed are in the numerator only |
+| `attempt_inflation` | ratio | lower * | Step attempts per *attempted* step (1.0 = every attempted step succeeded on its first try): retry pressure without the volume |
+| `failed_attempt_rate` | ratio | lower | Failed step attempts as a fraction of all step attempts, including the ones the policy then abandoned |
+| `retry_rate` | ratio | lower * | Retries the policy actually scheduled, per step attempt. `failed_attempt_rate` minus this is the share of failures given up on |
 | `refusal_rate` | ratio | lower | Requests refused by the provider (429) per request sent |
 | `error_rate` | ratio | lower | Requests that failed with an error per request sent |
 | `successful_job_latency_p50_ms` | ms | lower * | Median time of a job that *succeeded*, retries included; conditional by name |
@@ -159,7 +168,19 @@ and `bench --list`; a test asserts the harness emits exactly that set
 completed, so an algorithm that gave up on most of the workload is excluded from the row — and named, with
 its completion ratio, in the `best` column and in `excluded_by_completion` in the JSON. Without that gate
 the first version of this table crowned a strategy that finished 7.7 of 3000 jobs on two latency rows and
-on throughput, because failing fast is quick and leaves few slow jobs behind.
+on throughput, because failing fast is quick and leaves few slow jobs behind. The gate is what makes the
+honest throughput denominator (`jobs_done / makespan_s`) safe, and it is applied to the attempt metrics
+for the same reason: an algorithm that attempts three easy steps and abandons the queue reads 1.0 on
+`attempt_inflation` and 0.0 on `retry_rate` — both vacuous, both excluded.
+
+`attempts_per_completed_job` and `attempt_inflation` answer different questions and the difference is the
+point: the first is what finishing cost (it grows when attempts are wasted on jobs that later fail), the
+second is how often an attempt had to be repeated (it does not grow with volume, so it compares retry
+pressure across algorithms that did different amounts of work). A benchmark whose retry policy were part
+of the comparison would want the second; one asking "what does a completed job cost me" wants the first.
+`failed_attempt_rate` and `retry_rate` split the other way: the first counts every failed attempt, the
+second only the failures that led to another attempt, so their difference is the share of failures the
+policy judged hopeless.
 
 **A vector, not a composite.** Folding throughput, p99 latency and "how much you annoyed the provider"
 into one weighted number would hide the weights — which are the actual opinion — inside an arithmetic
@@ -170,22 +191,33 @@ that the winner of one row is often the loser of another.
 whose gap is not distinguishable from noise. Two guards, whichever is wider:
 
 * `TIE_TOLERANCE = 0.01` in relative terms — at three seeds, a 1% gap is not evidence of anything; and
-* `SIGNIFICANCE_K = 2.0` standard errors of the difference between the two means, estimated from the
-  seeds actually run (`sd_leader^2/n + sd_challenger^2/n`, with n the number of seeds).
+* `SIGNIFICANCE_K = 2.0` standard errors of the **paired per-seed difference** `d_i = metric(challenger,
+  seed_i) - metric(leader, seed_i)`, estimated as `stdev(d) / sqrt(n)` over the seeds both algorithms ran.
 
 The second guard is what stops the report from crowning a 1.3% win on a metric that moves 4% between
-seeds, and it is a **paired** test: every algorithm runs every seed, so what is compared is the per-seed
-difference `d_i = metric(challenger, seed_i) - metric(leader, seed_i)`, whose spread is small exactly
-when common random numbers worked. Using the independent-samples form instead would throw away the
+seeds, and it is **paired** because every algorithm runs every seed: the seed-to-seed noise the two
+algorithms share cancels, so what is tested is the difference, which is small exactly when common random
+numbers worked. The independent-samples form `sd_leader^2/n + sd_challenger^2/n` would throw away the
 strongest property of the design — and it did, until the review pointed it out. Each challenger is
 compared against the leader rather than against the growing group, which keeps the rule one line long and
 its meaning obvious. `SIGNIFICANCE_K = 2.0` is a **heuristic**, deliberately not described as 95%: with
 three seeds the Student-t critical value is 4.3, and claiming significance at 2.0 would assert more than
-the experiment supports. With a single seed there is nothing to test against, so the top scorer is crowned
-— one seed is not a comparison, and the `±` column is what says so. A row is unmarked when its direction
-is `neutral` (`makespan_s`, `requests`, `request_latency_p50_ms`, `wall_s`, `endpoint_spread`), when an
-algorithm the scenario declares unsuited is the only leader, or when every algorithm scores zero on it
-(`tests/test_benchmark_report.py::test_a_metric_that_is_zero_for_everyone_crowns_nobody`).
+the experiment supports.
+
+Three ways a row ends up unmarked, besides the direction being `neutral` (`makespan_s`, `jobs_failed`,
+`jobs_unstarted`, `requests`, `request_latency_p50_ms`, `wall_s`, `endpoint_spread`):
+
+* **fewer than two eligible contestants.** A star is a comparative statement, and one algorithm is not a
+  comparison — either because only one ran, or because the completion gate left only one. In the second
+  case the report names the survivor (`not_compared` in the JSON, `only X was eligible` in the markdown),
+  since silence there would read as "nobody did well";
+* **every algorithm scores zero** on it (`tests/test_benchmark_report.py::test_a_metric_that_is_zero_for_everyone_crowns_nobody`);
+* it was asked for by name although the scenario declares it unsuited, which leaves N/A in the column and
+  the algorithm out of the ranking entirely.
+
+With a single seed there is no spread to test against, so the best mean wins among the algorithms that
+ran — one *seed* is a weak comparison, which is what the missing `±` says. One *algorithm* is a different
+matter, and is never crowned.
 
 **Seeds** —
 `run_benchmark` derives its seed list from `scenario.seed` (`seed + 0 .. seeds - 1`), runs each algorithm
@@ -204,7 +236,7 @@ The worked example whose numbers section 8 quotes is `uv run pyattacker bench --
 /tmp/bench-full.md`: the five algorithms this scenario is suited to, x 3 seeds = 15 runs of 3000 jobs x 3
 steps x 2 calls on 12 workers, in **12-13 seconds of wall clock** on a laptop-class machine (the spread
 between runs is the machine; the simulation itself is deterministic). `--algorithms` with all seven costs
-about a third more, and marks the two unsuited columns N/A. A fast check of two
+about half again as much (18.0s measured) and marks the two unsuited columns N/A. A fast check of two
 algorithms on a smaller world (`--algorithms wait,immediate --seeds 1 --jobs 200 --concurrency 4
 --horizon 60`) costs about 0.13s.
 
@@ -230,67 +262,103 @@ returns a copy and leaves `SCENARIOS` alone, and a scenario can be built by hand
 prints it) and endpoints. A scenario with several endpoints is still **one** `Pool` in the harness, so
 it cannot yet exercise `failover` across vendors (section 9).
 
-**Staying inside the budget.** The defaults are nowhere near the 10-minute limit: the whole 21-run sweep
-measured 15.2s, and per-run cost ranged from 0.06s (`immediate`) to 1.09s (`failover`). The knobs are
-`--jobs` and `--seeds` (they scale the work directly), then `--horizon`, then `--concurrency` (which
-changes the world, not just the cost); `--wall-budget` is the guard, not the tuning knob.
+**Staying inside the budget.** The defaults are nowhere near the 10-minute limit: the whole 15-run sweep
+measured 12.3s (18.0s with all seven algorithms), and per-run cost ranged from 0.09s (`immediate`) to
+1.37s (`quota_aware`, which is the only one that varies much between seeds). The knobs are `--jobs` and
+`--seeds` (they scale the work directly), then `--horizon`, then `--concurrency` (which changes the world,
+not just the cost); `--wall-budget` is the guard, not the tuning knob.
 
-**`BenchmarkTimeout`.** `Harness.run` wraps the simulation in `asyncio.wait_for(..., wall_budget)` and
-raises rather than returning partial metrics — a run that cannot finish says so. If simulated time
-advanced, the message reports the seconds and jobs done and suggests a cheaper run; if it never advanced
-it says the run is "stalled, not slow" (workers parked, timers pending, something waiting for an event
-that cannot happen), with the worker, parked and pending counts. Both are covered by
-`tests/test_benchmark_harness.py::test_the_wall_budget_is_real_time_and_reported_as_a_failure_not_a_result`
-and `::test_a_stalled_simulation_says_so_instead_of_timing_out_silently`.
+**`BenchmarkTimeout`.** `Harness.run` starts the workers and a supervisor and waits for whichever finishes
+first under a real-time `asyncio.wait(..., timeout=wall_budget)`, then cancels both and raises rather than
+returning partial metrics — a run that cannot finish says so. If simulated time advanced, the message
+reports the seconds and jobs done and suggests a cheaper run; if it never advanced it says the run is
+"stalled, not slow" (workers parked, timers pending, something waiting for an event that cannot happen),
+with the worker, parked and pending counts. The supervisor is what turns the other hopeless case — every
+endpoint permanently DEAD or REVOKED, so no lease can ever be handed out again — into `BenchmarkStalled`
+within 50ms of wall clock instead of a budget-shaped timeout. All three are covered by
+`tests/test_benchmark_harness.py::test_the_wall_budget_is_real_time_and_reported_as_a_failure_not_a_result`,
+`::test_a_stalled_simulation_says_so_instead_of_timing_out_silently` and
+`::test_a_world_with_no_lease_left_is_reported_in_a_second_not_a_budget`.
 
 ## 8. What the current data says
 
 The 3-seed means from the sweep above (seeds 20260917, 20260918, 20260919), after the review fixes:
 `--markdown` writes the full table with `min`/`max`/`stdev` and per-endpoint admissions, and `--json`
-carries the winners and the exclusions.
+carries the winners and the exclusions. In the `best` column, `—` means the row separates nobody and `*`
+marks a conditional row.
 
-| Metric | `immediate` | `wait` | `backoff` | `sticky` | `quota_aware` |
-|---|---|---|---|---|---|
-| `jobs_done` | 7.00 | 1,348.67 | 1,361.67 | 1,404.00 | 843.67 |
-| `throughput_rps` | 0.0117 | 2.2478 | 2.2694 | 2.3400 | 1.4061 |
-| `refusal_rate` | 0.3387 | 0.2600 | 0.2484 | 0.2573 | 0.4760 |
-| `error_rate` | 0.0191 | 0.0244 | 0.0254 | 0.0223 | 0.0218 |
-| `successful_job_latency_p95_ms` | 7,755.55 | 9,603.35 | 9,456.53 | 9,288.31 | 9,910.48 |
-| `utilization` | 0.4928 | 0.6313 | 0.6384 | 0.6351 | 0.5026 |
-| `endpoint_spread` | 0.6538 | 0.5707 | 0.5640 | 0.5759 | 0.9368 |
+| Metric | `immediate` | `wait` | `backoff` | `sticky` | `quota_aware` | best |
+|---|---|---|---|---|---|---|
+| `jobs_done` | 7.00 | 1,348.67 | 1,361.67 | 1,404.00 | 843.67 | `sticky`, `backoff` |
+| `jobs_failed` | 2,993.00 | 547.00 | 508.00 | 545.67 | 1,088.67 | — |
+| `jobs_unstarted` | 0.00 | 1,104.33 | 1,130.33 | 1,050.33 | 1,067.67 | — |
+| `makespan_s` | 8.25 | 606.45 | 606.57 | 606.05 | 610.83 | — |
+| `throughput_rps` | 0.8910 | 2.2241 | 2.2449 | 2.3167 | 1.3809 | `sticky`, `backoff` * |
+| `attempts_per_completed_job` | 459.65 | 5.69 | 5.57 | 5.55 | 10.80 | `sticky`, `backoff` * |
+| `attempt_inflation` | 1.0077 | 1.6160 | 1.5947 | 1.5899 | 2.3396 | `sticky`, `backoff` * |
+| `failed_attempt_rate` | 0.9930 | 0.4516 | 0.4393 | 0.4401 | 0.6856 | `backoff`, `sticky`, `wait` |
+| `retry_rate` | 0.0077 | 0.3803 | 0.3725 | 0.3700 | 0.5705 | `sticky`, `backoff` * |
+| `refusal_rate` | 0.3387 | 0.2600 | 0.2484 | 0.2573 | 0.4760 | `backoff`, `sticky`, `immediate` |
+| `error_rate` | 0.0191 | 0.0244 | 0.0254 | 0.0223 | 0.0218 | five-way tie |
+| `successful_job_latency_p95_ms` | 7,755.55 | 9,603.35 | 9,456.53 | 9,288.31 | 9,910.48 | `sticky`, `wait` * |
+| `utilization` | 0.4928 | 0.6313 | 0.6384 | 0.6351 | 0.5026 | `backoff`, `sticky`, `wait`, `quota_aware` |
+| `endpoint_spread` | 0.6538 | 0.5707 | 0.5640 | 0.5759 | 0.9368 | — |
 
-**`immediate` is measured, and then excluded.** It completed 7.00 of 3,000 jobs (0.23%) and failed 2,993.00. It is the sole winner of `jobs_unstarted` (0.00 — it starts everything and finishes nothing) and
-it is the *raw* leader on `successful_job_latency_p50_ms` (5,381ms) and `successful_job_latency_p99_ms`
-(8,152ms), which is exactly the fail-fast artefact the completion gate now blocks: with 0.5% of the best
-completion it is excluded from every conditional row, and the table says so by name. Its `retry_rate`
-(0.993) and `attempts_per_job` (459.60) are on the board as the price of never queueing.
+`*` marks the rows of this table that are conditional: `immediate` (0.5% of the best completion) and
+`quota_aware` (60.1%) are excluded from every one of them, and named as excluded in both the table and the
+JSON. There are nine conditional rows in total — the five shown, plus `successful_job_latency_p50_ms`,
+`successful_job_latency_p99_ms` and both `acquire_wait_*` percentiles, which are left out of this table for
+width and are all in `--markdown`'s.
+
+**`immediate` is measured, and then excluded.** It completed 7.00 of 3,000 jobs (0.23%) and failed
+2,993.00. `jobs_unstarted` (0.00) is no longer a win for it — the accounting row is a diagnostic now, and
+"starts everything and finishes nothing" is not a quality. It is the *raw* leader on
+`successful_job_latency_p95_ms` (7,755.55ms) and `successful_job_latency_p99_ms` (8,152.07ms), which is
+exactly the fail-fast artefact the completion gate blocks: with 0.5% of the best completion it is excluded
+from every conditional row, and the table says so by name. Its `failed_attempt_rate` (0.9930) is the worst
+in the table — almost every request it was allowed to make failed — while its `retry_rate` (0.0077) is the
+lowest, because between the refusals and its own refusal to queue it barely schedules any. That inversion
+is why the two metrics are separate and why the second one is gated: "scheduled few retries" reads as
+virtue only in a run that attempted almost nothing.
 
 **`backoff` and `sticky` lead; `wait` is close behind.** The paired test puts them together on `jobs_done`
 (1,361.67 and 1,404.00 against `wait`'s 1,348.67, with per-seed spreads of 23-77 jobs), on throughput, on
 `successful_job_latency_p50_ms` (3,522ms and 3,368ms against 3,574ms) and on `acquire_wait_p99_ms`.
-`sticky` alone leads `successful_job_latency_p99_ms` (11,668.53ms against 12,501.36ms for `wait`). The gaps are
-small and the honest summary is "these three are hard to separate in this world", not "sticky is best by
-1.3%": the paired differences are tighter than the absolute spreads, which is what the seeds are for, but
-they are still single-digit percentages on a 10-minute simulated run.
+`sticky` alone leads `successful_job_latency_p99_ms` (11,668.53ms against 12,501.36ms for `wait`). The gaps
+are small and the honest summary is "these three are hard to separate in this world", not "sticky is best
+by 1.3%": the paired differences are tighter than the absolute spreads, which is what the seeds are for,
+but they are still single-digit percentages on a 10-minute simulated run.
+
+**Retry pressure separates them more than latency does.** `attempt_inflation` is 1.59-1.62 for the three
+front-runners against 2.34 for `quota_aware`: the leader's typical step takes about one and a half
+attempts, `quota_aware`'s more than two and a third. `wait` is inside the `failed_attempt_rate` tie even
+though its mean is the highest of the three (0.4516 against 0.4393 for `backoff`), and it retries the most
+of the three (0.3803 against 0.3725): the paired differences are what put it in the tie, and the tie is the
+honest statement about how little three seeds can see. `attempts_per_completed_job` is 5.55-5.69 for the
+three, where a run of this scenario's three steps that never had to repeat one would read 3.00 — the
+repetitions are a large share of what a completed job costs.
 
 **`quota_aware` loses, and the reason is visible in the mechanism.** 843.67 jobs against `wait`'s
 1,348.67 (-37%), `refusal_rate` 0.4760 against 0.2600, `endpoint_spread` 0.9368 (the most lopsided of the
 five). It ranks by the *declared* quota (`QuotaAware.score` reads `resource.options["quota"]["tokens"]`),
 which is not the refusals it will actually meet: the provider refuses on live in-flight capacity and on its
-own bucket with tightening, neither of which the declared number reflects. On seed 20260917 it sent 4,963
-of 6,621 admitted requests to `fast-flaky` (the endpoint with the highest error rate and storm rate) and
-only 573 to `slow-steady`, while `wait` sent 4,150 and 3,029 respectively. Its `error_rate` (0.0218) ties
-with the others: less traffic to the flaky endpoint is a different mix, not a better client.
+own bucket with tightening, neither of which the declared number reflects. In the last run of each
+algorithm (seed 20260919) it sent 2,136 of 6,434 admitted requests to `fast-flaky` (the endpoint with the
+highest error rate and storm rate) and only 306 to `metered`, while `wait` sent 4,618 and 1,300
+respectively. Its `error_rate` (0.0218) ties with the others: less traffic to the flaky endpoint is a
+different mix, not a better client.
 
-**Several rows crown nobody, and that is the answer.** `makespan_s`, `requests`, `request_latency_p50_ms`,
-`wall_s` and `endpoint_spread` are declared neutral — the last two most importantly: `wall_s` is what the
-sweep cost and `endpoint_spread` describes a deliberately heterogeneous fleet, where sending more traffic
-to the dependable endpoint *raises* the number. `acquire_wait_p50_ms` is 0.00 for every candidate that
-completed the work (the client rarely waits for a *lease*: what stops a request in this scenario is the
-provider's refusal, met while the lease is already held), and after the completion gate it has no winner
-at all. `leases_active_at_end` is 0.0 everywhere, where the zero-everywhere rule crowns nobody. The
-`error_rate` row is a five-way tie: the independent failure rates are simply not what separates these
-algorithms here.
+**Several rows crown nobody, and that is the answer.** `makespan_s`, `requests`, `jobs_failed`,
+`jobs_unstarted`, `request_latency_p50_ms`, `wall_s` and `endpoint_spread` are declared neutral — the
+middle two because their direction can be won by doing less, and `wall_s`/`endpoint_spread` because they
+are a cost and a description of a deliberately heterogeneous fleet (sending more traffic to the dependable
+endpoint *raises* the spread). `acquire_wait_p50_ms` is 0.00 for every candidate that completed the work
+(the client rarely waits for a *lease*: what stops a request in this scenario is the provider's refusal,
+met while the lease is already held), and after the completion gate it has no winner at all.
+`leases_active_at_end` is 0.0 everywhere, where the zero-everywhere rule crowns nobody. The `error_rate`
+row is a five-way tie: the independent failure rates are simply not what separates these algorithms here,
+and `refusal_rate`'s tie set includes `immediate` because with three seeds its refusal rate is not
+distinguishable from `backoff`'s, even though the means look 9 points apart.
 
 **What is not in the table.** `failover` and `least_busy` are declared unsuited to this scenario and are
 not run by default: one pool gives `failover` nothing to fail over to, and the pool's default selection is

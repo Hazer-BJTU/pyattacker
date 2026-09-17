@@ -610,7 +610,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
             if scenario.unsuited:
                 unsuited = "; ".join(f"{algorithm} ({reason})" for algorithm, reason in scenario.unsuited)
                 print(f"      not applicable here, run only if asked for: {unsuited}")
-        print("\nalgorithms:")
+        print("\nalgorithms (all built-ins; each scenario skips the ones it marks not applicable):")
         print("  " + ", ".join(default_algorithms()))
         print("\nmetrics (name [unit] direction):")
         for name, metric in METRICS.items():
@@ -650,8 +650,11 @@ def _cmd_bench(args: argparse.Namespace) -> int:
         )
 
     if not args.quiet:
+        # The header counts what will actually run: a scenario that cannot exercise an algorithm
+        # leaves it out, and the count has to agree with the columns and with `run_benchmark`.
+        planned = algorithms if algorithms else default_algorithms(scenario)
         print(
-            f"benchmarking {len(algorithms) if algorithms else len(default_algorithms())} algorithms "
+            f"benchmarking {len(planned)} algorithms "
             f"x {args.seeds} seed(s) on {scenario.name} "
             f"({scenario.jobs} jobs x {scenario.steps_per_job} steps x {scenario.calls_per_step} calls, "
             f"{scenario.concurrency} workers)",
@@ -750,7 +753,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench = sub.add_parser("bench", help="benchmark acquire algorithms against a simulated provider")
     p_bench.add_argument("--scenario", default="bursty_provider", help="which simulated world to run in (--list shows them)")
     p_bench.add_argument("--list", action="store_true", help="list scenarios, algorithms and metrics, then exit")
-    p_bench.add_argument("--algorithms", default=None, help="comma-separated names (default: every built-in algorithm)")
+    p_bench.add_argument(
+        "--algorithms",
+        default=None,
+        help="comma-separated names (default: every algorithm the scenario can exercise; see --list)",
+    )
     p_bench.add_argument("--seeds", type=int, default=3, help="how many seeds to average over")
     p_bench.add_argument("--jobs", type=int, default=None, help="override the scenario's job count")
     p_bench.add_argument("--concurrency", type=int, default=None, help="override the scenario's worker count")

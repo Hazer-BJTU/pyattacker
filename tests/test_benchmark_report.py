@@ -97,6 +97,26 @@ def _plain(metrics: dict[str, dict[str, float]]) -> BenchmarkReport:
     return BenchmarkReport(scenario=_small(), seeds=[1], runs=runs)
 
 
+def _multi(series: dict[str, dict[str, list[float]]]) -> BenchmarkReport:
+    """A report from explicit per-seed values for several metrics at once.
+
+    `series[algorithm][metric]` holds that algorithm's values on seeds 1..n, so how much work an
+    algorithm completed and how good it looked doing it can be set independently — which is the only way
+    to test the completion gate and the winner rule against each other.
+    """
+    runs = [
+        RunResult(
+            scenario="unit",
+            algorithm=algorithm,
+            seed=index + 1,
+            metrics={name: values[index] for name, values in metrics.items()},
+        )
+        for algorithm, metrics in series.items()
+        for index in range(len(next(iter(metrics.values()))))
+    ]
+    return BenchmarkReport(scenario=_small(), seeds=sorted({run.seed for run in runs}), runs=runs)
+
+
 def test_winners_respect_the_direction_of_each_metric():
     report = _plain(
         {
@@ -178,11 +198,90 @@ def test_a_conditional_metric_cannot_crown_an_algorithm_that_completed_almost_no
 
 
 def test_an_unsuited_algorithm_has_no_opinion_recorded_about_it():
-    """A scenario that cannot exercise an algorithm must not rank it (see Scenario.unsuited)."""
+    """A scenario that cannot exercise an algorithm must not rank it (see Scenario.unsuited).
+
+    Taking `b` out leaves one contestant, and one contestant is not a comparison, so the row has no
+    winner — the point is which algorithm was removed from the ranking, not that `a` collected a star
+    for outscoring an entry the scenario had already declared meaningless.
+    """
     report = _handmade({"a": [100.0], "b": [1.0]})
     report.unsuited = {"b": "this scenario has one pool"}
 
+    assert "b" not in report.comparable("jobs_done")
+    assert report.winners("jobs_done") == []
+    assert "b (n/a)" in report.render_table()
+
+    # Add a second algorithm the scenario *can* exercise and the row is a comparison again.
+    report.runs.append(RunResult(scenario="unit", algorithm="c", seed=1, metrics={"jobs_done": 50.0}))
     assert report.winners("jobs_done") == ["a"]
+
+
+def test_the_two_failure_modes_are_reported_but_never_crowned():
+    """`jobs_failed` and `jobs_unstarted` close the accounting; they are not achievements.
+
+    Each has the wrong sign available for free: an algorithm can shrink `jobs_failed` by never starting
+    a job and `jobs_unstarted` by starting everything and failing it. They stay in the table — the
+    totals have to add up — and award nothing.
+    """
+    report = _plain({"jobs_failed": {"idle": 0.0, "busy": 500.0}, "jobs_unstarted": {"idle": 3000.0, "busy": 0.0}})
+
+    assert METRICS["jobs_failed"].better == "neutral"
+    assert METRICS["jobs_unstarted"].better == "neutral"
+    assert report.winners("jobs_failed") == []
+    assert report.winners("jobs_unstarted") == []
+    assert "500.0" in report.render_table() and "3000.0" in report.render_table(), "still reported"
+
+
+def test_the_completion_baseline_ignores_an_algorithm_the_scenario_cannot_exercise():
+    """The gate is a statement about comparable work, so an N/A algorithm must not set its floor.
+
+    `n/a` was run because it was asked for by name and completed 5000 jobs. If it set the baseline,
+    every algorithm the scenario is actually about would fall below the 90% floor and the conditional
+    row would have no contestant left at all.
+    """
+    report = _multi(
+        {
+            "a": {"jobs_done": [100.0], "successful_job_latency_p95_ms": [500.0]},
+            "b": {"jobs_done": [95.0], "successful_job_latency_p95_ms": [900.0]},
+            "n/a": {"jobs_done": [5000.0], "successful_job_latency_p95_ms": [10.0]},
+        }
+    )
+    report.unsuited = {"n/a": "this scenario has one pool"}
+
+    assert report.comparable("successful_job_latency_p95_ms").keys() == {"a", "b"}
+    assert report.excluded_by_completion("successful_job_latency_p95_ms") == []
+    assert report.winners("successful_job_latency_p95_ms") == ["a"]
+
+
+def test_one_eligible_contestant_is_not_crowned():
+    """The gate can leave a single algorithm: that is not a win, and the report has to say which one.
+
+    `gaveup` finished 0.1% of the work and has the best latency in the table. Crowning `only` would
+    dress up a one-horse race as a result; staying silent would read as "nobody did well".
+    """
+    report = _multi(
+        {
+            "only": {"jobs_done": [1000.0], "successful_job_latency_p95_ms": [500.0]},
+            "gaveup": {"jobs_done": [1.0], "successful_job_latency_p95_ms": [10.0]},
+        }
+    )
+
+    assert report.winners("successful_job_latency_p95_ms") == []
+    assert report.unrivaled("successful_job_latency_p95_ms") == "only"
+    assert report.to_dict()["not_compared"] == {"successful_job_latency_p95_ms": "only"}
+    assert "not compared: only `only` was eligible" in report.render_markdown()
+    assert "successful_job_latency_p95_ms (only)" in report.render_table()
+
+
+def test_a_lone_algorithm_in_a_report_is_not_crowned():
+    """A star means "beat the others"; a one-algorithm run is a diagnostic, not a comparison."""
+    report = _multi({"a": {"jobs_done": [100.0, 120.0], "throughput_rps": [1.0, 1.1]}})
+
+    assert report.winners("jobs_done") == []
+    assert report.winners("throughput_rps") == []
+    # Nothing was removed by the gate either, so there is no exclusion for the report to explain.
+    assert report.unrivaled("throughput_rps") is None
+    assert report.to_dict()["not_compared"] == {}
 
 
 # ------------------------------------------------------------------ rendering

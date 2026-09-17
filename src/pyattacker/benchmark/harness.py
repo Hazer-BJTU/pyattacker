@@ -131,6 +131,8 @@ class Harness:
         self._jobs_failed = 0
         self._attempts = 0
         self._failed_attempts = 0
+        self._retries_scheduled = 0
+        self._attempted_steps = 0
         self._job_latencies: list[float] = []
         self._wait_ms: list[float] = []
         self._request_ms: list[float] = []
@@ -245,6 +247,9 @@ class Harness:
         policy = self.scenario.retry
         started = self.clock.now()
         attempt = 0
+        # One distinct step is being attempted, however many attempts it ends up costing: the
+        # denominator of `attempt_inflation`, which is what makes 1.0 mean "no retries".
+        self._attempted_steps += 1
         while True:
             attempt += 1
             self._attempts += 1
@@ -277,6 +282,9 @@ class Harness:
                 )
                 if not decision["retry"]:
                     return False
+                # A retry that is actually going to happen: the counter behind `retry_rate`, as opposed
+                # to `failed_attempt_rate`, which counts every failed attempt including abandoned ones.
+                self._retries_scheduled += 1
                 # The retry backoff is simulated time, like every other wait: a policy that backs off
                 # further is not penalised in wall-clock terms, it is penalised in makespan.
                 await self.clock.sleep(decision["delay_s"])
@@ -341,12 +349,14 @@ class Harness:
             "jobs_failed": float(self._jobs_failed),
             "jobs_unstarted": float(max(0, self.scenario.jobs - self._next_job)),
             "makespan_s": makespan,
-            # Fixed denominator: see METRICS["throughput_rps"]. Dividing by this run's own makespan
-            # would reward an algorithm for finishing early by abandoning its work.
-            "throughput_rps": (done / self.scenario.horizon_s) if self.scenario.horizon_s > 0 else 0.0,
+            # Its own makespan, not the budget: see METRICS["throughput_rps"]. The completion gate is
+            # what keeps the honest denominator from rewarding a run that gave up on most of its work.
+            "throughput_rps": (done / makespan) if makespan > 0 else 0.0,
             "requests": float(requests),
-            "attempts_per_job": (self._attempts / done) if done else 0.0,
-            "retry_rate": (self._failed_attempts / self._attempts) if self._attempts else 0.0,
+            "attempts_per_completed_job": (self._attempts / done) if done else 0.0,
+            "attempt_inflation": (self._attempts / self._attempted_steps) if self._attempted_steps else 0.0,
+            "failed_attempt_rate": (self._failed_attempts / self._attempts) if self._attempts else 0.0,
+            "retry_rate": (self._retries_scheduled / self._attempts) if self._attempts else 0.0,
             "refusal_rate": (provider.refusals / requests) if requests else 0.0,
             "error_rate": (provider.failed / requests) if requests else 0.0,
             "successful_job_latency_p50_ms": percentile(self._job_latencies, 0.50),

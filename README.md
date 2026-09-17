@@ -270,7 +270,7 @@ driving the real `Pool` and the real algorithm, and time is simulated, so a ten-
 seconds.
 
 ```bash
-uv run pyattacker bench                       # every algorithm x 3 seeds, about 20 seconds
+uv run pyattacker bench                       # the scenario's 5 algorithms x 3 seeds, about 13 seconds
 uv run pyattacker bench --list                # the scenarios, the algorithms, and what each metric means
 uv run pyattacker bench --algorithms wait,backoff --seeds 5 --json runs/bench.json
 ```
@@ -280,9 +280,9 @@ function of time rather than of who is asking, and each request's draws are inde
 two algorithms meet the same *exogenous* randomness and the same weather, and the comparison is between
 algorithms rather than between moods. (Their realized provider state still diverges, because the bucket
 and the in-flight count react to what each of them did — that divergence is the measurement.)
-It reports a vector of metrics (throughput, tail latency, refusals provoked, capacity utilisation,
-fairness across endpoints) instead of one weighted score, and it names the winner per metric —
-including when the winner is "nobody".
+It reports a vector of metrics (throughput, tail latency, retries, refusals provoked, capacity
+utilisation, fairness across endpoints) instead of one weighted score, and it names the winner per metric
+— including when the winner is "nobody", and never when there was only one algorithm left to compare.
 
 [`docs/benchmark.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/benchmark.md) has the assumptions, the metrics, the current numbers, and
 what they do not say.
@@ -349,7 +349,7 @@ uv sync                      # create the venv + install the dev group (which in
 uv run pytest                # the whole suite: zero network, a few seconds
 uv run ruff check            # lint (configuration lives in pyproject.toml, with reasons for each exception)
 uv run pyattacker demo       # end-to-end smoke test
-uv run pyattacker bench      # compare the acquire algorithms in simulation (about 20 seconds)
+uv run pyattacker bench      # compare the acquire algorithms in simulation (about 13 seconds)
 uv build                     # sdist + wheel
 ```
 

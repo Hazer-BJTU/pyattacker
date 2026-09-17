@@ -553,8 +553,10 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
     acquisition algorithms in a written-down world (capacity cycle, token bucket, latency tail, storms,
     three endpoints) so that "which algorithm is better here" becomes a question with an answer and a
     seed. It is not a measurement of anyone's provider, and changing an assumption can change the
-    ranking; two of the seven built-ins turn out to be the same code path in this world, which is
-    reported rather than hidden. See `docs/benchmark.md`.
+    ranking; two of the seven built-ins cannot be exercised in this world at all — `failover` has nothing
+    to fail over to with one pool, and `least_busy` is the pool's default selection under another name —
+    which the scenario declares (and marks N/A) rather than hides behind a plausible-looking number. See
+    `docs/benchmark.md`.
 
 ---
 

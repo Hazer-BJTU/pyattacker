@@ -98,7 +98,7 @@ assumptions, the metrics and how to read the table; this table is the flag surfa
 |---|---|
 | `--scenario NAME` | which simulated world to run in; default `bursty_provider` |
 | `--list` | print the scenarios, the algorithms and every metric with its unit and direction, then exit 0 |
-| `--algorithms A,B` | comma-separated subset; default is every built-in algorithm (`failover` included, which a single-pool scenario cannot show at its best) |
+| `--algorithms A,B` | comma-separated subset; default is every algorithm the scenario can exercise — asking for one it declares unsuited runs it anyway with an N/A column (e.g. `failover`, which a single-pool scenario cannot show at its best) |
 | `--seeds N` | how many seeds to average over, as `scenario.seed + 0 .. N-1` (default 3) |
 | `--jobs N` | override the scenario's job count |
 | `--concurrency N` | override the worker count — the client's in-flight count, so an assumption as well as a cost knob |

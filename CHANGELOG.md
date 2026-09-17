@@ -37,7 +37,12 @@ All notable changes to this project are documented here. The format follows
   waiter parked past the deadline (a starvation bug in real time, a hang under a simulated clock). The
   pool now arms one task, only while somebody waits, that sleeps on the pool's clock until the earliest
   future cooldown and broadcasts — and ignores already-expired and permanently dead slots, both of which
-  otherwise re-arm a zero-delay timer forever.
+  otherwise re-arm a zero-delay timer forever. It also tracks the deadline it armed, not just the task,
+  because a cooldown that starts later can still end earlier: a 5s cooldown beginning at t=5 has to replace
+  a 30s timer armed at t=0, or the waiters wake twenty simulated seconds after the resource they were
+  waiting for came back. Both numbers are pinned by
+  `tests/test_lease_safety.py::test_a_cooldown_that_ends_earlier_than_the_armed_one_replaces_it`, which
+  wakes at t=30 without the re-arm.
 * **`wall_s` on a benchmark report was never assigned**, so every report and every JSON payload claimed
   0.0s of wall clock. It is measured now, and it is declared `neutral`: it is what the sweep cost, not
   evidence about an algorithm.
@@ -48,10 +53,26 @@ All notable changes to this project are documented here. The format follows
   three seeds the Student-t critical value is 4.3.
 * **Fail-fast could win latency and throughput rows.** Throughput divided by each run's own makespan (so
   abandoning work early manufactured throughput) and latency was collected only for jobs that succeeded
-  (so an algorithm that finished 0.23% of the work could lead a latency row). Throughput now divides by
-  the scenario's fixed budget, the latency metrics are named `successful_job_latency_*`, and every
-  conditional metric refuses to crown an algorithm that completed less than 90% of the best completion —
-  naming the excluded ones in the table, the markdown and the JSON.
+  (so an algorithm that finished 0.23% of the work could lead a latency row). Throughput divides by the
+  run's own makespan again — the honest definition, now that the gate below makes it safe, and no longer a
+  linear rescaling of `jobs_done` that cannot tell a run which finished in 200s from one which took 500s —
+  the latency metrics are named `successful_job_latency_*`, and every conditional metric refuses to crown
+  an algorithm that completed less than 90% of the best completion, naming the excluded ones in the table,
+  the markdown and the JSON.
+* **Two metrics did not mean what their names said.** `retry_rate` counted every failed attempt, including
+  the ones the retry policy abandoned without retrying, and `attempts_per_job` counted step attempts per
+  *completed* job while documenting a "1.0 = no retries" baseline that this scenario's three-step jobs can
+  never reach. The first is now `failed_attempt_rate`, a real `retry_rate` counts the retries the policy
+  actually scheduled (the difference between them is the share of failures judged hopeless), and
+  `attempts_per_completed_job` documents its real baselines — `steps_per_job` for a clean run, with
+  attempts spent on jobs that later failed in the numerator only — beside a new `attempt_inflation`:
+  attempts per *attempted* step, where 1.0 really does mean "not one step had to be repeated".
+* **The completion baseline ignored which algorithms a scenario can exercise.** An unsuited algorithm run
+  because it was asked for by name could set the 90% floor and exclude every algorithm the scenario was
+  actually about. The baseline now comes from comparable algorithms only — and a conditional row with a
+  single eligible contestant has no winner at all, with the report naming it (`not_compared` in the JSON,
+  `only X was eligible` in the markdown) instead of crowning a one-horse race. A report containing one
+  algorithm never awards a star on any row: a star is a comparative statement.
 * **Client-side randomness depended on worker assignment.** One `Random` per worker was consumed by the
   acquire algorithm, the retry policy and every later job, so an algorithm that changed its own timing
   changed its own future randomness. The two subsystems now draw from separate streams derived from
@@ -72,6 +93,17 @@ All notable changes to this project are documented here. The format follows
   new `BenchmarkStalled` for a world whose every resource is dead or revoked), so the CLI reports them as
   a message and exit code 2 rather than as a traceback — and `BenchmarkStalled` arrives in about a second
   instead of after the whole wall-clock budget.
+* **The two accounting rows that carried a direction no longer do** (`jobs_failed`, `jobs_unstarted`).
+  Each can be minimised by doing less work — never start a job and nothing fails; start everything and fail
+  it and nothing is left unstarted — so they stay in the table, where the totals have to close, and award
+  no star.
+* **Documentation and CLI text that had drifted from the code.** `BenchmarkReport.winners()` and
+  `docs/benchmark.md` still described the independent-samples standard error the report no longer uses, the
+  virtual-vs-real clock table quoted throughput from the retired fixed-denominator formula, the worked
+  example still said "21 runs" where the scenario now runs 15, `Harness.run`'s timeout was documented as
+  `asyncio.wait_for` where it races the workers against a supervisor, and `bench`'s progress header counted
+  the framework's seven algorithms where the scenario would run five (as did the README's "about 20
+  seconds" and `--algorithms`'s "every built-in algorithm").
 
 * **PyYAML is no longer a dependency — it is the optional `yaml` extra.** `pip install pyattacker` now
   installs nothing at all: the kernel and the declarative layer's JSON/TOML paths are the standard library.

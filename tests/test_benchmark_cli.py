@@ -53,7 +53,21 @@ def test_json_output_is_a_report_a_program_can_read(tmp_path, capsys):
     assert payload["seeds"] == [20260917]
     assert [run["algorithm"] for run in payload["runs"]] == ["wait"]
     assert "mean" in payload["aggregates"]["wait"]["jobs_done"]
-    assert payload["winners"]["jobs_done"] == ["wait"], "one algorithm is trivially the winner"
+    # One algorithm is a diagnostic, not a comparison: there is nobody to beat, so there is no star.
+    assert payload["winners"]["jobs_done"] == []
+
+
+def test_the_progress_header_counts_the_algorithms_the_scenario_will_run(capsys):
+    """The scenario skips the two algorithms it cannot exercise, so the header has to say five.
+
+    The count came from the framework's full algorithm list while `run_benchmark` ran the scenario's own
+    default, so the announcement and the columns disagreed by two.
+    """
+    assert main(["bench", *SMALL]) == 0
+
+    captured = capsys.readouterr()
+    assert "benchmarking 5 algorithms" in captured.err
+    assert "(n/a)" not in captured.out, "nothing was asked for by name here"
 
 
 def test_json_to_stdout_replaces_the_table(capsys):

@@ -304,13 +304,115 @@ def test_an_acquire_refusal_reaches_the_retry_policy_like_any_other_failure():
     retried = Harness(forgiving, "immediate", seed=24).run()
 
     assert retried.metrics["jobs_done"] == 4, "the policy retried the refusal until a lease came free"
-    assert retried.metrics["attempts_per_job"] > 1
+    assert retried.metrics["attempts_per_completed_job"] > 1
+    assert retried.metrics["retry_rate"] > 0, "those were retries the policy really scheduled"
 
     strict = _saturating_scenario(retry=Retrying(max_attempts=6, base=0.1, factor=2.0, jitter="none"))
     refused = Harness(strict, "immediate", seed=24).run()
 
     assert refused.metrics["jobs_done"] < 4, "the default policy classifies it unknown and declines"
     assert refused.error_classes.get("unknown", 0) > 0
+
+
+# ------------------------------------------------------------------ what the cost metrics count
+
+
+def _friendly_scenario(**overrides):
+    """One endpoint that never fails and has room to spare: the run with a known-in-advance answer."""
+    endpoint = EndpointProfile(
+        id="only",
+        capacity=8,
+        latency=LatencyProfile(median_s=0.5, sigma=0.0, tail_rate=0.0),
+        failures=FailureProfile(error_rate=0.0, storm_rate=0.0),
+        rate_limit=None,
+    )
+    return _small(
+        endpoints=(endpoint,),
+        jobs=12,
+        concurrency=2,
+        steps_per_job=3,
+        calls_per_step=1,
+        retry=Retrying(max_attempts=1),
+        **overrides,
+    )
+
+
+def test_a_run_with_no_failures_pins_both_attempt_baselines():
+    """The zero-retry baselines, measured instead of described.
+
+    `attempts_per_completed_job` cannot start at 1.0 — a three-step job spends three attempts even when
+    nothing fails, so its baseline is `steps_per_job` — while `attempt_inflation` divides attempts by the
+    *steps that were attempted* and therefore does read 1.0. This run is where the right answer is known
+    before it starts, which is the only reason to assert exact numbers.
+    """
+    metrics = Harness(_friendly_scenario(), "wait", seed=31).run().metrics
+
+    assert metrics["jobs_done"] == 12
+    assert metrics["attempts_per_completed_job"] == 3.0, "12 jobs x 3 steps / 12 completed jobs"
+    assert metrics["attempt_inflation"] == 1.0, "36 attempts over 36 attempted steps"
+    assert metrics["failed_attempt_rate"] == 0.0
+    assert metrics["retry_rate"] == 0.0
+
+
+def test_throughput_is_measured_over_the_run_not_over_the_budget():
+    """The denominator is the run's own makespan — the only way finishing sooner shows up.
+
+    This workload is over long before the horizon. With a fixed `jobs_done / horizon_s` denominator two
+    runs that completed the same work in 9s and in 500s would score identically, which is not a
+    throughput. The completion gate is what keeps the honest denominator from rewarding a run that
+    finished early by abandoning its queue.
+    """
+    metrics = Harness(_friendly_scenario(), "wait", seed=33).run().metrics
+
+    assert metrics["makespan_s"] < 60.0, "the workload ends well before the 120s horizon"
+    assert metrics["throughput_rps"] == pytest.approx(metrics["jobs_done"] / metrics["makespan_s"])
+    assert metrics["throughput_rps"] != pytest.approx(metrics["jobs_done"] / 120.0)
+
+
+def _broken_scenario(retry, **overrides):
+    """One endpoint that fails every request, so every failed attempt meets the retry policy."""
+    endpoint = EndpointProfile(
+        id="only",
+        capacity=4,
+        latency=LatencyProfile(median_s=0.1, sigma=0.0, tail_rate=0.0),
+        failures=FailureProfile(error_rate=1.0, storm_rate=0.0),
+        rate_limit=None,
+    )
+    return _small(
+        endpoints=(endpoint,),
+        jobs=2,
+        concurrency=1,
+        steps_per_job=1,
+        calls_per_step=1,
+        retry=retry,
+        **overrides,
+    )
+
+
+def test_a_failed_attempt_and_a_scheduled_retry_are_counted_separately():
+    """`retry_rate` counts retries, not failures: the two diverge exactly where the policy gives up.
+
+    Every request fails here. With `max_attempts=1` no retry is ever scheduled, so the failure rate is
+    1.0 and the retry rate is 0.0 — one metric would have hidden that distinction. With a budget of
+    three, each step spends two retries and abandons the third failure: 4 retries out of 6 attempts.
+    """
+    one_shot = Harness(_broken_scenario(Retrying(max_attempts=1)), "wait", seed=32).run().metrics
+
+    assert one_shot["jobs_done"] == 0
+    assert one_shot["failed_attempt_rate"] == 1.0
+    assert one_shot["retry_rate"] == 0.0, "abandoned failures are not retries"
+
+    retried = (
+        Harness(
+            _broken_scenario(Retrying(max_attempts=3, base=0.0, factor=1.0, jitter="none")), "wait", seed=32
+        )
+        .run()
+        .metrics
+    )
+
+    assert retried["failed_attempt_rate"] == 1.0
+    assert retried["retry_rate"] == pytest.approx(4 / 6), "two retries per step, three attempts each"
+    assert retried["attempt_inflation"] == pytest.approx(3.0), "6 attempts over 2 attempted steps"
 
 
 # ------------------------------------------------------------------ unsuited algorithms

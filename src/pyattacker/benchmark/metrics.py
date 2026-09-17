@@ -41,34 +41,74 @@ def _m(name: str, unit: str, better: str, description: str, *, gated: bool = Fal
 METRICS: dict[str, Metric] = dict(
     [
         _m("jobs_done", "jobs", "higher", "Jobs that finished successfully before the horizon."),
-        _m("jobs_failed", "jobs", "lower", "Jobs that gave up: a step exhausted its retry budget."),
-        _m("jobs_unstarted", "jobs", "lower", "Jobs the workers never began because the horizon arrived first."),
+        _m(
+            "jobs_failed",
+            "jobs",
+            "neutral",
+            "Jobs that gave up: a step exhausted its retry budget. Reported because the accounting has to "
+            "close (`done + failed + unstarted = jobs`), not awarded: an algorithm can shrink this number "
+            "by never starting the jobs it would have failed.",
+        ),
+        _m(
+            "jobs_unstarted",
+            "jobs",
+            "neutral",
+            "Jobs the workers never began because the horizon arrived first. Diagnostic for the same "
+            "reason: an algorithm can shrink it by starting and failing everything immediately.",
+        ),
         _m(
             "makespan_s",
             "s",
             "neutral",
-            "Simulated seconds until the last job finished or gave up — read it next to `jobs_done`, "
-            "since finishing early by failing fast is not an achievement.",
+            "Simulated seconds from the start until the last worker stopped: the horizon, plus whatever "
+            "step was still in flight when it arrived. Read it next to `jobs_done`, since finishing early "
+            "by failing fast is not an achievement.",
         ),
         _m(
             "throughput_rps",
             "jobs/s",
             "higher",
-            "Completed jobs per simulated second of the scenario's budget. The denominator is fixed on "
-            "purpose: dividing by each run's own makespan would let an algorithm that abandons every job "
-            "manufacture throughput out of finishing early.",
+            "Completed jobs per simulated second of the run's *own* makespan: what came out, over the time "
+            "it took. Conditional on purpose — with a fixed denominator this would be `jobs_done` rescaled "
+            "by a constant, and without the completion gate an algorithm could manufacture throughput by "
+            "abandoning the queue and finishing early.",
             gated=True,
         ),
         _m("requests", "requests", "neutral", "Requests sent, including refusals and retries."),
         _m(
-            "attempts_per_job",
+            "attempts_per_completed_job",
             "attempts",
             "lower",
-            "Step attempts per completed job (1.0 = no retries). Per *completed* job: an algorithm that "
-            "gives up on most of them is measured on the few it finished.",
+            "Step attempts the run spent per completed job — what finishing cost. The zero-retry baseline "
+            "is `steps_per_job`, not 1.0: a three-step job costs three attempts even when nothing fails, "
+            "and attempts spent on jobs that later gave up are in the numerator but not the denominator.",
             gated=True,
         ),
-        _m("retry_rate", "ratio", "lower", "Failed step attempts as a fraction of all step attempts."),
+        _m(
+            "attempt_inflation",
+            "ratio",
+            "lower",
+            "Step attempts per *attempted* step (1.0 = every step that was attempted succeeded on its "
+            "first try). Numerator and denominator cover the same steps, so this is retry pressure "
+            "without the volume. Conditional, because which steps get attempted is the algorithm's "
+            "choice: one that only takes the uncontended ones has an easier sample of steps.",
+            gated=True,
+        ),
+        _m(
+            "failed_attempt_rate",
+            "ratio",
+            "lower",
+            "Failed step attempts as a fraction of all step attempts. Includes attempts the retry policy "
+            "then abandoned, which `retry_rate` excludes.",
+        ),
+        _m(
+            "retry_rate",
+            "ratio",
+            "lower",
+            "Retries the policy actually scheduled, as a fraction of all step attempts. "
+            "`failed_attempt_rate` minus this is the share of failures that were given up on.",
+            gated=True,
+        ),
         _m("refusal_rate", "ratio", "lower", "Requests refused by the provider (429) per request sent."),
         _m("error_rate", "ratio", "lower", "Requests that failed with an error per request sent."),
         _m(

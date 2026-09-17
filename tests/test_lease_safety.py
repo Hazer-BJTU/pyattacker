@@ -18,6 +18,7 @@ import pytest
 from helpers import FakeClock, make_pool, run
 
 from pyattacker import Pool, Resource, RetryableError, Runner, pipeline, task
+from pyattacker.benchmark import VirtualClock
 from pyattacker.runner import RunConfig
 from pyattacker.tasks import leaky
 
@@ -343,3 +344,54 @@ def test_a_wait_that_only_a_cooldown_can_end_actually_ends():
 
     # Without an armed cooldown timer this never returns: the timeout is what turns a hang into a test.
     assert run(asyncio.wait_for(wait_then_acquire(), timeout=2.0)) is True
+
+
+def test_a_cooldown_that_ends_earlier_than_the_armed_one_replaces_it():
+    """Regression: the pool arms one notifier, so the *earliest* deadline has to own it.
+
+    The sequence, in exact simulated time — which is why this test uses `VirtualClock` rather than the
+    suite's `FakeClock`: it makes both the correct and the incorrect wake-up an exact number.
+
+        t=0  A fails once with a 30s cooldown -> unusable until t=30. B is busy, so a waiter parks
+             and the notifier arms t=30.
+        t=5  B, still busy, fails once with a 5s cooldown -> unusable until t=10, then released.
+
+    The earliest availability moved 30 -> 10 at t=5. A notifier that only asks "is a timer still
+    alive?" keeps sleeping to t=30, and the waiter wakes twenty simulated seconds after B was usable
+    again. Checking the armed *deadline* is what makes t=10 win.
+    """
+    clock = VirtualClock()
+    resources = [
+        Resource.create("llm", id="a", capacity=1, degrade_after=1, dead_after=9, cooldown_s=30.0),
+        Resource.create("llm", id="b", capacity=1, degrade_after=1, dead_after=9, cooldown_s=5.0),
+    ]
+    pool = Pool("apis", resources, algorithm="wait")
+    pool.clock = clock
+
+    async def scenario() -> float:
+        # t = 0: A is cooling down for 30s, and B is held so the pool is momentarily unusable.
+        doomed = pool.try_acquire(id="a")
+        assert doomed is not None
+        doomed.report(ok=False)
+        doomed.release_now()
+        busy = pool.try_acquire(id="b")
+        assert busy is not None
+
+        async def holder() -> None:
+            await clock.sleep(5.0)  # t = 5
+            busy.report(ok=False)  # B degrades: unusable until 5 + 5 = 10
+            busy.release_now()
+
+        async def waiter() -> float:
+            # `blocked()` is the harness's marker around an acquire: it tells the simulated clock that
+            # this worker can only be released by a lease or by time, so time is allowed to move.
+            with clock.blocked():
+                assert await pool.wait_slot(None) is True
+            return clock.now()
+
+        held = clock.spawn(holder())
+        woke = clock.spawn(waiter())
+        await held
+        return await woke
+
+    assert run(scenario()) == 10.0

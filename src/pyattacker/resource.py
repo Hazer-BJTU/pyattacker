@@ -320,6 +320,8 @@ class Pool:
         self.clock = clock or _RealClock()
         # Set while a cooldown is pending and somebody is waiting for it; see _ensure_cooldown_notifier.
         self._cooldown_task: asyncio.Task[None] | None = None
+        #: The deadline that task is sleeping until, so a *newer* but earlier one can replace it.
+        self._cooldown_deadline: float | None = None
         self.deadlock_warn_s = deadlock_warn_s
         self.on_event = on_event
         self._slots: dict[str, _Slot] = {}
@@ -696,9 +698,12 @@ class Pool:
         Arming one task per pool (not per slot, and only while somebody is waiting) closes both: the
         deadline is registered with the pool's clock, so a virtual clock can advance to it, and the
         broadcast that follows is what actually releases the waiters.
+
+        One task is enough only if it is the *earliest* deadline that owns it, which is why the armed
+        deadline is tracked next to the task. A cooldown that starts later can still end earlier — B
+        breaks at t=5 with a 5s cooldown while A's 30s notifier is already sleeping — and keeping the
+        old timer would wake the waiters long after the resource they were waiting for came back.
         """
-        if self._cooldown_task is not None and not self._cooldown_task.done():
-            return
         if not self._waiters:
             return  # nobody is waiting, so there is nobody to wake; the next waiter arms this again
         now = self.clock.now()
@@ -719,18 +724,32 @@ class Pool:
                 # waiters need (their next check runs `state_at` and finds READY).
                 self._notify()
             return
-        delay = min(pending) - now
+        deadline = min(pending)
+        armed = self._cooldown_task
+        if armed is not None and not armed.done():
+            if self._cooldown_deadline is not None and self._cooldown_deadline <= deadline:
+                return  # already waking at or before this deadline
+            # An earlier deadline appeared after this timer was armed; the armed one is now too late.
+            armed.cancel()
+        delay = deadline - now
 
         async def _wake_after_cooldown() -> None:
+            this_task = asyncio.current_task()
             try:
                 await self.clock.sleep(delay)
             finally:
-                self._cooldown_task = None
+                # Only the notifier that is still the armed one may clear the registration: a task
+                # replaced for an earlier deadline runs its `finally` after its successor was stored,
+                # and clearing unconditionally would erase that successor's deadline.
+                if self._cooldown_task is this_task:
+                    self._cooldown_task = None
+                    self._cooldown_deadline = None
             self._notify()
             # Another slot may have started cooling down while this one was pending.
             self._ensure_cooldown_notifier()
 
         self._cooldown_task = asyncio.create_task(_wake_after_cooldown())
+        self._cooldown_deadline = deadline
 
     def _report(
         self,

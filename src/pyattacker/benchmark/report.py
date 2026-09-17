@@ -104,15 +104,43 @@ class BenchmarkReport:
         """
         if not METRICS[metric].gated_by_completion:
             return []
-        best_done = max((self.mean(name, "jobs_done") for name in self.series(metric)), default=0.0)
+        # The baseline is the best *comparable* completion. An algorithm the scenario cannot exercise,
+        # run only because it was asked for by name, must not set the threshold that excludes the
+        # algorithms the scenario is actually about.
+        suited = [name for name in self.series(metric) if name not in self.unsuited]
+        best_done = max((self.mean(name, "jobs_done") for name in suited), default=0.0)
         if best_done <= 0:
             return []
         excluded = []
-        for name in self.series(metric):
+        for name in suited:
             ratio = self.mean(name, "jobs_done") / best_done
             if ratio < COMPLETION_FLOOR:
                 excluded.append((name, ratio))
         return sorted(excluded, key=lambda item: -item[1])
+
+    def comparable(self, metric: str) -> dict[str, dict[int, float]]:
+        """The runs this metric may be compared on: suited algorithms that clear the completion gate."""
+        series = self.series(metric)
+        eligible = {name: values for name, values in series.items() if name not in self.unsuited}
+        if METRICS[metric].gated_by_completion:
+            gated = {name for name, _ in self.excluded_by_completion(metric)}
+            eligible = {name: values for name, values in eligible.items() if name not in gated}
+        return eligible
+
+    def unrivaled(self, metric: str) -> str | None:
+        """The one algorithm a gated metric is left with, when the gate removed every other contestant.
+
+        `winners` refuses to crown it, so the report has to name it: "only this one was eligible" is a
+        statement about the field, and silence would read as "nobody did well". Restricted to gated
+        metrics on purpose, and to rows that started with more than one contestant — this explains a row
+        the gate emptied, not a report that only ever contained one algorithm.
+        """
+        if not METRICS[metric].gated_by_completion:
+            return None
+        if len(self.series(metric)) < 2:
+            return None
+        eligible = self.comparable(metric)
+        return next(iter(eligible)) if len(eligible) == 1 else None
 
     def winners(self, metric: str) -> list[str]:
         """The algorithms that can claim this metric: the best mean, and anyone within noise of it.
@@ -123,21 +151,19 @@ class BenchmarkReport:
         result, and a report that crowns it is lying politely.
 
         Each challenger is compared against the leader with `SIGNIFICANCE_K` standard errors of their
-        difference (sample `stdev` over the seeds, so `sd_best^2/n + sd_other^2/n` under the hood).
-        Comparing against the leader rather than against the growing group keeps the rule one line
-        long and its meaning obvious.
+        *paired per-seed difference* — `stdev(challenger - leader) / sqrt(n)` over the seeds both ran —
+        which is what the common-random-numbers design buys: the seed-to-seed noise the two algorithms
+        share cancels, leaving the difference. Comparing against the leader rather than against the
+        growing group keeps the rule one line long and its meaning obvious.
         """
         info = METRICS[metric]
         direction = info.better
         if direction == "neutral":
             return []
-        series = self.series(metric)
-        # A scenario that cannot exercise an algorithm has no opinion about it (see Scenario.unsuited).
-        eligible = {name: values for name, values in series.items() if name not in self.unsuited}
-        if info.gated_by_completion:
-            gated = {name for name, _ in self.excluded_by_completion(metric)}
-            eligible = {name: values for name, values in eligible.items() if name not in gated}
-        if not eligible:
+        eligible = self.comparable(metric)
+        # A star is a comparative statement. One contestant is not a comparison, whether the others
+        # were excluded by the completion gate or never ran.
+        if len(eligible) < 2:
             return []
         means = {name: statistics.fmean(values.values()) for name, values in eligible.items()}
         best = max(means.values()) if direction == "higher" else min(means.values())
@@ -184,6 +210,8 @@ class BenchmarkReport:
                 if METRICS[metric].gated_by_completion
             },
             "unsuited": dict(self.unsuited),
+            # Rows where the completion gate left a single contestant: no star, and the reason on record.
+            "not_compared": {metric: name for metric in METRICS if (name := self.unrivaled(metric)) is not None},
         }
 
     # ------------------------------------------------------------------ rendering
@@ -228,9 +256,13 @@ class BenchmarkReport:
         if excluded:
             detail = ", ".join(f"{name} on {metric} ({ratio:.1%} of the best completion)" for metric, name, ratio in excluded[:4])
             lines.append(
-                "conditional rows (throughput, successful-job latency) only consider algorithms that "
+                "conditional rows (throughput, latency, attempt pressure) only consider algorithms that "
                 f"completed at least {COMPLETION_FLOOR:.0%} of the best completion; excluded: {detail}"
             )
+        sole = {metric: name for metric in names if (name := self.unrivaled(metric)) is not None}
+        if sole:
+            detail = ", ".join(f"{metric} ({name})" for metric, name in sole.items())
+            lines.append(f"no winner where a single algorithm was eligible to be compared: {detail}")
         if self.unsuited:
             detail = "; ".join(f"{name} ({reason})" for name, reason in sorted(self.unsuited.items()))
             lines.append(f"not applicable in {self.scenario.name}: {detail}")
@@ -266,7 +298,10 @@ class BenchmarkReport:
                 cells.append(rendered)
             verdict = ", ".join(f"`{name}`" for name in best) if best else "—"
             gated = self.excluded_by_completion(metric)
-            if gated:
+            sole = self.unrivaled(metric)
+            if sole is not None:
+                verdict = f"not compared: only `{sole}` was eligible"
+            elif gated:
                 verdict += " (excluded: " + ", ".join(f"`{name}` {ratio:.1%}" for name, ratio in gated) + ")"
             lines.append(f"| {info.name} ({info.unit}) | " + " | ".join(cells) + f" | {verdict} |")
         lines.append("")
