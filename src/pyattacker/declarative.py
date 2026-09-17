@@ -18,7 +18,7 @@ import os
 import re
 import sys
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -277,13 +277,46 @@ def _number(value: Any, path: str, *, minimum: float | None = None, exclusive: b
     _range(value, path, minimum, exclusive=exclusive)
 
 
+def _backend_param(name: str, value: Any, path: str, item: Any) -> None:
+    """Type-check one backend parameter against the dataclass field it would land on."""
+    if isinstance(item.default, bool):
+        _flag(value, path)
+    elif isinstance(item.default, int):
+        _integer(value, path, minimum=0)
+    elif isinstance(item.default, float):
+        _number(value, path, minimum=0)
+    elif isinstance(item.default, str) or item.type in ("str", str):
+        _text(value, path)
+        if name == "root" and not value.strip():
+            _fail(path, "must not be empty")
+    # An unrecognised parameter shape is left to `resolve_backend`, the code that will actually
+    # build the backend; the invariant here is "accepted implies constructible".
+
+
 def _backend(value: Any, path: str) -> None:
     """The shape of an ``artifact_backend``, checked without constructing one.
 
-    ``resolve_backend`` is deliberately not used here: constructing a ``FileBackend`` creates its
-    root directory, and `validate` must not touch the filesystem.
+    ``resolve_backend`` is deliberately not called here: constructing a ``FileBackend`` creates its
+    root directory, and `validate` must not touch the filesystem. The check therefore mirrors what
+    ``resolve_backend`` accepts — the JSON-string form, the known backend kinds, the fields each
+    backend takes and the ones it *requires* — so that anything this accepts can also be constructed
+    for real, barring environmental failures such as an unwritable path.
     """
-    if value is None or isinstance(value, str):
+    if value is None:
+        return
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw.startswith("{"):
+            # ""/"inline"/"none" -> inline, "null" -> the null backend, "file://..." or a bare path
+            # -> a file backend rooted there. All of those are constructible by definition.
+            return
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            _fail(path, f"is not valid JSON: {exc}")
+        if not isinstance(parsed, Mapping):
+            _fail(path, f"must describe a mapping, got {type(parsed).__name__}")
+        _backend(parsed, path)
         return
     body = _mapping(value, path)
     params = dict(body)
@@ -291,9 +324,17 @@ def _backend(value: Any, path: str) -> None:
     factory = BACKENDS.get(kind)
     if factory is None:
         _fail(f"{path}.kind", f"unknown artifact backend {kind!r}; available: {sorted(BACKENDS)}")
-    _unknown(path, params, (item.name for item in fields(factory)))
-    if "min_bytes" in params:
-        _integer(params["min_bytes"], f"{path}.min_bytes", minimum=0)
+    declared = {item.name: item for item in fields(factory)}
+    _unknown(path, params, declared)
+    missing = sorted(
+        name
+        for name, item in declared.items()
+        if item.default is MISSING and item.default_factory is MISSING and name not in params
+    )
+    if missing:
+        _fail(path, f"{kind!r} backend requires {missing}")
+    for name, param in params.items():
+        _backend_param(name, param, f"{path}.{name}", declared[name])
 
 
 def _algorithm_param(name: str, value: Any, path: str) -> None:
@@ -618,11 +659,14 @@ class DeclarativeSpec:
     Attributes:
         path: Source config file path, kept for error messages and :meth:`describe`.
         template: The built, validated :class:`~pyattacker.pipeline.PipelineTemplate`.
-        pools: Resource pools declared under ``pools:``, ready to pass to ``Runner(pools=...)``.
-        run: The raw ``run:`` section (concurrency, store, etc.) — not validated here; the CLI
-            maps it onto :class:`~pyattacker.runner.RunConfig` fields.
-        source: The raw ``source:`` section describing how to generate seeds (``kind``/``repeats``/
-            ``key_field`` plus factory-specific keys); consumed by :meth:`seeds`/:meth:`pipelines`.
+        pools: Resource pools declared under ``pools:``, validated by :func:`load_spec` and ready to
+            pass to ``Runner(pools=...)``.
+        run: The ``run:`` section (concurrency, store, ...), validated by :func:`load_spec` against
+            the fields a config may set (see :data:`RUN_FIELDS`); the CLI maps it onto
+            :class:`~pyattacker.runner.RunConfig`.
+        source: The ``source:`` section describing how to generate seeds (``kind``/``repeats``/
+            ``key_field`` plus factory-specific keys); validated by :func:`load_spec` (kind,
+            required fields, numeric ranges) and consumed by :meth:`seeds`/:meth:`pipelines`.
         raw: The config with ``${VAR}`` references expanded where resolvable; in non-strict mode
             an unresolved reference is left as the literal ``${VAR}`` placeholder rather than
             raising (see :func:`expand_env`) — this is *not* guaranteed to be fully expanded.
@@ -706,6 +750,9 @@ def load_spec(path: str | Path, *, strict_env: bool = False) -> DeclarativeSpec:
     pipe_cfg = raw.get("pipeline")
     if not pipe_cfg:
         raise ConfigError("config is missing the pipeline section")
+    # Normalise the section *before* reading from it: a scalar or a list here used to reach
+    # `pipe_cfg.get("tasks")` and escape as an AttributeError instead of a config error.
+    pipe_cfg = _mapping(pipe_cfg, "pipeline")
     entries = pipe_cfg.get("tasks")
     if not entries:
         raise ConfigError("pipeline.tasks must not be empty")

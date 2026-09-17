@@ -16,8 +16,10 @@ All notable changes to this project are documented here. The format follows
   `ConfigError`, not a no-op.
 * **One shared validation entry (`load_spec`) for `validate` and every `run` mode.** Unknown fields
   (with a "did you mean" for typos), wrong types, out-of-range numbers, unknown pool references
-  (including the `resource` a `use:` factory declares itself), unresolvable algorithms and a bad
-  `source:` declaration are exit code `2` before a store or a shard child exists, and each message
+  (including the `resource` a `use:` factory declares itself), unresolvable algorithms, a bad
+  `source:` declaration, a section that is not a mapping, and an `artifact_backend` that
+  `resolve_backend` could not construct (a missing file-backend `root`, an unparseable JSON-string
+  spec, an unknown `kind`) are exit code `2` before a store or a shard child exists, and each message
   names the field path. The `run:` block now also accepts `artifact_backend`, `write_behind`,
   `write_batch` and `flush_interval`, which the CLI used to filter out silently.
 

@@ -193,12 +193,16 @@ is a `2` there too, and no task starts. What is checked, with the field path in 
 | numeric ranges | `run.concurrency: 0`, `run.heartbeat_s` at or below 0, `pools.apis.capacity: 0` |
 | pool references | `pipeline.resource`, `pipeline.tasks[0].resource`, and the `resource` a `use:` factory declares itself |
 | algorithms | `algorithm: nosuchalgorithm`, `algorithm: {name: backoff, bse: 1}` |
+| artifact backend | `artifact_backend: {kind: file}` with no `root`, an unknown `kind`, a JSON-string spec that does not parse, or a `min_bytes` that is not a non-negative integer |
+| sections | `pipeline:` (and every other section) must be a mapping — a scalar or a list is a config error, not a traceback |
 | source | `source.kind` must be `range`/`jsonl`; `jsonl` requires `source.path`; `source.repeats` at least 1 |
 | retry | `"on"` names, and the numeric/boolean fields of a retry block |
 
 It is a *declaration* check only: it does not open `source.path`, walk the dataset, build an
-`artifact_backend` (which would create its directory), or call a task. `${VAR}` values are expanded as
-described below.
+`artifact_backend` (which would create its directory), or call a task. It does, however, check that an
+`artifact_backend` is one `resolve_backend` could construct — required fields such as a file backend's
+`root` included — so `validate` and `run` accept and refuse exactly the same specs. `${VAR}` values are
+expanded as described below.
 
 ## `plugins` — what is installed
 

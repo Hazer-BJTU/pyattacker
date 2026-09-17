@@ -497,6 +497,100 @@ def test_artifact_backend_forms_mean_what_they_say(tmp_path, value, expected):
     assert manifest["artifact_backend"] == expected
 
 
+def test_mapping_and_json_backend_specs_are_accepted_without_touching_the_filesystem(tmp_path):
+    """The accepted side of the backend invariant, and the one place `validate` could grow a side
+    effect: a mapping spec (and its JSON-string spelling) must validate, the real `run` must
+    construct it, and `validate` itself must not create the directory the backend owns."""
+    forms = [
+        ({"kind": "file", "root": str(tmp_path / "mapping")}, "file", tmp_path / "mapping"),
+        ({"kind": "file", "root": str(tmp_path / "json"), "min_bytes": 1}, "file", tmp_path / "json"),
+        ({"kind": "null"}, "null", None),
+        (json.dumps({"kind": "file", "root": str(tmp_path / "string")}), "file", tmp_path / "string"),
+    ]
+    for index, (backend, expected, root) in enumerate(forms):
+        cfg = _write_json_config(tmp_path, f"backend-ok-{index}.json", _shard_config(artifact_backend=backend))
+        db = tmp_path / f"backend-ok-{index}.db"
+
+        assert main(["validate", "-c", str(cfg)]) == 0
+        if root is not None:
+            assert not Path(root).exists(), "validate must not construct an artifact backend"
+
+        assert main(["run", "-c", str(cfg), "--store", str(db)]) == 0
+        if root is not None:
+            assert Path(root).is_dir(), "the run must have constructed the configured backend"
+        (manifest,) = _run_manifest(db)
+        assert manifest["artifact_backend"] == expected
+
+
+# Every malformed backend declaration is asserted through *both* `validate` and `run`: the two share
+# the check, so a spec `validate` accepts has to be constructible by `resolve_backend`, or the
+# precheck sends the operator on with a config that dies during store setup.
+MALFORMED_BACKENDS = [
+    ({"kind": "file"}, "backend requires ['root']", "file-no-root"),
+    ({"kind": "file", "root": 5}, "run.artifact_backend.root", "file-root-not-a-string"),
+    ({"kind": "file", "root": ""}, "run.artifact_backend.root", "file-root-empty"),
+    ({"kind": "file", "root": "/data", "min_bytes": "big"}, "run.artifact_backend.min_bytes", "min-bytes-string"),
+    ({"kind": "file", "root": "/data", "min_bytes": -1}, "run.artifact_backend.min_bytes", "min-bytes-negative"),
+    ({"kind": "file", "root": "/data", "bse": 1}, "unknown field(s) 'bse'", "unknown-field"),
+    ({"kind": "nosuch", "root": "/data"}, "unknown artifact backend", "unknown-kind"),
+    ("{not json", "is not valid JSON", "json-string-unparseable"),
+    ('{"kind": "file"}', "backend requires ['root']", "json-string-no-root"),
+    ('{"kind": "nosuch", "root": "/data"}', "unknown artifact backend", "json-string-unknown-kind"),
+]
+
+
+@pytest.mark.parametrize(
+    ("backend", "fragment"),
+    [(backend, fragment) for backend, fragment, _ in MALFORMED_BACKENDS],
+    ids=[name for _, _, name in MALFORMED_BACKENDS],
+)
+def test_malformed_artifact_backends_are_refused_by_validate_and_by_run(tmp_path, capsys, backend, fragment):
+    cfg = _write_json_config(tmp_path, "backend-bad.json", _shard_config(artifact_backend=backend))
+    db = tmp_path / "backend-bad.db"
+    capsys.readouterr()  # discard earlier output
+
+    assert main(["validate", "-c", str(cfg)]) == 2
+    assert fragment in capsys.readouterr().err
+
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 2
+    assert fragment in capsys.readouterr().err
+    assert not db.exists()  # refused before a store file exists
+
+
+# `pipeline:` used to be dereferenced before it was checked, so a non-mapping section escaped as an
+# AttributeError from `pipe_cfg.get("tasks")` -- exit 1 with a traceback from both commands.
+MALFORMED_PIPELINES = [
+    ("hello", "pipeline", "scalar"),
+    ([1, 2], "pipeline", "list"),
+    (5, "pipeline", "number"),
+    ([], "pipeline", "empty-list"),
+    ({}, "pipeline", "empty-mapping"),
+    ({"tasks": "nope"}, "pipeline.tasks", "tasks-not-a-list"),
+]
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "fragment"),
+    [(pipeline, fragment) for pipeline, fragment, _ in MALFORMED_PIPELINES],
+    ids=[name for _, _, name in MALFORMED_PIPELINES],
+)
+def test_a_malformed_pipeline_section_is_a_config_error_not_a_traceback(tmp_path, capsys, pipeline, fragment):
+    cfg = _write_json_config(tmp_path, "pipeline-shape.json", {"pipeline": pipeline})
+    db = tmp_path / "pipeline-shape.db"
+    capsys.readouterr()
+
+    assert main(["validate", "-c", str(cfg)]) == 2
+    err = capsys.readouterr().err
+    assert fragment in err
+    assert "Traceback" not in err
+
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 2
+    err = capsys.readouterr().err
+    assert fragment in err
+    assert "Traceback" not in err
+    assert not db.exists()
+
+
 @pytest.mark.requires_yaml
 def test_config_backend_and_no_write_behind_reach_the_run_record(tmp_path):
     """The issue's first symptom, verbatim: a config that asks for the null backend plus
