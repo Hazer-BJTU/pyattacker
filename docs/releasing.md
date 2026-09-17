@@ -53,7 +53,7 @@ uv sync                     # refresh uv.lock
 uv run pytest               # tests/test_packaging.py asserts the two agree
 ```
 
-**3. Rehearse, if you want to** (optional; needs no version number and cannot be spent):
+**3. Rehearse, if you want to** (optional; the TestPyPI copy is scratch, and no PyPI version is spent):
 
 Actions → Release → **Run workflow**, with *Publish to TestPyPI* checked. This runs the full verification and
 uploads to TestPyPI. Then check the result:
@@ -63,12 +63,18 @@ uv venv /tmp/verify --python 3.11
 uv pip install --python /tmp/verify/bin/python \
   --index-url https://test.pypi.org/simple/ \
   --extra-index-url https://pypi.org/simple/ \
-  pyattacker
+  --index-strategy unsafe-best-match \
+  "pyattacker==X.Y.Z"
+/tmp/verify/bin/pyattacker --version   # must print X.Y.Z, not the previously released version
 /tmp/verify/bin/pyattacker demo --pipelines 20
 rm -rf /tmp/verify
 ```
 
-The `--extra-index-url` is required: TestPyPI does not carry `pyyaml`.
+Every flag here is load-bearing. `--extra-index-url` is required because TestPyPI does not carry `pyyaml` —
+but `--extra-index-url` also *outranks* `--index-url` in uv, so `pyattacker` itself resolves from PyPI
+(where the last release lives, and `pyyaml` is fine) instead of from TestPyPI. That install succeeds and
+happily reports the *older* version, verifying nothing, which is why the pin and
+`--index-strategy unsafe-best-match` are both needed, and why `--version` is the actual assertion.
 
 **4. Tag and push.** This is the step that publishes:
 
