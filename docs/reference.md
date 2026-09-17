@@ -991,6 +991,47 @@ Record types with typed fields: `PipelineRecord`, `AttemptRecord` and `EventReco
 resume — with no artifact to restore, a resumed pipeline starts over and records
 `pipeline.checkpoint_missing`.
 
+### Paged reads and third-party stores
+
+The list methods above are the **required** interface, and they may materialize their result — that is
+what makes `merge_reports` and a small report easy to write. A whole-kind read that must stay bounded
+in memory (an export of a large store) goes through the `iter_*` helpers instead:
+
+| Helper | Yields, in this order |
+|---|---|
+| `iter_pipelines(store, *, run_id=None, state=None)` | `PipelineRecord`, `created_at` then `pipeline_id` |
+| `iter_tasks(store, pipeline_id=None, *, run_id=None)` | `TaskRecord`, `pipeline_id` then `seq` |
+| `iter_attempts(store, *, run_id=None, pipeline_id=None)` | `AttemptRecord`, `attempt_id` (write order) |
+| `iter_events(store, *, pipeline_id=None, run_id=None)` | `EventRecord`, `event_id` (write order, oldest first) |
+| `iter_artifacts(store, *, pipeline_id)` | `Artifact` of one pipeline, by `seq` |
+
+```python
+from pyattacker.store import iter_events
+
+for event in iter_events(store, run_id=run_id):   # one batch in memory, not the whole log
+    ...
+```
+
+`PagedStore` is the **optional** extension that makes those reads batched: a store implements
+`iter_pipelines` / `iter_tasks` / `iter_attempts` / `iter_events` / `iter_artifacts` with the signatures
+above, reads at most `ITER_BATCH_SIZE` (1000) rows per query, and yields in the documented order.
+`SqliteStore` implements all five with keyset pagination (`WHERE <key> > <last row of the batch>
+ORDER BY <key> LIMIT 1000`), so no query returns more than a batch and no read cursor stays open while
+a row is being processed. `MemoryStore` walks its live containers; for it, bounded memory is inherent.
+
+The compatibility rule for a store that does not implement the extension — the third-party store
+plugin layer is public API, and existing plugins were written against the list methods:
+
+* each `iter_*` helper uses the store's native paged method **when it exists**, and otherwise
+  **delegates to the list API** (`iter_pipelines` → `pipelines()`, `iter_tasks` → `tasks()`,
+  `iter_attempts` → `attempts()`, `iter_artifacts` → `artifacts()`, and `iter_events` → `events()`
+  with the largest limit it can express, because that list API's own `limit` means "the most recent
+  N" and cannot say "everything");
+* the fallback is correct but materializes the kind, so a third-party store gets complete exports
+  with the memory profile of its list API. Implementing the five methods is what upgrades it;
+* `Store` remains the only protocol `open_store()` checks, so adding the extension breaks nothing.
+  `WriteBehindStore` implements it and flushes before every paged read, like its other read views.
+
 ---
 
 ## Artifact backends
@@ -1165,7 +1206,8 @@ external side effects idempotent.
 
 ## Export
 
-Five row shapes, three formats, streaming throughout.
+Five row shapes, three formats. Rows stream out of the store in bounded batches; the merged report
+(N stores into one coherent answer) is the one place that has to hold rows in memory.
 
 | Name | Value |
 |---|---|
@@ -1174,9 +1216,32 @@ Five row shapes, three formats, streaming throughout.
 
 | Function | Purpose |
 |---|---|
-| `iter_rows(store, *, kind="pipelines", run_id=None)` | stream rows as dicts |
-| `export_store(store, path, *, kind="pipelines", fmt="jsonl", run_id=None)` | write one store, returns the row count |
-| `export_stores(paths, path, *, kind=..., fmt=...)` | write several shard stores as one merged file |
+| `iter_rows(store, *, kind="pipelines", run_id=None, limit=None)` | stream rows as dicts |
+| `export_store(store, path, *, kind="pipelines", fmt="jsonl", run_id=None, limit=None)` | write one store, returns the row count |
+| `export_stores(paths, path, *, kind=..., fmt=..., limit=...)` | write several shard stores as one concatenated file |
+
+One row per kind, in the order `limit` truncates:
+
+| `kind` | One row per | Order |
+|---|---|---|
+| `pipelines` (default) | pipeline, nested — tasks and artifacts included | `created_at`, then `pipeline_id` |
+| `tasks` | task: final state, duration, error, leases used | `pipeline_id`, then `seq` |
+| `attempts` | attempt, including each retry `decision` | `attempt_id` (write order) |
+| `events` | structured event | `event_id` (write order, oldest first) |
+| `artifacts` | artifact, intermediate ones included | pipeline order, then `seq` |
+
+`limit` means the same thing for every kind — it counts rows of that kind, including `artifacts`,
+where it used to count pipelines:
+
+* `None` (the default): the **complete** history, nothing is truncated;
+* `0`: no rows;
+* `N > 0`: the first N rows in the order above;
+* a negative value: `ConfigError`.
+
+(`export_stores` applies the limit per store, so each store contributes at most its first N rows.)
+
+Every order ends in a key that is unique, so a read that crosses a batch boundary can neither drop nor
+duplicate a row — including when many pipelines share one `created_at`.
 
 ```python
 from pyattacker import export_store, iter_rows
@@ -1193,6 +1258,15 @@ export_store(store, "attempts.csv", kind="attempts", fmt="csv")
 `pipelines` rows are nested — tasks and artifacts included — which is why it is the default. CSV takes its
 header from the first rows and folds later keys into an `extra` column, so memory stays flat and no field is
 dropped silently.
+
+**Where streaming holds, and where it does not.** `jsonl` and `json` write row by row, and `csv` buffers
+only the `header_rows` prefix it needs for the header. On the store side, `tasks`/`attempts`/`events` are
+read through the paged helpers in batches of `ITER_BATCH_SIZE` (1000) rows, and `artifacts` pages the
+pipelines and then streams each one's artifacts, so the memory unit is **one pipeline**, not the store. A
+`pipelines` row is itself nested, so exporting that kind materializes one pipeline's tasks and artifacts at
+a time. `merge_reports` is the deliberate exception: de-duplicating by `pipeline_id` needs the winning row
+of every pipeline, so the merged rows are held in memory (it counts events/attempts with aggregate queries
+instead of reading the log).
 
 ---
 

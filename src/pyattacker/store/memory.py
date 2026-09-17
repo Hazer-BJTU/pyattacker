@@ -206,6 +206,54 @@ class MemoryStore:
         ]
 
     # ----------------------------------------------------------- query views
+    # Batched whole-kind reads (the optional PagedStore extension). A memory store already holds
+    # every row, so "bounded memory" is inherent; these yield the live records (no copies, and an
+    # artifact's payload is hydrated on demand) while keeping the order identical to SqliteStore's.
+    def iter_pipelines(
+        self, *, run_id: str | None = None, state: str | None = None
+    ) -> Iterator[PipelineRecord]:
+        items = [
+            p
+            for p in self._pipelines.values()
+            if (run_id is None or p.run_id == run_id) and (state is None or p.state == state)
+        ]
+        items.sort(key=lambda p: (p.created_at, p.pipeline_id))
+        yield from items
+
+    def iter_tasks(
+        self, pipeline_id: str | None = None, *, run_id: str | None = None
+    ) -> Iterator[TaskRecord]:
+        items = [
+            t
+            for t in self._tasks.values()
+            if (pipeline_id is None or t.pipeline_id == pipeline_id) and (run_id is None or t.run_id == run_id)
+        ]
+        items.sort(key=lambda t: (t.pipeline_id, t.seq))
+        yield from items
+
+    def iter_attempts(
+        self, *, run_id: str | None = None, pipeline_id: str | None = None
+    ) -> Iterator[AttemptRecord]:
+        for record in self._attempts:
+            if (run_id is None or record.run_id == run_id) and (
+                pipeline_id is None or record.pipeline_id == pipeline_id
+            ):
+                yield record
+
+    def iter_events(
+        self, *, pipeline_id: str | None = None, run_id: str | None = None
+    ) -> Iterator[EventRecord]:
+        for event in self._events:
+            if (pipeline_id is None or event.pipeline_id == pipeline_id) and (
+                run_id is None or event.run_id == run_id
+            ):
+                yield event
+
+    def iter_artifacts(self, *, pipeline_id: str) -> Iterator[Artifact]:
+        items = [a for (pid, _), a in self._artifacts.items() if pid == pipeline_id]
+        for artifact in sorted(items, key=lambda a: a.seq):
+            yield _hydrate(artifact, self.backend)
+
     def pipelines(
         self, *, run_id: str | None = None, state: str | None = None, limit: int | None = None
     ) -> list[PipelineRecord]:
@@ -282,7 +330,7 @@ class MemoryStore:
         return out[-limit:]
 
     def export_rows(self, *, run_id: str | None = None) -> Iterator[dict[str, Any]]:
-        for p in self.pipelines(run_id=run_id):
+        for p in self.iter_pipelines(run_id=run_id):
             yield {
                 "pipeline_id": p.pipeline_id,
                 "key": p.key,

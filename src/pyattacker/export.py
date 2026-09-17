@@ -8,6 +8,9 @@ The kernel records facts; this module decides how to lay them out for whoever co
 * ``events`` — the structured log;
 * ``artifacts`` — the persisted state of each step.
 
+Every kind is exported in full unless an explicit ``limit`` says otherwise, and rows stream out of
+the store in bounded batches — see :func:`iter_rows` for the order and limit rule.
+
 Formats: ``jsonl`` (default, streaming), ``json`` (a single array) and ``csv`` (flat; nested
 values become compact JSON strings). CSV needs a stable header, so the header is taken from the
 first ``header_rows`` rows and anything introduced later is folded into an ``extra`` column —
@@ -21,10 +24,18 @@ import dataclasses
 import json
 import os
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from itertools import islice
 from typing import Any
 
 from .errors import ConfigError
-from .store.base import Store
+from .store.base import (
+    Store,
+    iter_artifacts,
+    iter_attempts,
+    iter_events,
+    iter_pipelines,
+    iter_tasks,
+)
 
 __all__ = ["ROW_KINDS", "FORMATS", "iter_rows", "flatten", "write_rows", "export_store"]
 
@@ -138,32 +149,56 @@ def _decode(artifact: Any) -> Any:
 def iter_rows(
     store: Store, *, kind: str = "pipelines", run_id: str | None = None, limit: int | None = None
 ) -> Iterator[dict[str, Any]]:
-    """Yield export rows of one kind. ``run_id=None`` means "everything in this store"."""
+    """Yield export rows of one kind. ``run_id=None`` means "everything in this store".
+
+    Order — the front of it is what ``limit`` truncates, and every kind orders by a key that is
+    unique, so a paged read can neither drop nor duplicate a row:
+
+    * ``pipelines`` — ``created_at``, ties broken by ``pipeline_id``;
+    * ``tasks`` — ``pipeline_id``, then ``seq``;
+    * ``attempts`` — ``attempt_id`` (insertion order, oldest first);
+    * ``events`` — ``event_id`` (insertion order, oldest first);
+    * ``artifacts`` — pipeline order (as above), then ``seq``.
+
+    ``limit`` counts rows of the requested kind — including ``artifacts``, where it used to count
+    pipelines — and means the same thing for every kind: ``None`` (the default) exports the complete
+    history, ``0`` exports nothing, a positive N exports the first N rows in the order above, and a
+    negative value raises :class:`~pyattacker.errors.ConfigError`.
+
+    Rows stream out of the store: no kind is materialized whole. With ``kind="pipelines"`` a single
+    row nests that pipeline's tasks and artifacts, so one pipeline is the memory unit; the other
+    kinds are read in bounded batches where the store implements the optional paged-iteration
+    extension (``SqliteStore`` does, see :class:`~pyattacker.store.base.PagedStore`).
+    """
     if kind not in ROW_KINDS:
         raise ConfigError(f"unknown row kind {kind!r}; available: {list(ROW_KINDS)}")
+    if limit is not None and limit < 0:
+        raise ConfigError(f"limit must be >= 0, got {limit}")
+
+    rows: Iterator[dict[str, Any]]
     if kind == "pipelines":
-        yield from store.export_rows(run_id=run_id)
-        return
-    if kind == "tasks":
-        records: Iterable[Any] = store.tasks(run_id=run_id, limit=limit)
-        mapper = _task_row
+        rows = store.export_rows(run_id=run_id)
+    elif kind == "tasks":
+        rows = (_task_row(record) for record in iter_tasks(store, run_id=run_id))
     elif kind == "attempts":
-        records = store.attempts(run_id=run_id, limit=limit)
-        mapper = _attempt_row
+        rows = (_attempt_row(record) for record in iter_attempts(store, run_id=run_id))
     elif kind == "events":
-        records = store.events(run_id=run_id, limit=limit or 100000)
-        mapper = _event_row
+        rows = (_event_row(record) for record in iter_events(store, run_id=run_id))
     else:
-        if run_id is None:
-            pipeline_ids = [p.pipeline_id for p in store.pipelines(limit=limit)]
-        else:
-            pipeline_ids = [p.pipeline_id for p in store.pipelines(run_id=run_id, limit=limit)]
-        for pipeline_id in pipeline_ids:
-            for artifact in store.artifacts(pipeline_id):
-                yield _artifact_row(artifact)
-        return
-    for record in records:
-        yield mapper(record)
+        rows = _artifact_rows(store, run_id=run_id)
+    yield from rows if limit is None else islice(rows, limit)
+
+
+def _artifact_rows(store: Store, *, run_id: str | None = None) -> Iterator[dict[str, Any]]:
+    """Artifacts across pipelines: page the pipelines, then stream each one's artifacts.
+
+    The old shape collected every pipeline id up front; paging the pipelines instead keeps the
+    memory unit at "one pipeline's artifacts" and can neither duplicate nor drop a row, because
+    :func:`~pyattacker.store.base.iter_pipelines` orders by ``(created_at, pipeline_id)``.
+    """
+    for pipeline in iter_pipelines(store, run_id=run_id):
+        for artifact in iter_artifacts(store, pipeline_id=pipeline.pipeline_id):
+            yield _artifact_row(artifact)
 
 
 def flatten(value: Any) -> Any:
@@ -282,7 +317,10 @@ def export_stores(
     run_id: str | None = None,
     limit: int | None = None,
 ) -> int:
-    """Export several stores into one file (concatenated; see :mod:`pyattacker.merge` to de-duplicate)."""
+    """Export several stores into one file (concatenated; see :mod:`pyattacker.merge` to de-duplicate).
+
+    ``limit`` is applied per store, so each store contributes at most its first N rows of ``kind``.
+    """
 
     def _chain() -> Iterator[dict[str, Any]]:
         for store in stores:

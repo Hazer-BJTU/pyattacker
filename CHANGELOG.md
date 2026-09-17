@@ -25,6 +25,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+* **Paged store reads (`pyattacker.store.iter_*`).** Whole-kind reads for exports no longer have to
+  materialize a table: `iter_pipelines` / `iter_tasks` / `iter_attempts` / `iter_events` /
+  `iter_artifacts` stream records in the documented order, using an optional `PagedStore` extension
+  when the store has one and falling back to the list API when it does not — so third-party stores
+  keep working unchanged. `SqliteStore` implements the extension with keyset pagination
+  (`WHERE key > last ORDER BY key LIMIT`), and `WriteBehindStore` flushes before every paged read
+  exactly as its list APIs do. See [stores](docs/reference.md#paged-reads-and-third-party-stores).
+
 * **`pyattacker bench` — a simulation that compares the acquire algorithms.** A scenario states the
   assumptions about a provider as data (a capacity cycle, a token bucket that tightens when pushed,
   log-normal latency with a slow tail, independent failures plus correlated storms, three endpoints of
@@ -63,6 +71,13 @@ All notable changes to this project are documented here. The format follows
   descendants die with it; Windows has no process-group signalling in the standard library, so there only
   the direct child is terminated — stated as a platform limit in
   [the `shell_run` reference](docs/reference.md#shell_run).
+
+* **`export` silently stopped at 100 000 events, and dropped the oldest ones.** `iter_rows` asked the
+  store for `limit=100000` even when the caller asked for no limit, and SQLite answers that with the
+  *newest* rows — so on a store with more events than that, a "complete" export quietly began in the
+  middle and the first events were gone. `None` now means the complete history, and the read is paged:
+  an export takes bounded keyset batches instead of `fetchall`-ing the table, and the
+  `pipelines`/`artifacts` paths no longer ignore the limit or collect every pipeline id first.
 * Resume now rejects an existing pipeline key whose task or seed digest differs, preserving its
   historical result/checkpoint and raising `PipelineIdentityConflict` (CLI exit 2). In-flight
   pipelines cancelled during the stop are immediately finalized as interrupted.
@@ -148,6 +163,14 @@ All notable changes to this project are documented here. The format follows
   across deliberately unlike endpoints is good; it is a diagnostic now, and so is `wall_s`.
 
 ### Changed
+
+* **Export `limit` is one rule per row kind, and it counts that kind's rows.** `None` (the default)
+  exports the complete history, `0` exports no rows, a positive `N` exports the first N rows of the
+  kind's documented order and a negative value is a `ConfigError`. Two things follow for callers:
+  `limit` on `kind="artifacts"` used to count *pipelines* — it now counts artifact rows, like every
+  other kind — and a truncated `events` export now keeps the *oldest* rows instead of the newest.
+  `iter_rows` documents the order per kind. The CLI's `--limit` belongs to `run`, not `export`, so no
+  CLI behaviour changes.
 
 * **A scenario can declare the algorithms it cannot exercise** (`Scenario.unsuited`): `bursty_provider`
   lists `failover` (one pool gives it nothing to fail over to) and `least_busy` (the pool's default

@@ -3,7 +3,11 @@
 Coverage
 * ``ROW_KINDS`` / ``FORMATS`` and ``iter_rows`` for every kind on a tiny finished run
   (exact row counts plus concrete field values; JSON artifact payloads come back decoded)
-* ``run_id=`` / ``limit=`` filtering and the ``flatten`` CSVsafe rules
+* ``run_id=`` / ``limit=`` filtering — one limit rule per kind, complete exports by default —
+  and the ``flatten`` CSVsafe rules
+* streaming: a 100_001-event store exports first to last with nothing duplicated, and the SQL
+  trace proves the store reads it in bounded batches instead of one ``fetchall``
+* the compatibility rule for stores: the paged extension is preferred, the list API is the fallback
 * ``write_rows`` in ``jsonl`` / ``json`` / ``csv`` (including the ``extra`` column for keys that
   appear only after ``header_rows``) and ``export_store`` / ``export_stores``
 * ``merge_reports``: de-duplication by ``pipeline_id``, the winner rule (best state, then latest
@@ -16,21 +20,31 @@ Coverage
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import textwrap
 import time
+import tracemalloc
+from math import ceil
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from pyattacker import (
+    Artifact,
+    AttemptRecord,
     ConfigError,
+    EventRecord,
+    MemoryStore,
+    PipelineRecord,
     RetryableError,
     Retrying,
     Runner,
     SqliteStore,
     load_spec,
+    open_store,
     pipeline,
     task,
 )
@@ -46,6 +60,8 @@ from pyattacker.export import (
 )
 from pyattacker.merge import merge_reports
 from pyattacker.shard import shard_specs
+from pyattacker.store import ITER_BATCH_SIZE, PagedStore, Store
+from pyattacker.store.writebehind import WriteBehindStore
 from pyattacker.tasks import flaky
 
 # 2 pipelines x 2 tasks, all succeeding: the counts below are exact for that fixture.
@@ -243,6 +259,383 @@ def test_iter_rows_limit_truncates(two_step):
     assert len(list(iter_rows(two_step.store, kind="attempts", limit=1))) == 1
     assert len(list(iter_rows(two_step.store, kind="events", limit=2))) == 2
     assert len(list(iter_rows(two_step.store, kind="tasks", limit=100))) == EXPECTED_COUNTS["tasks"]
+
+
+@pytest.mark.parametrize("kind", ROW_KINDS)
+def test_iter_rows_limit_means_the_same_thing_for_every_kind(two_step, kind):
+    """One rule per kind: the cap counts exported rows and truncates the documented order.
+
+    ``artifacts`` used to count *pipelines* (so ``limit=1`` returned a whole pipeline's artifacts)
+    and ``pipelines`` ignored the limit outright; ``events`` used to take the newest rows.
+    """
+    everything = list(iter_rows(two_step.store, kind=kind))
+    assert everything  # the fixture run has rows of every kind
+
+    assert list(iter_rows(two_step.store, kind=kind, limit=None)) == everything
+    assert list(iter_rows(two_step.store, kind=kind, limit=0)) == []
+    assert list(iter_rows(two_step.store, kind=kind, limit=1)) == everything[:1]
+    assert list(iter_rows(two_step.store, kind=kind, limit=len(everything))) == everything
+    assert list(iter_rows(two_step.store, kind=kind, limit=len(everything) + 5)) == everything
+    assert (
+        list(iter_rows(two_step.store, kind=kind, run_id=two_step.report.run_id, limit=2))
+        == everything[:2]
+    )
+
+
+@pytest.mark.parametrize("kind", ROW_KINDS)
+def test_iter_rows_rejects_a_negative_limit(two_step, kind):
+    with pytest.raises(ConfigError, match="limit must be >= 0"):
+        list(iter_rows(two_step.store, kind=kind, limit=-1))
+
+
+# ------------------------------------------- streaming export (issue #34 / >100k events)
+# A store one row past the 100_000-event cap the export used to apply silently. Module-scoped: the
+# table is built once and read by both tests below.
+BIG_EVENT_COUNT = 100_001
+
+
+@pytest.fixture(scope="module")
+def big_event_store(tmp_path_factory):
+    path = tmp_path_factory.mktemp("streaming-export") / "events.db"
+    writer = SqliteStore(str(path))
+    insert = (
+        "INSERT INTO events (ts,scope,kind,run_id,pipeline_id,task_run_id,pool,resource_id,data_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?)"
+    )
+    now = time.time()
+    try:
+        writer._conn.execute("BEGIN")  # one transaction, or 100k rows cost 100k commits
+        for start in range(0, BIG_EVENT_COUNT, 10_000):
+            writer._conn.executemany(
+                insert,
+                [
+                    (now + index * 1e-6, "pipeline", f"event.{index}", "run-big", None, None, None,
+                     None, "{}")
+                    for index in range(start, min(start + 10_000, BIG_EVENT_COUNT))
+                ],
+            )
+        writer._conn.commit()
+    finally:
+        writer.close()
+
+    store = SqliteStore(str(path), read_only=True)
+    try:
+        yield store
+    finally:
+        store.close()
+
+
+def test_events_export_past_one_hundred_thousand_is_complete(big_event_store):
+    """The acceptance criterion: >100000 events, first and last present, nothing duplicated."""
+    rows = list(iter_rows(big_event_store, kind="events"))
+
+    assert len(rows) == BIG_EVENT_COUNT  # not the newest 100_000 the hidden default kept
+    assert rows[0]["kind"] == "event.0"
+    assert rows[-1]["kind"] == f"event.{BIG_EVENT_COUNT - 1}"
+
+    event_ids = [row["event_id"] for row in rows]
+    assert len(set(event_ids)) == BIG_EVENT_COUNT  # no duplicates
+    assert event_ids == sorted(event_ids)  # oldest first, the documented order
+
+    filtered = list(iter_rows(big_event_store, kind="events", run_id="run-big"))
+    assert len(filtered) == BIG_EVENT_COUNT
+    assert list(iter_rows(big_event_store, kind="events", run_id="run-other")) == []
+
+
+def test_events_export_reads_bounded_batches_not_the_whole_table(big_event_store):
+    """The batching claim, measured: SQLite's own trace of the statements the export really runs.
+
+    One bounded query per batch (``LIMIT ITER_BATCH_SIZE``), and reaching the first row costs
+    exactly one of them — so the Python-side working set is a batch, not the table.
+    """
+    statements: list[str] = []
+    big_event_store._conn.set_trace_callback(statements.append)
+
+    def event_selects() -> list[str]:
+        return [sql for sql in statements if "FROM events" in sql]
+
+    try:
+        rows = iter_rows(big_event_store, kind="events")
+        first = next(rows)
+        after_first_row = event_selects()
+        consumed = 1 + sum(1 for _ in rows)
+    finally:
+        big_event_store._conn.set_trace_callback(None)
+
+    assert first["kind"] == "event.0"
+    assert consumed == BIG_EVENT_COUNT
+    assert len(after_first_row) == 1
+    assert event_selects() and all(
+        f"ORDER BY event_id LIMIT {ITER_BATCH_SIZE}" in sql for sql in event_selects()
+    )
+    assert len(event_selects()) == ceil(BIG_EVENT_COUNT / ITER_BATCH_SIZE)
+
+
+def _peak_bytes(work: Any) -> int:
+    """Peak Python allocations (bytes) while ``work()`` runs — stdlib ``tracemalloc``, no deps."""
+    gc.collect()
+    tracemalloc.start()
+    try:
+        work()
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_events_export_memory_is_a_batch_not_the_table(big_event_store):
+    """The acceptance criterion, measured: peak memory does not follow the table's row count.
+
+    The bound is calibrated inside the test against the *same* store read through the list API —
+    the shape the export used to have — so it is a ratio, not a machine-specific number. Measured
+    here: ~0.9 MiB streaming against ~66 MiB for the 100_001 events.
+    """
+    materialized = _peak_bytes(lambda: len(big_event_store.events(limit=BIG_EVENT_COUNT)))
+    streamed = _peak_bytes(lambda: sum(1 for _ in iter_rows(big_event_store, kind="events")))
+
+    assert streamed * 8 < materialized  # one bounded batch against the whole table
+
+
+@pytest.fixture()
+def paged_store(tmp_path):
+    """2500 pipelines that all share one ``created_at`` — a tie across every batch boundary."""
+    store = SqliteStore(str(tmp_path / "paged.db"))
+    try:
+        for index in range(2500):
+            pipeline_id = f"p{index:04d}"
+            store.upsert_pipeline(
+                PipelineRecord(
+                    pipeline_id=pipeline_id,
+                    run_id="run-1",
+                    name="qa",
+                    key=f"k{index:04d}",
+                    state="succeeded",
+                    created_at=1000.0,
+                    n_tasks_total=1,
+                    n_tasks_done=1,
+                )
+            )
+            store.put_artifact(
+                Artifact(
+                    id=f"{pipeline_id}:0",
+                    pipeline_id=pipeline_id,
+                    task_name="ask",
+                    seq=0,
+                    type_name="dict",
+                    codec="json",
+                    digest="d",
+                    size=2,
+                    payload=b"{}",
+                    created_at=1000.0,
+                    is_final=True,
+                )
+            )
+        yield store
+    finally:
+        store.close()
+
+
+def test_pipelines_and_artifacts_exports_page_the_pipeline_table(paged_store):
+    """Neither kind may read the whole pipelines table up front, and the tie must not lose a row.
+
+    Instrumented at the SQL layer again: ``artifacts`` used to collect every pipeline id with one
+    unbounded SELECT before reading any artifact.
+    """
+    statements: list[str] = []
+    paged_store._conn.set_trace_callback(statements.append)
+
+    def pipeline_selects() -> list[str]:
+        return [sql for sql in statements if "FROM pipelines" in sql]
+
+    try:
+        artifact_rows = iter_rows(paged_store, kind="artifacts")
+        first_artifact = next(artifact_rows)
+        after_first_row = pipeline_selects()
+        artifacts = [first_artifact, *artifact_rows]
+        artifacts_queries = len(pipeline_selects())
+
+        pipeline_rows = list(iter_rows(paged_store, kind="pipelines"))
+        total_queries = len(pipeline_selects())
+    finally:
+        paged_store._conn.set_trace_callback(None)
+
+    assert first_artifact["pipeline_id"] == "p0000"
+    assert len(after_first_row) == 1 and "LIMIT" in after_first_row[0]
+    assert artifacts_queries == ceil(2500 / ITER_BATCH_SIZE)
+    assert total_queries == 2 * ceil(2500 / ITER_BATCH_SIZE)
+
+    assert [row["pipeline_id"] for row in artifacts] == [f"p{i:04d}" for i in range(2500)]
+    assert len({row["artifact_id"] for row in artifacts}) == 2500
+    assert [row["pipeline_id"] for row in pipeline_rows] == [f"p{i:04d}" for i in range(2500)]
+
+
+def test_events_export_is_complete_in_every_format_with_filters_and_several_stores(tmp_path):
+    """Correctness of the paged path: jsonl/json/csv, ``run_id``, write-behind and two stores."""
+    db1, db2 = tmp_path / "e1.db", tmp_path / "e2.db"
+    report1 = _run(db1, TWO_STEP, [{"n": 0}, {"n": 1}])
+    _run(db2, TWO_STEP, [{"n": 10}, {"n": 11}])
+
+    live = open_store(str(db1))  # auto write-behind: the store the CLI and Runner use
+    other = _open(db2)
+    try:
+        assert isinstance(live, WriteBehindStore)
+        expected = list(iter_rows(live, kind="events"))
+        assert len(expected) == EXPECTED_COUNTS["events"]
+
+        jsonl = tmp_path / "events.jsonl"
+        assert export_store(live, str(jsonl), kind="events", fmt="jsonl") == len(expected)
+        assert [
+            json.loads(line) for line in jsonl.read_text(encoding="utf-8").splitlines()
+        ] == expected
+
+        as_json = tmp_path / "events.json"
+        assert export_store(live, str(as_json), kind="events", fmt="json") == len(expected)
+        assert json.loads(as_json.read_text(encoding="utf-8"))["rows"] == expected
+
+        as_csv = tmp_path / "events.csv"
+        assert export_store(live, str(as_csv), kind="events", fmt="csv") == len(expected)
+        with as_csv.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames
+            csv_rows = list(reader)
+        assert len(csv_rows) == len(expected)
+        assert "kind" in fieldnames
+        assert {row["kind"] for row in csv_rows} == {row["kind"] for row in expected}
+
+        both = tmp_path / "both.jsonl"
+        assert export_stores([live, other], str(both), kind="events") == 2 * len(expected)
+
+        filtered = tmp_path / "filtered.jsonl"
+        assert (
+            export_stores([live, other], str(filtered), kind="events", run_id=report1.run_id)
+            == len(expected)
+        )
+        assert export_store(live, str(tmp_path / "none.jsonl"), kind="events", run_id="run-x") == 0
+    finally:
+        live.close()
+        other.close()
+
+
+def test_export_of_a_write_behind_store_flushes_buffered_facts_first():
+    """The write-behind wrapper buffers attempts/events until a batch fills; the export must flush.
+
+    The paged reads are delegated through explicit methods for exactly this reason — a plain
+    ``__getattr__`` passthrough would read the inner store and silently drop the last batch.
+    """
+    inner = MemoryStore()
+    store = WriteBehindStore(inner, batch_size=1000, flush_interval=999.0)
+    try:
+        for index in range(3):
+            store.emit_event(EventRecord(ts=float(index), kind=f"event.{index}", run_id="run-1"))
+        store.record_attempt(
+            AttemptRecord(
+                pipeline_id="p1",
+                run_id="run-1",
+                task_run_id="p1:0",
+                task_name="ask",
+                seq=0,
+                attempt_no=1,
+                started_at=0.0,
+                outcome="succeeded",
+            )
+        )
+        assert store.pending == 4  # nothing has reached the inner store yet
+
+        assert [row["kind"] for row in iter_rows(store, kind="events")] == [
+            "event.0",
+            "event.1",
+            "event.2",
+        ]
+        assert [row["outcome"] for row in iter_rows(store, kind="attempts")] == ["succeeded"]
+        assert store.pending == 0
+    finally:
+        store.close()
+
+
+# ------------------------------------------- third-party store compatibility (issue #34)
+class _ListOnlyStore:
+    """A third-party store without the paged extension: the required API, and no ``iter_*`` at all.
+
+    A real one defines the ``Store`` members; this proxy forwards them through ``__getattr__`` and
+    raises ``AttributeError`` for the optional paged family, which is what the fallback must survive.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.journal = inner.journal
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("iter_"):
+            raise AttributeError(name)  # the extension this store never implemented
+        return getattr(self._inner, name)
+
+
+class _RecordingStore:
+    """A store that *does* implement the extension and records which paged methods were asked for."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.journal = inner.journal
+        self.calls: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def iter_pipelines(self, **kwargs: Any) -> Any:
+        self.calls.append("iter_pipelines")
+        return self._inner.iter_pipelines(**kwargs)
+
+    def iter_tasks(self, **kwargs: Any) -> Any:
+        self.calls.append("iter_tasks")
+        return self._inner.iter_tasks(**kwargs)
+
+    def iter_attempts(self, **kwargs: Any) -> Any:
+        self.calls.append("iter_attempts")
+        return self._inner.iter_attempts(**kwargs)
+
+    def iter_events(self, **kwargs: Any) -> Any:
+        self.calls.append("iter_events")
+        return self._inner.iter_events(**kwargs)
+
+    def iter_artifacts(self, **kwargs: Any) -> Any:
+        self.calls.append("iter_artifacts")
+        return self._inner.iter_artifacts(**kwargs)
+
+
+def test_a_list_only_third_party_store_keeps_working(two_step):
+    """The documented fallback: a store without the extension is read through its list API."""
+    proxy = _ListOnlyStore(two_step.store)
+    assert not hasattr(proxy, "iter_events")  # the extension really is absent
+    assert not isinstance(proxy, PagedStore)
+
+    for kind in ROW_KINDS:
+        expected = list(iter_rows(two_step.store, kind=kind))
+        assert list(iter_rows(proxy, kind=kind)) == expected
+        assert list(iter_rows(proxy, kind=kind, limit=1)) == expected[:1]
+
+    # ...and the extension stays optional: it is not a member of the required protocol, so a store
+    # written against `Store` alone remains a `Store`.
+    assert isinstance(two_step.store, Store)
+    assert not hasattr(Store, "iter_events")
+
+
+def test_paged_extension_is_used_when_the_store_has_one(two_step):
+    """The other half of the rule: a native paged method wins over the list-API fallback."""
+    proxy = _RecordingStore(two_step.store)
+    assert isinstance(proxy, PagedStore)
+
+    list(iter_rows(proxy, kind="pipelines"))
+    assert proxy.calls == []  # nested rows go through the required `export_rows` (paged inside)
+
+    expected_calls = {
+        "tasks": {"iter_tasks"},
+        "attempts": {"iter_attempts"},
+        "events": {"iter_events"},
+        "artifacts": {"iter_pipelines", "iter_artifacts"},
+    }
+    for kind, expected in expected_calls.items():
+        proxy.calls.clear()
+        list(iter_rows(proxy, kind=kind))
+        assert set(proxy.calls) == expected
 
 
 # ------------------------------------------------------------------------ flatten

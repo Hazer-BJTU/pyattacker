@@ -296,6 +296,14 @@ rerun the whole pipeline, and it leaves a `pipeline.checkpoint_missing` event be
 before the attempt starts" from being interrupted by cancellation. Batched writes / write-behind merging is a
 later optimization and does not affect the interface.
 
+**Read policy**: the list queries above may materialize their result — a report wants a list. A whole-kind
+read that must stay bounded (an export of a large store) goes through the optional paged-iteration
+extension instead: keyset batches of `ITER_BATCH_SIZE` rows, ordered by a unique key so a batch boundary
+can neither drop nor duplicate a row; a nested `pipelines` row materializes one pipeline, which is the
+documented memory unit. `Store` is unchanged, so a third-party store that implements only the list API
+stays complete, just not bounded in memory — see
+[the store reference](reference.md#paged-reads-and-third-party-stores).
+
 ---
 
 ## 6. Two Ways to Use It
@@ -420,7 +428,9 @@ can record its own provenance.
 **Row shapes** (`--rows`) for whatever consumes the results: `pipelines` (nested, the default), `tasks`,
 `attempts` (with the retry `decision`), `events`, `artifacts`. **Formats** (`--format`): `jsonl`, `json`, `csv`.
 CSV takes its header from the first `header_rows` rows and folds anything introduced later into an `extra`
-column, which keeps memory flat without silently dropping fields.
+column, which keeps memory flat without silently dropping fields. Every kind is exported in full — `events`
+used to stop at the newest 100 000 rows — and read in bounded batches; see
+[the export reference](reference.md#export).
 
 ### 6.4 Plugins, Backends and the Monitoring Endpoint (M4)
 

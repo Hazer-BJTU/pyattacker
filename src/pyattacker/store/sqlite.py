@@ -20,7 +20,14 @@ from pathlib import Path
 from typing import Any
 
 from ..artifact import Artifact
-from .base import AttemptRecord, EventRecord, PipelineRecord, RunRecord, TaskRecord
+from .base import (
+    ITER_BATCH_SIZE,
+    AttemptRecord,
+    EventRecord,
+    PipelineRecord,
+    RunRecord,
+    TaskRecord,
+)
 
 __all__ = ["SqliteStore"]
 
@@ -64,6 +71,8 @@ CREATE TABLE IF NOT EXISTS pipelines (
 );
 CREATE INDEX IF NOT EXISTS idx_pipelines_run ON pipelines(run_id, state);
 CREATE INDEX IF NOT EXISTS idx_pipelines_state ON pipelines(state);
+-- the keyset pagination order used by iter_pipelines/export_rows (created_at, then pipeline_id)
+CREATE INDEX IF NOT EXISTS idx_pipelines_created ON pipelines(created_at, pipeline_id);
 
 CREATE TABLE IF NOT EXISTS tasks (
     task_run_id TEXT PRIMARY KEY,
@@ -438,6 +447,109 @@ class SqliteStore:
         ]
 
     # ----------------------------------------------------------- query views
+    # Batched whole-kind reads (the optional PagedStore extension). Each query is a keyset page:
+    # `WHERE <key> > (last row of the previous page) ORDER BY <key> LIMIT ITER_BATCH_SIZE`. Keyset
+    # rather than one long-lived cursor so no read statement stays open while the caller processes
+    # a row, and rather than `fetchall` so the Python-side working set is one batch, not the table.
+    def _iter_keyset(
+        self,
+        select: str,
+        where: list[str],
+        args: list[Any],
+        *,
+        columns: tuple[str, ...],
+        mapper: Any,
+    ) -> Iterator[Any]:
+        predicate = _keyset_predicate(columns)
+        order = ", ".join(columns)
+        cursor: tuple[Any, ...] | None = None
+        while True:
+            sql = select
+            params = list(args)
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            if cursor is not None:
+                sql += (" AND " if where else " WHERE ") + predicate
+                params += _keyset_params(cursor)
+            sql += f" ORDER BY {order} LIMIT ?"
+            params.append(ITER_BATCH_SIZE)
+            rows = self._conn.execute(sql, params).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                yield mapper(row)
+            if len(rows) < ITER_BATCH_SIZE:
+                return
+            cursor = tuple(rows[-1][column] for column in columns)
+
+    def iter_pipelines(
+        self, *, run_id: str | None = None, state: str | None = None
+    ) -> Iterator[PipelineRecord]:
+        where: list[str] = []
+        args: list[Any] = []
+        if run_id:
+            where.append("run_id=?")
+            args.append(run_id)
+        if state:
+            where.append("state=?")
+            args.append(state)
+        yield from self._iter_keyset(
+            "SELECT * FROM pipelines", where, args,
+            columns=("created_at", "pipeline_id"), mapper=_to_pipeline,
+        )
+
+    def iter_tasks(
+        self, pipeline_id: str | None = None, *, run_id: str | None = None
+    ) -> Iterator[TaskRecord]:
+        where: list[str] = []
+        args: list[Any] = []
+        if pipeline_id:
+            where.append("pipeline_id=?")
+            args.append(pipeline_id)
+        if run_id:
+            where.append("run_id=?")
+            args.append(run_id)
+        yield from self._iter_keyset(
+            "SELECT * FROM tasks", where, args,
+            columns=("pipeline_id", "seq"), mapper=_to_task,
+        )
+
+    def iter_attempts(
+        self, *, run_id: str | None = None, pipeline_id: str | None = None
+    ) -> Iterator[AttemptRecord]:
+        where: list[str] = []
+        args: list[Any] = []
+        if run_id:
+            where.append("run_id=?")
+            args.append(run_id)
+        if pipeline_id:
+            where.append("pipeline_id=?")
+            args.append(pipeline_id)
+        yield from self._iter_keyset(
+            "SELECT * FROM attempts", where, args, columns=("attempt_id",), mapper=_to_attempt
+        )
+
+    def iter_events(
+        self, *, pipeline_id: str | None = None, run_id: str | None = None
+    ) -> Iterator[EventRecord]:
+        where: list[str] = []
+        args: list[Any] = []
+        if pipeline_id:
+            where.append("pipeline_id=?")
+            args.append(pipeline_id)
+        if run_id:
+            where.append("run_id=?")
+            args.append(run_id)
+        yield from self._iter_keyset(
+            "SELECT * FROM events", where, args, columns=("event_id",), mapper=_to_event
+        )
+
+    def iter_artifacts(self, *, pipeline_id: str) -> Iterator[Artifact]:
+        yield from self._iter_keyset(
+            "SELECT * FROM artifacts", ["pipeline_id=?"], [pipeline_id],
+            columns=("seq",), mapper=lambda row: _hydrate(_to_artifact(row), self.backend),
+        )
+
     def pipelines(
         self, *, run_id: str | None = None, state: str | None = None, limit: int | None = None
     ) -> list[PipelineRecord]:
@@ -578,7 +690,9 @@ class SqliteStore:
         return [dict(r) for r in self._conn.execute(sql, args).fetchall()]
 
     def export_rows(self, *, run_id: str | None = None) -> Iterator[dict[str, Any]]:
-        for record in self.pipelines(run_id=run_id):
+        # Paged over pipelines: the nested part (tasks + artifacts) is materialized per pipeline,
+        # which is the documented memory unit, not per store.
+        for record in self.iter_pipelines(run_id=run_id):
             tasks = self.tasks(record.pipeline_id)
             arts = self.artifacts(record.pipeline_id)
             yield {
@@ -635,6 +749,28 @@ class SqliteStore:
 
 
 # ------------------------------------------------------------ row mapping
+def _keyset_predicate(columns: tuple[str, ...]) -> str:
+    """``(a, b) > (?, ?)`` written out column by column.
+
+    SQLite only learned row values in 3.15, and the spelled-out form is what lets the query use an
+    index on ``(a, b)`` for both the range and the order.
+    """
+    terms = []
+    for index, column in enumerate(columns):
+        equalities = [f"{earlier}=?" for earlier in columns[:index]]
+        terms.append("(" + " AND ".join([*equalities, f"{column}>?"]) + ")")
+    return "(" + " OR ".join(terms) + ")"
+
+
+def _keyset_params(cursor: tuple[Any, ...]) -> list[Any]:
+    """The parameters :func:`_keyset_predicate` expects for one cursor row."""
+    params: list[Any] = []
+    for index in range(len(cursor)):
+        params.extend(cursor[:index])
+        params.append(cursor[index])
+    return params
+
+
 def _to_run(row: sqlite3.Row) -> RunRecord:
     return RunRecord(
         run_id=row["run_id"], label=row["label"], status=row["status"], started_at=row["started_at"],

@@ -158,6 +158,11 @@ pyattacker export STORE [STORE ...] OUTPUT [--rows SHAPE] [--format FMT] [--run-
 `--format` is `jsonl` (default), `json` or `csv`. CSV takes its header from the first rows and folds later
 keys into an `extra` column, so memory stays flat and no field is silently dropped.
 
+Every kind is exported in full: a store with more than 100 000 events used to lose everything older than
+the newest 100 000 from `--rows events`. Rows come out oldest-first for `events`/`attempts` and in
+pipeline/`seq` order for `tasks`/`artifacts`, read from the store in bounded batches — [the export
+reference](reference.md#export) has the exact per-kind order, the `limit` rule and the memory notes.
+
 ## `serve` — read-only HTTP view
 
 ```bash
