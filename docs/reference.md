@@ -47,7 +47,7 @@ A task is a unary function: one value in, one value out. It may be sync or async
 ### `task`
 
 ```python
-@task(name=None, *, resource=None, algorithm=None, retry=None, timeout_s=None) -> TaskSpec
+@task(name=None, *, resource=None, algorithm=None, retry=None, timeout_s=None, config=None, version=None) -> TaskSpec
 ```
 
 Turns a function into a `TaskSpec`. Usable bare (`@task`), with a name (`@task("ask")`), or with options.
@@ -59,6 +59,8 @@ Turns a function into a `TaskSpec`. Usable bare (`@task`), with a name (`@task("
 | `algorithm` | `str` or algorithm | `None` | default acquire policy; falls back to the pool's |
 | `retry` | `Retrying` or `dict` | no retries | policy applied when an attempt raises |
 | `timeout_s` | `float` | `None` | wall-clock limit for one attempt; **async tasks only** |
+| `config` | JSON mapping | `{}` | declared behavior, snapshotted into the resume fingerprint |
+| `version` | `str` | `None` | explicit revision for external behavior or dynamic code |
 
 ```python
 from pyattacker import Retrying, task
@@ -81,7 +83,7 @@ A task needing more than the value and the context takes it from a closure:
 
 ```python
 def make_judge(model: str, threshold: float):
-    @task(f"judge.{model}", resource="judges")
+    @task(f"judge.{model}", resource="judges", config={"model": model, "threshold": threshold})
     async def judge(row: dict, ctx) -> dict:
         async with ctx.acquire(model=model) as lease:
             return {**row, "pass": await lease.client.score(row) >= threshold}
@@ -94,7 +96,8 @@ pipeline("eval", prepare | make_judge("gpt-4o", 0.8))
 
 ```python
 build_task_spec(fn, *, name=None, resource=None, algorithm=None, retry=None,
-                timeout_s=None, registry=None) -> TaskSpec
+                timeout_s=None, registry=None, config=None, version=None,
+                children=(), parameters=None) -> TaskSpec
 ```
 
 The function `@task` is built on. Call it directly when the target is not known at decoration time — which
@@ -114,11 +117,13 @@ Immutable description of a task. You rarely construct one; you receive them from
 | `accepts`, `returns` | type hints, used for the build-time chain check |
 | `takes_ctx` | whether `fn` accepts `(value, ctx)` |
 | `module`, `qualname`, `code_digest` | identify this version of the code; folded into the pipeline digest |
+| `config`, `version` | explicitly declared behavior and revision |
+| `parameters`, `children` | factory parameters and nested specs; recorded separately from user config |
 
 | Method | Returns |
 |---|---|
 | `is_async` | whether `fn` is a coroutine function |
-| `fingerprint()` | the dict that feeds `spec_digest` |
+| `fingerprint(*, include_code=True)` | the dict that feeds `spec_digest`; includes nested specs |
 | `with_overrides(**kwargs)` | a new spec with fields replaced |
 
 Two `TaskSpec`s compose with `|` into a `Chain`. `spec | other` validates nothing on its own; the check
@@ -341,7 +346,7 @@ template = pipeline("qa", steps)
 compute_spec_digest(tasks, *, include_code=True) -> str
 ```
 
-The task-chain fingerprint. Useful for checking whether a code change would invalidate existing checkpoints
+The task-chain fingerprint (`v2:` followed by a 32-character hex digest). Useful for checking whether a code change would invalidate existing checkpoints
 before you run anything:
 
 ```python
@@ -760,6 +765,7 @@ raise and asks your retry policy what to do.
 ```
 PyAttackerError
 ├── ConfigError              a config or declaration mistake (CLI exit code 2)
+│   └── PipelineIdentityConflict  stored key has a different task or seed digest
 ├── PipelineBuildError       the task chain does not type-check
 ├── PluginError              a plugin failed to load or resolve
 ├── ArtifactCodecError       a payload could not be encoded or decoded
@@ -1062,6 +1068,71 @@ from the merged rows. Merging is idempotent, so a store counted twice does not i
 | `summary()` | human-readable |
 | `errors(limit=20)` | failures across all shards |
 | `export(path, *, fmt="jsonl", kind="pipelines")` | write the merged view |
+
+---
+
+## Resume identity
+
+A task fingerprint records its name/target, declared resource and timeout, every retry field
+(including exception module/qualified names), task algorithm configuration, `config`, `version`,
+and factory `parameters`. `fanout` also records its ordered child fingerprints and `on_error`.
+Built-in factories record their behavior arguments automatically. User `config` is separate from
+factory parameters, so a declarative override cannot erase a built-in's behavior identity.
+
+`config` and `parameters` must contain JSON values with finite numbers; they are snapshotted when
+the spec is built. Arbitrary closures, clients, globals, imported helpers, endpoint options, and
+pool-default algorithms are **not** inspected. Declare behavior from those sources explicitly:
+
+```python
+from pyattacker import task
+
+@task("ask", config={"model": "model-a", "temperature": 0.2}, version="prompt-v2")
+async def ask(row, ctx):
+    ...  # use the same declared model, temperature and prompt revision in your client call
+```
+
+A custom task algorithm must provide `fingerprint()` returning finite JSON values, or the task
+must supply `version=` and bump it when algorithm behavior changes. Built-in algorithm strings,
+config mappings and equivalent instances normalize to the same fingerprint; nested fallback
+configuration is included. Secrets and runtime clients should never be placed in identity config.
+
+`pipeline(..., include_code=False)` removes source digests recursively, including fanout children.
+It retains factory parameters, config, version and policies. Source-inspection failure falls back
+to module/qualified name, so dynamically defined functions need an explicit version to distinguish
+implementations with the same name. Changes to imported helpers also need config/version updates.
+
+Default IDs hash the spec digest, seed digest and repeat index. An unchanged definition/input
+retains its ID and shard; changed behavior produces a new ID and may move to another shard.
+Explicit `bind(key=...)`, `map(key_of=...)` and declarative `source.key_field` retain their supplied
+IDs, but the Runner checks the stored spec and seed digest **before** skipping or restoring.
+A mismatch raises `PipelineIdentityConflict` (`ConfigError`, CLI exit 2), interrupts the new run,
+and leaves the conflicting pipeline's stored definition, result and checkpoint untouched.
+Use a new key or store for changed work. `retry_succeeded=True` is not a conflict override.
+
+### Upgrading existing stores
+
+The new spec digest is prefixed `v2:`; all default pipeline IDs change from the old fingerprint
+format. Old records remain readable/exportable, but are not automatically migrated or reused:
+the old fingerprint omitted information needed to verify equivalence. Opening a store whose
+oldest pipeline has a legacy digest emits a warning and `run.legacy_identity` event before tasks
+start. Default IDs rerun work; explicit old keys conflict. Finish expensive old runs with the old
+package, then start a new store for v2. Do not rewrite legacy digests to bypass verification.
+For sharded runs, this identity change also changes shard assignment; keep the old shard stores
+and old package together when completing an old run.
+
+### External side effects
+
+Recovery skips tasks whose checkpoint cursor and artifact are durable. It does not guarantee
+exactly-once requests or file writes: a provider may complete a request before the process crashes
+or fails while writing the checkpoint, and that task can run again. Journal summary, null/missing
+payloads and unusable checkpoints can also require replay of earlier tasks.
+
+If your provider supports idempotency keys, derive one from the stable pipeline and task identity,
+for example `f"{ctx.pipeline_id}:{ctx.seq}"`, and reuse it across retries rather than including the
+attempt number. Respect the provider's retention window and API contract. For file sinks, upsert
+by the same identity or write one atomically replaced file per pipeline/task; a plain append-only
+`write_jsonl` task can create duplicate lines on replay. Resource lease safety does not make those
+external side effects idempotent.
 
 ---
 

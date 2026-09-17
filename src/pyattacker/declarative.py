@@ -182,6 +182,8 @@ def _build_task(entry: Mapping[str, Any], *, default_pool: str | None = None) ->
         "resource": entry.get("resource", default_pool),
         "algorithm": entry.get("algorithm"),
         "timeout_s": entry.get("timeout_s"),
+        "config": entry.get("config"),
+        "version": entry.get("version"),
     }
     if entry.get("retry") is not None:
         overrides["retry"] = _build_retrying(entry["retry"])

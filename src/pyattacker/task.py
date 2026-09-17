@@ -18,10 +18,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import json
 import random
 import typing
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 from .algorithm import backoff_delay
@@ -87,6 +88,10 @@ class TaskSpec:
     and (if ``takes_ctx``) a fresh :class:`TaskContext`.
 
     Attributes:
+        config / version: Declared JSON behavior and explicit revision. Config is snapshotted
+            at construction; arbitrary closures and external endpoint settings are not inspected.
+        parameters / children: Factory behavior arguments and nested specs, kept separately from
+            user config so config overrides cannot erase factory identity.
         fn: The wrapped callable; ``(value)`` or ``(value, ctx)`` depending on ``takes_ctx``.
         resource: Default pool name this task acquires from (``ctx.acquire()`` with no ``pool=``
             falls back to this); ``None`` means the task must always name its pool explicitly.
@@ -119,26 +124,52 @@ class TaskSpec:
     module: str = ""
     qualname: str = ""
     code_digest: str = ""
+    config: Mapping[str, Any] = field(default_factory=dict, compare=False, repr=False)
+    parameters: Mapping[str, Any] = field(default_factory=dict, compare=False, repr=False)
+    version: str | None = None
+    children: tuple["TaskSpec", ...] = field(default=(), repr=False)
+    _config_json: str = field(default="{}", init=False, repr=False)
+    _parameters_json: str = field(default="{}", init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.version is not None and not isinstance(self.version, str):
+            raise ConfigError("task version must be a string")
+        if not isinstance(self.config, Mapping) or not isinstance(self.parameters, Mapping):
+            raise ConfigError("task config and parameters must be JSON mappings")
+        object.__setattr__(self, "_config_json", _identity_json(dict(self.config)))
+        object.__setattr__(self, "_parameters_json", _identity_json(dict(self.parameters)))
 
     @property
     def is_async(self) -> bool:
         return inspect.iscoroutinefunction(self.fn)
 
-    def fingerprint(self) -> dict[str, Any]:
-        return {
+    def fingerprint(self, *, include_code: bool = True) -> dict[str, Any]:
+        """Stable declared behavior; never inspect closures or serialize runtime clients."""
+        result = {
             "name": self.name,
             "target": f"{self.module}:{self.qualname}",
-            "code": self.code_digest,
+            "config": json.loads(self._config_json),
+            "parameters": json.loads(self._parameters_json),
+            "version": self.version,
+            "children": [child.fingerprint(include_code=include_code) for child in self.children],
             "resource": self.resource,
+            "algorithm": _algorithm_identity(self.algorithm, version=self.version),
             "timeout_s": self.timeout_s,
             "retry": {
                 "max_attempts": self.retry.max_attempts,
+                "on": [f"{exc.__module__}:{exc.__qualname__}" for exc in self.retry.on],
+                "retry_classified": self.retry.retry_classified,
+                "retry_unknown": self.retry.retry_unknown,
+                "max_total_s": self.retry.max_total_s,
                 "base": self.retry.base,
                 "factor": self.retry.factor,
                 "cap": self.retry.cap,
                 "jitter": self.retry.jitter,
             },
         }
+        if include_code:
+            result["code"] = self.code_digest
+        return result
 
     def with_overrides(self, **kwargs: Any) -> "TaskSpec":
         return replace(self, **{k: v for k, v in kwargs.items() if v is not None})
@@ -151,6 +182,37 @@ class TaskSpec:
 
     def __call__(self, value: Any, ctx: "TaskContext") -> Any:
         return self.fn(value, ctx) if self.takes_ctx else self.fn(value)
+
+
+def _identity_json(value: Any) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"task identity must contain only finite JSON values: {exc}") from exc
+
+
+def _algorithm_identity(spec: Any, *, version: str | None = None) -> Any:
+    if spec is None:
+        # Pool defaults and endpoint options are external: version them through task config/version.
+        return None
+    from .algorithm import ALGORITHMS, resolve_algorithm
+
+    algorithm = resolve_algorithm(spec)
+    target = f"{type(algorithm).__module__}:{type(algorithm).__qualname__}"
+    if type(algorithm) in ALGORITHMS.values():
+        params = {}
+        for item in fields(algorithm):
+            value = getattr(algorithm, item.name)
+            params[item.name] = _algorithm_identity(value, version=version) if item.name == "fallback" else value
+        return json.loads(_identity_json({"target": target, "params": params}))
+    hook = getattr(algorithm, "fingerprint", None)
+    if callable(hook):
+        return json.loads(_identity_json({"target": target, "config": hook()}))
+    if version is not None:
+        return {"target": target, "version": version}
+    raise ConfigError(
+        f"custom algorithm {target} must provide fingerprint() with JSON values or use task(version=...)"
+    )
 
 
 def _code_digest(fn: Callable[..., Any]) -> str:
@@ -169,12 +231,20 @@ def build_task_spec(
     retry: Retrying | Mapping[str, Any] | None = None,
     timeout_s: float | None = None,
     registry: CodecRegistry | None = None,
+    config: Mapping[str, Any] | None = None,
+    version: str | None = None,
+    children: tuple[TaskSpec, ...] = (),
+    parameters: Mapping[str, Any] | None = None,
 ) -> TaskSpec:
     """Wrap a plain function into a :class:`TaskSpec` (the internal implementation of ``@task``)."""
     if isinstance(fn, TaskSpec):  # double decoration / declarative override
-        return fn if not any((name, resource, algorithm, retry, timeout_s)) else fn.with_overrides(
+        if not (any((name, resource, algorithm, retry, timeout_s, children))
+                or config is not None or version is not None or parameters is not None):
+            return fn
+        return fn.with_overrides(
             name=name, resource=resource, algorithm=algorithm, timeout_s=timeout_s,
             retry=_as_retrying(retry) if retry is not None else None,
+            config=config, version=version, children=children or None, parameters=parameters,
         )
     if not callable(fn):
         raise ConfigError(f"task must be callable, got {fn!r}")
@@ -222,6 +292,10 @@ def build_task_spec(
         module=getattr(fn, "__module__", "") or "",
         qualname=getattr(fn, "__qualname__", "") or "",
         code_digest=_code_digest(fn),
+        config=config if config is not None else {},
+        version=version,
+        children=children,
+        parameters=parameters if parameters is not None else {},
     )
 
 
@@ -244,6 +318,8 @@ def task(
     algorithm: Any = None,
     retry: Retrying | Mapping[str, Any] | None = None,
     timeout_s: float | None = None,
+    config: Mapping[str, Any] | None = None,
+    version: str | None = None,
 ) -> Any:
     """Mark a function as a task. Supports ``@task`` / ``@task("name")`` / ``@task(name=..., retry=...)``."""
 
@@ -255,6 +331,8 @@ def task(
             algorithm=algorithm,
             retry=retry,
             timeout_s=timeout_s,
+            config=config,
+            version=version,
         )
 
     if callable(name):

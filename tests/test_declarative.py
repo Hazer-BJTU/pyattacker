@@ -128,7 +128,8 @@ def test_describe_output_structure(tmp_path):
         "tags": {"suite": "decl"},
         "spec_digest": spec.template.spec_digest,
     }
-    assert len(described["pipeline"]["spec_digest"]) == 32  # hex of blake2b(digest_size=16)
+    assert described["pipeline"]["spec_digest"].startswith("v2:")
+    assert len(described["pipeline"]["spec_digest"][3:]) == 32
     assert described["pools"] == {
         "apis": {"kind": "llm", "resources": 2, "capacity": 8, "algorithm": "backoff"},
         "judge": {"kind": None, "resources": 1, "capacity": 1, "algorithm": "wait"},

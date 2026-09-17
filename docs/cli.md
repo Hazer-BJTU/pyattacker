@@ -193,6 +193,12 @@ pipeline:
 source: { kind: jsonl, path: data.jsonl, limit: 100, key_field: id, repeats: 1 }
 ```
 
+Task entries also accept `config: {model: model-a}` and `version: "prompt-v2"` for behavior that
+cannot be inferred from source. These join the recovery fingerprint; factory parameters remain
+separate. With `source.key_field`, changing task identity or seed contents under an existing key
+raises a config error (exit 2) and preserves the old result. Use a new key/store for changed work.
+See [resume identity](reference.md#resume-identity) before upgrading an existing store.
+
 `${VAR}` is expanded from the environment (see `--strict-env`). `source.kind` is `jsonl` or `range`;
 `repeats: k` is pass@k — k independent pipelines per seed. CLI flags override the `run:` block.
 

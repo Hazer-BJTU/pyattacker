@@ -82,7 +82,7 @@ These six are the foundation of the design; no change may break them:
 
 ```
 pipeline_key = blake2b(canonical_json({
-    spec_digest,          # task-chain fingerprint: each task's name/target/args + source digest
+    spec_digest,          # v2 task-chain fingerprint: config/parameters/children/policies + source digest
     seed_digest,          # digest of the seed contents (that row of the dataset)
     repeat,               # which sample of pass@k this is
 }))
@@ -97,6 +97,12 @@ Three direct consequences:
 * **pass@k for free**: `template.map(seeds, repeats=3)` expands into three independent pipelines in one go,
   sharing the same seed digest.
 
+The spec fingerprint is versioned as `v2:`. Explicit keys retain their supplied identity, but
+stored spec/seed digests must match before skip or restore. Legacy stores remain readable;
+default IDs change and explicit legacy keys conflict. Closures, globals, endpoint options and
+pool defaults require declared task config/version. See [resume identity](reference.md#resume-identity)
+for migration and external side-effect idempotency; checkpoints do not guarantee exactly-once calls.
+
 ---
 
 ## 4. Key Mechanisms
@@ -109,11 +115,13 @@ After each task succeeds, three things happen in order:
 2. `store.record_task(...)` — the task's final state along with duration, error, and leases used;
 3. `store.upsert_pipeline(record.n_tasks_done = seq + 1)` — **advances the checkpoint cursor**.
 
-The recovery algorithm (`Runner._execute_pipeline`):
+The recovery algorithm (`Runner._open_pipeline` / `Runner._drive`):
 
 ```
 resume(spec):
     rec = store.get_pipeline(spec.pipeline_id)
+    if rec exists and (rec.spec_digest != spec.spec_digest or rec.seed_digest != spec.seed_digest):
+        → PipelineIdentityConflict; preserve existing pipeline and checkpoint
     if rec.state == succeeded and not retry_succeeded:  → skip (counted as skipped)
     start = 0
     if rec.state in (failed, interrupted) and rec.n_tasks_done > 0:

@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import traceback as tb_mod
+import warnings
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -46,6 +47,7 @@ from .artifact import (
 from .errors import (
     ConfigError,
     LeaseLeakError,
+    PipelineIdentityConflict,
     PyAttackerError,
     StoreUnavailable,
     error_class_of,
@@ -473,6 +475,7 @@ class Runner:
         self._all_done = asyncio.Event()
         self._hard_stop = False
         self._fatal_error = None
+        self._identity_error: PipelineIdentityConflict | None = None
         for pool in self.pools.values():
             pool.reset_waiters()
         self._live["started_at"] = started
@@ -498,6 +501,15 @@ class Runner:
                 notes=cfg.notes,
             )
         )
+        existing = self.store.pipelines(limit=1)
+        if existing and not existing[0].spec_digest.startswith("v2:"):
+            message = (
+                "store contains legacy task fingerprints; v2 default pipeline IDs will rerun work, "
+                "and explicit keys with old fingerprints will conflict. Use a new store or retain "
+                "the old package to finish the old run; see docs/reference.md#resume-identity."
+            )
+            warnings.warn(message, UserWarning, stacklevel=2)
+            self._emit("run.legacy_identity", scope="run", data={"message": message})
         if resume:
             interrupted = self.store.interrupt_stale(
                 stale_after_s=cfg.stale_after_s, keep_run_id=rid
@@ -585,6 +597,8 @@ class Runner:
             store=self.store,
         )
         self._flush_store()
+        if self._identity_error is not None:
+            raise self._identity_error
         if isinstance(producer_error, asyncio.CancelledError):
             raise producer_error
         if producer_error is not None:
@@ -651,8 +665,6 @@ class Runner:
             pump.cancel()
             await asyncio.gather(pump, return_exceptions=True)
             try:
-                for _ in workers:
-                    await queue.put(None)
                 if self._hard_stop:
                     # The caller cancelled us: a worker stuck in a 30-minute task must not keep
                     # the process alive, so cancel them rather than waiting.
@@ -660,6 +672,8 @@ class Runner:
                         worker.cancel()
                     await asyncio.gather(*workers, return_exceptions=True)
                 else:
+                    for _ in workers:
+                        await queue.put(None)
                     try:
                         await asyncio.wait_for(
                             asyncio.gather(*workers, return_exceptions=True),
@@ -712,6 +726,8 @@ class Runner:
             try:
                 if item is None:
                     return
+                if self._identity_error is not None:
+                    continue  # stop queued work before opening or overwriting any other records
                 state = None
                 self._live["running"] += 1
                 try:
@@ -724,6 +740,16 @@ class Runner:
                     self._live["running"] -= 1
             except asyncio.CancelledError:
                 raise
+            except PipelineIdentityConflict as exc:
+                # Do not send conflicts through internal-error recovery: that would overwrite
+                # the historical row and its checkpoint with a failure from the new definition.
+                self._identity_error = exc
+                self._hard_stop = True
+                self.stop("identity_conflict")
+                self._counters["pipelines_done"] += 1
+                self._emit(
+                    "pipeline.identity_conflict", pipeline_id=item.pipeline_id, data={"error": str(exc)}
+                )
             except Exception as exc:  # framework-level surprise: record it, don't take down the run
                 self._counters["pipelines_failed"] += 1
                 self._counters["pipelines_done"] += 1
@@ -819,6 +845,18 @@ class Runner:
         """
         cfg = self.config
         record = self.store.get_pipeline(spec.pipeline_id)
+        if record is not None:
+            changed = []
+            if record.spec_digest != spec.spec_digest:
+                changed.append("task definition (spec_digest)")
+            if record.seed_digest != spec.seed_digest:
+                changed.append("input (seed_digest)")
+            if changed:
+                raise PipelineIdentityConflict(
+                    f"pipeline key {spec.key!r} conflicts with stored {' and '.join(changed)}; "
+                    "the existing result/checkpoint is unchanged. Use a new key or store for "
+                    "changed work; --retry-succeeded does not override identity conflicts."
+                )
         if record is not None and record.state == "succeeded" and not cfg.retry_succeeded:
             self._counters["skipped"] += 1
             self._counters["pipelines_done"] += 1

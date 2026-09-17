@@ -23,8 +23,8 @@ Somewhere in there, `asyncio.Semaphore` stops being enough and you are writing a
 pyattacker is that scheduler, extracted and made boring:
 
 * **a failure costs you one task, not the run** — every task's output is persisted the moment it is
-  produced, so `resume` restarts at the first task that produced nothing, and re-sends nothing that
-  already succeeded;
+  produced, so `resume` continues from durable task checkpoints; external side effects still need
+  idempotency when a crash occurs before checkpoint persistence;
 * **endpoints are a pool, not a global variable** — capacity, health, and quota per endpoint, leased
   through `async with`, with seven policies for choosing which one to use and how to wait;
 * **the record is queryable, not a log file** — every attempt, every retry decision (`{retry, reason,
@@ -137,12 +137,18 @@ Every successful task persists its artifact and advances the checkpoint. On resu
 runner.run(template.map(rows), resume=True)   # or pyattacker resume -c config.yaml
 ```
 
-* Already successful pipelines → skipped outright;
+* Already successful pipelines with matching task/input identity → skipped outright;
 * Failed pipelines → continue from **the first task that produced no artifact**: **if task C died, only task C
-  reruns, and task B's request is not re-sent**;
+  reruns when task B's checkpoint is durable**;
 * The seed artifact is persisted too → recovery **does not depend on the original dataset file**;
 * Changed a task's source code (`spec_digest` includes source digests) → treated as a new pipeline, so old
-  results are not incorrectly reused.
+  results are not incorrectly reused. Factory parameters, fanout children, retry/algorithm policies and
+  explicit task `config`/`version` are included too. Explicit keys reject changed definitions or inputs.
+
+**Upgrading an existing store:** fingerprint v2 changes default IDs and shard assignment; legacy work may
+rerun and old explicit keys conflict. Finish old runs with the old package, then use a new store. See the
+[resume identity and idempotency reference](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md#resume-identity)
+for migration guidance, dynamic functions and external configuration.
 
 ## Running It Across Processes (Sharding)
 

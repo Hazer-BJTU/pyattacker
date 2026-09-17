@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+* Resume now rejects an existing pipeline key whose task or seed digest differs, preserving its
+  historical result/checkpoint and raising `PipelineIdentityConflict` (CLI exit 2).
+* Task fingerprint v2 includes built-in factory parameters, ordered fanout children and strategy,
+  all retry fields and declared algorithm configuration. Tasks/config entries accept finite-JSON
+  `config` and an explicit `version` for dynamic code or external behavior. `include_code=False`
+  excludes child source digests recursively while retaining declared behavior.
+* Legacy fingerprint stores remain readable but are not automatically migrated: default pipeline
+  IDs and shard assignments change, and explicit old keys conflict. The Runner warns when the
+  oldest stored pipeline uses the legacy format. Finish old runs with the old package, then use
+  a new store; see [resume identity](docs/reference.md#resume-identity).
+
+
 ### Changed
 
 * **PyYAML is no longer a dependency — it is the optional `yaml` extra.** `pip install pyattacker` now

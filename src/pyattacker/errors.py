@@ -15,6 +15,7 @@ __all__ = [
     "PyAttackerError",
     "ConfigError",
     "PipelineBuildError",
+    "PipelineIdentityConflict",
     "ArtifactCodecError",
     "PluginError",
     "ResourceError",
@@ -43,6 +44,10 @@ class ConfigError(PyAttackerError):
 
 class PipelineBuildError(PyAttackerError):
     """The pipeline is invalid at construction time (for example, adjacent tasks' artifact types do not chain)."""
+
+
+class PipelineIdentityConflict(ConfigError):
+    """An existing pipeline key refers to a different task definition or seed."""
 
 
 class PluginError(PyAttackerError):

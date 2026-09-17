@@ -192,11 +192,8 @@ class PipelineSpec:
 
 
 def compute_spec_digest(tasks: Sequence[TaskSpec], *, include_code: bool = True) -> str:
-    payload = [t.fingerprint() for t in tasks]
-    if not include_code:
-        for item in payload:
-            item.pop("code", None)
-    return digest_of(canonical_json(payload))
+    payload = [t.fingerprint(include_code=include_code) for t in tasks]
+    return "v2:" + digest_of(canonical_json(payload))
 
 
 def pipeline(
