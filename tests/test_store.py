@@ -30,6 +30,7 @@ from pyattacker import Artifact, MemoryStore, SqliteStore
 from pyattacker.artifact import DEFAULT_REGISTRY
 from pyattacker.errors import ArtifactCodecError, RetryableError
 from pyattacker.store import (
+    ITER_BATCH_SIZE,
     AttemptRecord,
     EventRecord,
     PagedStore,
@@ -475,23 +476,29 @@ def test_paged_iterators_break_cursor_ties_on_the_primary_key(store):
 def test_paged_iterators_mirror_the_live_store_semantics(store):
     """``events``/``attempts`` are bounded by the mark taken when iteration starts.
 
-    Both backends have to agree: the mark is per iterator (a later read sees the new rows), and a
-    row appended after the mark is not exported by an iterator that is already running.
+    Both backends have to agree, and a full page is consumed before the append so the producer's
+    write lands after the iterator's last page: without the bound the next page would pick it up.
+    The mark is per iterator, not permanent — a new read sees the new rows.
     """
-    store.emit_event(EventRecord(ts=1.0, kind="first", run_id="run-1"))
-    store.emit_event(EventRecord(ts=2.0, kind="second", run_id="run-1"))
-    store.record_attempt(_attempt(attempt_no=1, outcome="failed", run_id="run-1"))
+    for index in range(ITER_BATCH_SIZE):
+        store.emit_event(EventRecord(ts=float(index), kind=f"event.{index}", run_id="run-1"))
+        store.record_attempt(_attempt(attempt_no=index + 1, run_id="run-1"))
 
     events = store.iter_events()
     attempts = store.iter_attempts()
-    assert (next(events).kind, next(attempts).attempt_no) == ("first", 1)  # marks fixed here
-    store.emit_event(EventRecord(ts=3.0, kind="late", run_id="run-1"))
-    store.record_attempt(_attempt(attempt_no=2, outcome="succeeded", run_id="run-1"))
+    first_events = [next(events) for _ in range(ITER_BATCH_SIZE)]  # the marks are fixed here
+    first_attempts = [next(attempts) for _ in range(ITER_BATCH_SIZE)]
+    assert (first_events[0].kind, first_attempts[0].attempt_no) == ("event.0", 1)
 
-    assert [event.kind for event in events] == ["second"]
+    store.emit_event(EventRecord(ts=1.0, kind="event.late", run_id="run-1"))
+    store.record_attempt(_attempt(attempt_no=ITER_BATCH_SIZE + 1, run_id="run-1"))
+
+    assert list(events) == []  # bounded: the late rows are not part of this traversal
     assert list(attempts) == []
-    assert [event.kind for event in store.iter_events()] == ["first", "second", "late"]
-    assert [a.attempt_no for a in store.iter_attempts()] == [1, 2]
+
+    # a fresh iterator does see them
+    assert [e.kind for e in store.iter_events()][-1] == "event.late"
+    assert [a.attempt_no for a in store.iter_attempts()][-1] == ITER_BATCH_SIZE + 1
 
 
 # ----------------------------------------------------------------- export_rows
