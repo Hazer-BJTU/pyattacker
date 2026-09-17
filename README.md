@@ -1,4 +1,4 @@
-# <img src="https://raw.githubusercontent.com/Hazer-BJTU/pyattacker/main/assets/logo/icon.png" width="34" alt=""> pyattacker
+# <img src="https://raw.githubusercontent.com/Hazer-BJTU/pyattacker/0790fc15bda1ae21fe6dc66b91b1bf3ae6fb5a54/assets/logo/icon.png" width="34" alt=""> pyattacker
 
 [![PyPI](https://img.shields.io/pypi/v/pyattacker)](https://pypi.org/project/pyattacker/)
 [![CI](https://github.com/Hazer-BJTU/pyattacker/actions/workflows/ci.yml/badge.svg)](https://github.com/Hazer-BJTU/pyattacker/actions/workflows/ci.yml)
