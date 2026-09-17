@@ -291,10 +291,12 @@ def test_a_cancellation_is_not_parked_behind_an_unresponsive_creation(
 ) -> None:
     """The other side of the spawn window: a creation that never returns must not hold the cancellation.
 
-    The wrapped ``loop.subprocess_exec`` creates the child and then never returns, and the cleanup
-    budget is shortened for the test, so the task has to surface ``CancelledError`` instead of waiting
-    for a handle that never arrives. A child that exists at that point cannot be owned by anybody in
-    the library — the test takes back the abandoned transport it injected (which kills and reaps that
+    This pins the *bound* rather than the original leak (there was no wait to bound before the fix, so
+    it passes on `main` too): its guard is that removing the bound makes it fail. The wrapped
+    ``loop.subprocess_exec`` creates the child and then never returns, and the cleanup budget is
+    shortened for the test, so the task has to surface ``CancelledError`` instead of waiting for a
+    handle that never arrives. A child that exists at that point cannot be owned by anybody in the
+    library — the test takes back the abandoned transport it injected (which kills and reaps that
     child) and records the PID for teardown, which is exactly the trade the bounded wait makes: a
     possible orphan instead of a task that never finishes.
     """
@@ -314,7 +316,9 @@ def test_a_cancellation_is_not_parked_behind_an_unresponsive_creation(
         return created
 
     monkeypatch.setattr(asyncio.BaseEventLoop, "subprocess_exec", stuck_subprocess_exec)
-    monkeypatch.setattr("pyattacker.tasks._CLEANUP_TIMEOUT_S", 0.2)
+    # Shortened for the test, and created rather than required: this is about the wait being bounded,
+    # not about the constant existing (an implementation without the wait cannot have it).
+    monkeypatch.setattr("pyattacker.tasks._CLEANUP_TIMEOUT_S", 0.2, raising=False)
 
     async def scenario() -> None:
         spec = shell_run(_child_command(child_script, pid_file), timeout_s=None)
