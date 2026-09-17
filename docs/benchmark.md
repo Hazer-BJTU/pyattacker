@@ -157,22 +157,14 @@ every algorithm scores zero on it
 `run_benchmark` derives its seed list from `scenario.seed` (`seed + 0 .. seeds - 1`), runs each algorithm
 on each seed, and reports the mean with `min`, `max` and sample `stdev` from `aggregate()`; the markdown
 form prints `mean ±stdev`. At three seeds a 1% gap is not evidence of anything, which is why the spread
-is both printed and used as the tie tolerance.
+is printed next to every mean and feeds the significance guard above.
 
 ## 7. How to run it
 
-`uv run pyattacker bench [options]`, with the surface that `--list` prints:
-
-| Flag | Effect |
-|---|---|
-| `--scenario NAME` | Which simulated world to run in. Default `bursty_provider`; `--list` shows the available ones |
-| `--list` | Print scenarios, algorithms and every metric with its unit and direction, then exit |
-| `--algorithms A,B` | Comma-separated subset. Default: every built-in algorithm, `failover` included |
-| `--seeds N` | How many seeds to average over (default 3), as `scenario.seed + 0 .. N-1` |
-| `--jobs N` / `--concurrency N` / `--horizon S` | Override the scenario's job count, worker count (the client's in-flight count, so an assumption as well as a cost knob) and simulated-time horizon |
-| `--wall-budget S` | Real seconds any *single* run may take (default 600) |
-| `--clock {virtual,real}` / `--speedup F` | `virtual` (default) is simulated time that costs nothing; `real` replays the scenario in compressed real time (factor `F`, default 10.0) to validate the simulator, and is much slower |
-| `--json PATH` / `--markdown PATH` / `--quiet` | Write the report as JSON (`-` for stdout) or markdown; `--quiet` silences progress on stderr |
+`uv run pyattacker bench [options]`. The full flag table is
+[`docs/cli.md`](cli.md#bench--compare-the-acquire-algorithms-in-simulation); `pyattacker bench --list`
+prints the same surface with the scenarios, the algorithms and every metric, and is the thing to run
+when the two disagree.
 
 The worked example whose numbers section 8 quotes is `uv run pyattacker bench --markdown
 /tmp/bench-full.md`: 7 algorithms x 3 seeds = 21 runs of 3000 jobs x 3 steps x 2 calls on 12 workers,

@@ -81,6 +81,41 @@ retries and read the resulting decision records. Useful as a CI smoke test.
 
 ---
 
+## `bench` — compare the acquire algorithms in simulation
+
+```bash
+pyattacker bench [--scenario NAME] [--list] [--algorithms A,B] [--seeds N]
+                 [--jobs N] [--concurrency N] [--horizon S] [--wall-budget S]
+                 [--clock {virtual,real}] [--speedup F] [--json PATH] [--markdown PATH] [--quiet]
+```
+
+No network and no provider: a scenario is a written-down world (capacity cycle, token bucket, latency
+tail, failure storms, three endpoints of different character), the client is a closed loop of workers
+driving the real `Pool` and the real algorithm, and time is simulated. `docs/benchmark.md` explains the
+assumptions, the metrics and how to read the table; this table is the flag surface.
+
+| Flag | Effect |
+|---|---|
+| `--scenario NAME` | which simulated world to run in; default `bursty_provider` |
+| `--list` | print the scenarios, the algorithms and every metric with its unit and direction, then exit 0 |
+| `--algorithms A,B` | comma-separated subset; default is every built-in algorithm (`failover` included, which a single-pool scenario cannot show at its best) |
+| `--seeds N` | how many seeds to average over, as `scenario.seed + 0 .. N-1` (default 3) |
+| `--jobs N` | override the scenario's job count |
+| `--concurrency N` | override the worker count — the client's in-flight count, so an assumption as well as a cost knob |
+| `--horizon S` | override the simulated-time horizon, which stops new jobs rather than truncating one |
+| `--wall-budget S` | real seconds any single run may take (default 600); a run that cannot finish raises rather than returning partial metrics |
+| `--clock {virtual,real}` | `virtual` (default) is simulated time that costs nothing; `real` replays the scenario in compressed real time to validate the simulator, and is much slower |
+| `--speedup F` | compression factor for `--clock real` (default 10) |
+| `--json PATH` | write the full report as JSON (`-` for stdout) |
+| `--markdown PATH` | write the report as a markdown table, including per-endpoint admissions |
+| `--quiet` | no progress on stderr |
+
+The table goes to stdout and progress to stderr, so `pyattacker bench --json - --quiet | jq .` composes.
+Exit codes follow the rest of the CLI: `0` for a completed sweep, `2` for an unknown scenario or
+algorithm. A benchmark that cannot finish is a `2` as well — never a partial table.
+
+---
+
 ## `report` — statistics and failures
 
 ```bash
