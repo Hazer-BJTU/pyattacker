@@ -1,5 +1,9 @@
 # pyattacker
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Hazer-BJTU/pyattacker/main/docs/assets/logo.svg" alt="pyattacker" width="132">
+</p>
+
 [![PyPI](https://img.shields.io/pypi/v/pyattacker)](https://pypi.org/project/pyattacker/)
 [![CI](https://github.com/Hazer-BJTU/pyattacker/actions/workflows/ci.yml/badge.svg)](https://github.com/Hazer-BJTU/pyattacker/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/pypi/pyversions/pyattacker)](https://pypi.org/project/pyattacker/)
