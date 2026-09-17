@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import time
 from pathlib import Path
 
 import pytest
 
 from pyattacker.benchmark import (
+    BenchmarkStalled,
     BenchmarkTimeout,
     EndpointProfile,
     FailureProfile,
@@ -376,3 +378,31 @@ def test_a_wait_that_only_a_cooldown_can_end_advances_simulated_time():
 
     assert got is True
     assert simulated == 30.0, "the clock advanced to the cooldown deadline, not by accident"
+
+
+def test_a_world_with_no_lease_left_is_reported_in_a_second_not_a_budget():
+    """Every endpoint retired for good is a scenario bug, and it must not look like a slow machine.
+
+    With every resource DEAD there is no lease left to hand out: the workers park and the clock has no
+    timer to advance to, so the run cannot end by itself. The supervisor notices inside its poll interval
+    and raises `BenchmarkStalled` with the numbers, rather than spending the whole wall-clock budget to
+    report a timeout that says nothing about the cause.
+    """
+    endpoint = EndpointProfile(
+        id="only",
+        capacity=1,
+        latency=LatencyProfile(median_s=0.01, sigma=0.0, tail_rate=0.0),
+        failures=FailureProfile(error_rate=1.0, storm_rate=0.0),  # every request fails -> dead_after reached
+        rate_limit=None,
+    )
+    scenario = _small(endpoints=(endpoint,), jobs=50, concurrency=2, steps_per_job=1, calls_per_step=1)
+
+    started = time.monotonic()
+    with pytest.raises(BenchmarkStalled) as excinfo:
+        Harness(scenario, "wait", seed=25, wall_budget=60.0).run()
+    elapsed = time.monotonic() - started
+
+    message = str(excinfo.value)
+    assert "dead or revoked" in message
+    assert "jobs done" in message
+    assert elapsed < 10.0, "the point is that this is reported fast, not after the budget"
