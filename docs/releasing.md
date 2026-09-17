@@ -120,8 +120,12 @@ number. If a bad artifact reaches PyPI, yank it and publish a patch release — 
 (`git push --delete origin vX.Y.Z`, then re-tag). Deleting a tag is safe while nothing has been published;
 once PyPI has the version, move to a new version number instead.
 
-**A re-run says the files already exist.** That is `--check-url` doing its job: already-uploaded files are
-skipped rather than failing the job, so a partially-failed publish can be re-run.
+**A re-run says the files already exist.** That is `--check-url` doing its job: a file already on the index
+*with the same hash* is skipped, so a publish that died halfway can simply be re-run. The comparison is by
+hash, not by filename, so this only holds while the commit is unchanged. Re-run a *TestPyPI rehearsal* after
+further commits and the rebuilt sdist — which ships `docs/` — no longer matches, and the step fails with
+`Local file and index file do not match`. That is the check refusing to mix two builds; delete the TestPyPI
+release before rehearsing again, or accept the first attempt as the one that proved the upload.
 
 **403 from PyPI.** Almost always the publisher configuration: check that the owner, repository, workflow
 filename (`release.yml`) and environment name match exactly what the job declares.
