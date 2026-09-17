@@ -56,7 +56,7 @@ the scenario tests assert (`tests/test_benchmark_scenario.py::test_the_base_scen
 | Client-side randomness follows the logical identity, not the worker: the acquire algorithm and the retry policy each draw from `Random(f"{seed}:{{acquire,retry}}:{job}:{step}:{attempt}")` | `harness.py` (`acquire_stream`, `retry_stream`) | `tests/test_benchmark_harness.py::test_client_randomness_follows_the_logical_identity_not_the_worker` |
 | A scenario declares the algorithms it cannot exercise, and they are not ranked on numbers that cannot mean anything | `scenario.py` (`Scenario.unsuited`), `report.py` (`default_algorithms`, `winners`) | `tests/test_benchmark_harness.py::test_a_scenario_declares_which_algorithms_it_cannot_exercise`, `::test_an_algorithm_the_scenario_cannot_exercise_is_marked_not_ranked` |
 | A wait that only a cooldown can end is a real timer on the pool's clock, so simulated time reaches it and the waiters are woken — and the *earliest* pending deadline owns that timer | `resource.py` (`_ensure_cooldown_notifier`, `_cooldown_deadline`) | `tests/test_lease_safety.py::test_a_wait_that_only_a_cooldown_can_end_actually_ends` and `::test_a_cooldown_that_ends_earlier_than_the_armed_one_replaces_it` (kernel regression tests: both time out or wake late without the fix), `tests/test_benchmark_harness.py::test_a_wait_that_only_a_cooldown_can_end_advances_simulated_time` |
-| An algorithm that completes almost nothing cannot be crowned on a conditional metric; the excluded ones are named in the table and the JSON, the baseline ignores algorithms the scenario declares unsuited, and a row with a single eligible contestant has no winner at all | `report.py` (`COMPLETION_FLOOR`, `excluded_by_completion`, `comparable`, `unrivaled`, `winners`) | `tests/test_benchmark_report.py::test_a_conditional_metric_cannot_crown_an_algorithm_that_completed_almost_nothing`, `::test_the_completion_baseline_ignores_an_algorithm_the_scenario_cannot_exercise`, `::test_one_eligible_contestant_is_not_crowned` |
+| An algorithm that does a fraction of the work cannot be crowned on *any* quality row — not the latency and throughput rows where its value is undefined without completions, and not the rates whose denominators it partly controls; the excluded ones are named in the table and the JSON, the baseline ignores algorithms the scenario declares unsuited, and a gated row with a single eligible contestant has no winner at all | `report.py` (`COMPLETION_FLOOR`, `excluded_by_completion`, `comparable`, `unrivaled`, `winners`), `metrics.py` (`Metric.requires_comparable_completion`) | `tests/test_benchmark_report.py::test_every_quality_row_requires_comparable_completion`, `::test_an_algorithm_that_does_almost_nothing_cannot_win_any_quality_row` (parametrised over all thirteen gated rows), `::test_a_quality_metric_cannot_crown_an_algorithm_that_completed_almost_nothing`, `::test_the_completion_baseline_ignores_an_algorithm_the_scenario_cannot_exercise`, `::test_one_eligible_contestant_is_not_crowned` |
 | Nothing hands the algorithm a reference to the environment: the harness builds a `Pool` and a `TaskContext` and nothing else, `SimulatedProvider` is private to it, and `capacity_at()` is public only so the metrics can integrate the capacity on offer | `harness.py` (`_context`, `_call_sequence`) | `tests/test_benchmark_harness.py::test_the_algorithm_is_handed_the_pool_but_never_the_environment` walks everything a spy algorithm is given and fails if the scenario or the provider is reachable |
 | The same seed reproduces the numbers exactly (every metric except `wall_s`) | `scenario.seed` -> `Harness.seed` -> per-run streams | `tests/test_benchmark_harness.py::test_the_same_seed_and_scenario_reproduce_the_same_numbers` |
 | No sockets, and nothing in the package can reach the network | stdlib-only imports | `tests/test_benchmark_harness.py::test_the_benchmark_opens_no_network_connections`; `::test_the_benchmark_package_imports_nothing_that_can_reach_the_network` |
@@ -141,7 +141,7 @@ and `bench --list`; a test asserts the harness emits exactly that set
 
 | Metric | Unit | Better | Meaning |
 |---|---|---|---|
-| `jobs_done` | jobs | higher | Jobs that finished successfully before the horizon |
+| `jobs_done` | jobs | higher | Jobs completed successfully among the work admitted before the horizon cutoff. No new job is admitted after it, but one already in flight finishes — which is why a 600s run can have a makespan slightly above 600s |
 | `jobs_failed` | jobs | neutral | Jobs that gave up: a step exhausted its retry budget. Diagnostic: an algorithm can shrink it by never starting the jobs it would have failed |
 | `jobs_unstarted` | jobs | neutral | Jobs the workers never began because the horizon arrived first. Diagnostic: an algorithm can shrink it by starting everything and failing it |
 | `makespan_s` | s | neutral | Simulated seconds until the last worker stopped (the horizon, plus a step still in flight); read it next to `jobs_done` |
@@ -149,29 +149,45 @@ and `bench --list`; a test asserts the harness emits exactly that set
 | `requests` | requests | neutral | Requests sent, including refusals and retries |
 | `attempts_per_completed_job` | attempts | lower * | Step attempts spent per completed job. The zero-retry baseline is `steps_per_job`, not 1.0, and attempts spent on jobs that later failed are in the numerator only |
 | `attempt_inflation` | ratio | lower * | Step attempts per *attempted* step (1.0 = every attempted step succeeded on its first try): retry pressure without the volume |
-| `failed_attempt_rate` | ratio | lower | Failed step attempts as a fraction of all step attempts, including the ones the policy then abandoned |
+| `failed_attempt_rate` | ratio | lower * | Failed step attempts as a fraction of all step attempts, including the ones the policy then abandoned |
 | `retry_rate` | ratio | lower * | Retries the policy actually scheduled, per step attempt. `failed_attempt_rate` minus this is the share of failures given up on |
-| `refusal_rate` | ratio | lower | Requests refused by the provider (429) per request sent |
-| `error_rate` | ratio | lower | Requests that failed with an error per request sent |
-| `successful_job_latency_p50_ms` | ms | lower * | Median time of a job that *succeeded*, retries included; conditional by name |
+| `refusal_rate` | ratio | lower * | Requests refused by the provider (429) per request sent |
+| `error_rate` | ratio | lower * | Requests that failed with an error per request sent |
+| `successful_job_latency_p50_ms` | ms | lower * | Median time of a job that *succeeded*, retries included; the name is the qualifier |
 | `successful_job_latency_p95_ms` | ms | lower * | 95th percentile job time among successful jobs: the tail a user notices |
 | `successful_job_latency_p99_ms` | ms | lower * | 99th percentile job time among successful jobs |
 | `acquire_wait_p50_ms` | ms | lower * | Median time a step spent waiting for a lease (over acquisitions that succeeded) |
 | `acquire_wait_p99_ms` | ms | lower * | 99th percentile lease wait: what a saturated pool costs a caller that waits |
 | `request_latency_p50_ms` | ms | neutral | Median served request latency (a property of the world) |
-| `utilization` | ratio | higher | Served work-seconds over offered capacity-seconds |
+| `utilization` | ratio | higher * | Served work-seconds over offered capacity-seconds, integrated over the run's own makespan |
 | `endpoint_spread` | ratio | neutral | Spread of admitted requests across endpoints; diagnostic, because the endpoints are deliberately unlike each other |
-| `leases_active_at_end` | leases | lower | Leases still held when the run ended; must be zero |
+| `leases_active_at_end` | leases | lower | Leases still held when the run ended; must be zero. The one directional counter that is not a quality claim |
 | `wall_s` | s | neutral | Real seconds the harness spent simulating: cost, never quality |
 
-`*` marks a **conditional** metric (`Metric.gated_by_completion`): it is only defined for work that
-completed, so an algorithm that gave up on most of the workload is excluded from the row — and named, with
-its completion ratio, in the `best` column and in `excluded_by_completion` in the JSON. Without that gate
-the first version of this table crowned a strategy that finished 7.7 of 3000 jobs on two latency rows and
-on throughput, because failing fast is quick and leaves few slow jobs behind. The gate is what makes the
-honest throughput denominator (`jobs_done / makespan_s`) safe, and it is applied to the attempt metrics
-for the same reason: an algorithm that attempts three easy steps and abandons the queue reads 1.0 on
-`attempt_inflation` and 0.0 on `retry_rate` — both vacuous, both excluded.
+`*` marks a row that **requires comparable completion** (`Metric.requires_comparable_completion`). The
+rule is not "the metric is undefined without completions" — that was the first version of it, and it was
+too narrow. It is:
+
+> A directional quality metric may only produce a comparative winner when the algorithms completed a
+> comparable amount of useful work. `jobs_done` is the comparison of how much work got done, and the
+> correctness/diagnostic counters make no quality claim, so those are the only ungated rows.
+
+The reason is that the client controls the denominator of almost every rate here. `refusal_rate` is
+`refusals / requests_sent`, and an algorithm that abandons contention before asking sends no request to
+be refused; `error_rate` and `failed_attempt_rate` are the same shape; `retry_rate` is low for an
+algorithm that never gets far enough to meet a retryable failure; and `utilization` integrates offered
+capacity over a run whose *length* the client chose, so a run that stops after eight seconds never gives
+the capacity it left unused a chance to be used. An algorithm that does 0.2% of the work should not win
+any of those rows, and `test_an_algorithm_that_does_almost_nothing_cannot_win_any_quality_row` checks
+that on every one of them by handing the do-nothing algorithm the numerically best value.
+
+Excluded algorithms are named, with their completion ratio, in the `best` column and in
+`excluded_by_completion` in the JSON. Without the gate the first version of this table crowned a strategy
+that finished 7.7 of 3000 jobs on two latency rows and on throughput, because failing fast is quick and
+leaves few slow jobs behind. The gate is also what makes the honest throughput denominator
+(`jobs_done / makespan_s`) safe, and it is applied to the rates for the reason above: an algorithm that
+attempts three easy steps and abandons the queue reads 1.0 on `attempt_inflation`, 0.0 on `retry_rate`
+and a flattering `refusal_rate` — all vacuous, all excluded.
 
 `attempts_per_completed_job` and `attempt_inflation` answer different questions and the difference is the
 point: the first is what finishing cost (it grows when attempts are wasted on jobs that later fail), the
@@ -215,6 +231,9 @@ Three ways a row ends up unmarked, besides the direction being `neutral` (`makes
 * it was asked for by name although the scenario declares it unsuited, which leaves N/A in the column and
   the algorithm out of the ranking entirely.
 
+Together with the gate, that gives the winner rule one sentence: *a quality row is decided among the
+algorithms that did comparable work, and only when at least two of them could be compared at all.*
+
 With a single seed there is no spread to test against, so the best mean wins among the algorithms that
 ran — one *seed* is a weak comparison, which is what the missing `±` says. One *algorithm* is a different
 matter, and is never crowned.
@@ -234,9 +253,9 @@ when the two disagree.
 
 The worked example whose numbers section 8 quotes is `uv run pyattacker bench --markdown
 /tmp/bench-full.md`: the five algorithms this scenario is suited to, x 3 seeds = 15 runs of 3000 jobs x 3
-steps x 2 calls on 12 workers, in **12-13 seconds of wall clock** on a laptop-class machine (the spread
+steps x 2 calls on 12 workers, in **13 seconds of wall clock** on a laptop-class machine (the spread
 between runs is the machine; the simulation itself is deterministic). `--algorithms` with all seven costs
-about half again as much (18.0s measured) and marks the two unsuited columns N/A. A fast check of two
+about half again as much (20.2s measured) and marks the two unsuited columns N/A. A fast check of two
 algorithms on a smaller world (`--algorithms wait,immediate --seeds 1 --jobs 200 --concurrency 4
 --horizon 60`) costs about 0.13s.
 
@@ -263,7 +282,7 @@ prints it) and endpoints. A scenario with several endpoints is still **one** `Po
 it cannot yet exercise `failover` across vendors (section 9).
 
 **Staying inside the budget.** The defaults are nowhere near the 10-minute limit: the whole 15-run sweep
-measured 12.3s (18.0s with all seven algorithms), and per-run cost ranged from 0.09s (`immediate`) to
+measured 13.0s (20.2s with all seven algorithms), and per-run cost ranged from 0.09s (`immediate`) to
 1.37s (`quota_aware`, which is the only one that varies much between seeds). The knobs are `--jobs` and
 `--seeds` (they scale the work directly), then `--horizon`, then `--concurrency` (which changes the world,
 not just the cost); `--wall-budget` is the guard, not the tuning knob.
@@ -285,7 +304,7 @@ within 50ms of wall clock instead of a budget-shaped timeout. All three are cove
 The 3-seed means from the sweep above (seeds 20260917, 20260918, 20260919), after the review fixes:
 `--markdown` writes the full table with `min`/`max`/`stdev` and per-endpoint admissions, and `--json`
 carries the winners and the exclusions. In the `best` column, `—` means the row separates nobody and `*`
-marks a conditional row.
+marks a row that requires comparable completion.
 
 | Metric | `immediate` | `wait` | `backoff` | `sticky` | `quota_aware` | best |
 |---|---|---|---|---|---|---|
@@ -296,30 +315,34 @@ marks a conditional row.
 | `throughput_rps` | 0.8910 | 2.2241 | 2.2449 | 2.3167 | 1.3809 | `sticky`, `backoff` * |
 | `attempts_per_completed_job` | 459.65 | 5.69 | 5.57 | 5.55 | 10.80 | `sticky`, `backoff` * |
 | `attempt_inflation` | 1.0077 | 1.6160 | 1.5947 | 1.5899 | 2.3396 | `sticky`, `backoff` * |
-| `failed_attempt_rate` | 0.9930 | 0.4516 | 0.4393 | 0.4401 | 0.6856 | `backoff`, `sticky`, `wait` |
+| `failed_attempt_rate` | 0.9930 | 0.4516 | 0.4393 | 0.4401 | 0.6856 | `backoff`, `sticky`, `wait` * |
 | `retry_rate` | 0.0077 | 0.3803 | 0.3725 | 0.3700 | 0.5705 | `sticky`, `backoff` * |
-| `refusal_rate` | 0.3387 | 0.2600 | 0.2484 | 0.2573 | 0.4760 | `backoff`, `sticky`, `immediate` |
-| `error_rate` | 0.0191 | 0.0244 | 0.0254 | 0.0223 | 0.0218 | five-way tie |
+| `refusal_rate` | 0.3387 | 0.2600 | 0.2484 | 0.2573 | 0.4760 | `backoff`, `sticky` * |
+| `error_rate` | 0.0191 | 0.0244 | 0.0254 | 0.0223 | 0.0218 | `wait`, `sticky` * |
 | `successful_job_latency_p95_ms` | 7,755.55 | 9,603.35 | 9,456.53 | 9,288.31 | 9,910.48 | `sticky`, `wait` * |
-| `utilization` | 0.4928 | 0.6313 | 0.6384 | 0.6351 | 0.5026 | `backoff`, `sticky`, `wait`, `quota_aware` |
+| `utilization` | 0.4928 | 0.6313 | 0.6384 | 0.6351 | 0.5026 | `wait`, `backoff`, `sticky` * |
 | `endpoint_spread` | 0.6538 | 0.5707 | 0.5640 | 0.5759 | 0.9368 | — |
 
-`*` marks the rows of this table that are conditional: `immediate` (0.5% of the best completion) and
-`quota_aware` (60.1%) are excluded from every one of them, and named as excluded in both the table and the
-JSON. There are nine conditional rows in total — the five shown, plus `successful_job_latency_p50_ms`,
-`successful_job_latency_p99_ms` and both `acquire_wait_*` percentiles, which are left out of this table for
-width and are all in `--markdown`'s.
+`*` marks the rows of this table that require comparable completion: `immediate` (0.5% of the best
+completion) and `quota_aware` (60.1%) are excluded from every one of them, and named as excluded in both
+the table and the JSON. There are thirteen such rows in total — the nine shown, plus
+`successful_job_latency_p50_ms`, `successful_job_latency_p99_ms` and both `acquire_wait_*` percentiles,
+which are left out of this table for width and are all in `--markdown`'s. The only directional rows *not*
+marked are `jobs_done` (the comparison itself) and `leases_active_at_end` (a correctness counter).
 
 **`immediate` is measured, and then excluded.** It completed 7.00 of 3,000 jobs (0.23%) and failed
 2,993.00. `jobs_unstarted` (0.00) is no longer a win for it — the accounting row is a diagnostic now, and
 "starts everything and finishes nothing" is not a quality. It is the *raw* leader on
 `successful_job_latency_p95_ms` (7,755.55ms) and `successful_job_latency_p99_ms` (8,152.07ms), which is
 exactly the fail-fast artefact the completion gate blocks: with 0.5% of the best completion it is excluded
-from every conditional row, and the table says so by name. Its `failed_attempt_rate` (0.9930) is the worst
+from every quality row, and the table says so by name. Its `failed_attempt_rate` (0.9930) is the worst
 in the table — almost every request it was allowed to make failed — while its `retry_rate` (0.0077) is the
 lowest, because between the refusals and its own refusal to queue it barely schedules any. That inversion
 is why the two metrics are separate and why the second one is gated: "scheduled few retries" reads as
-virtue only in a run that attempted almost nothing.
+virtue only in a run that attempted almost nothing. The same reasoning is what removed it from the
+`refusal_rate` and `error_rate` rows in this revision: sending 71.7 requests instead of 12,246 means there
+is almost nothing in those denominators to be counted against, so a low rate there is a statement about
+how little it asked for.
 
 **`backoff` and `sticky` lead; `wait` is close behind.** The paired test puts them together on `jobs_done`
 (1,361.67 and 1,404.00 against `wait`'s 1,348.67, with per-seed spreads of 23-77 jobs), on throughput, on
@@ -345,8 +368,8 @@ which is not the refusals it will actually meet: the provider refuses on live in
 own bucket with tightening, neither of which the declared number reflects. In the last run of each
 algorithm (seed 20260919) it sent 2,136 of 6,434 admitted requests to `fast-flaky` (the endpoint with the
 highest error rate and storm rate) and only 306 to `metered`, while `wait` sent 4,618 and 1,300
-respectively. Its `error_rate` (0.0218) ties with the others: less traffic to the flaky endpoint is a
-different mix, not a better client.
+respectively. Its `error_rate` (0.0218) is competitive with the others even though it provoked twice the
+refusals: less traffic to the flaky endpoint is a different mix, not a better client.
 
 **Several rows crown nobody, and that is the answer.** `makespan_s`, `requests`, `jobs_failed`,
 `jobs_unstarted`, `request_latency_p50_ms`, `wall_s` and `endpoint_spread` are declared neutral — the
@@ -355,10 +378,9 @@ are a cost and a description of a deliberately heterogeneous fleet (sending more
 endpoint *raises* the spread). `acquire_wait_p50_ms` is 0.00 for every candidate that completed the work
 (the client rarely waits for a *lease*: what stops a request in this scenario is the provider's refusal,
 met while the lease is already held), and after the completion gate it has no winner at all.
-`leases_active_at_end` is 0.0 everywhere, where the zero-everywhere rule crowns nobody. The `error_rate`
-row is a five-way tie: the independent failure rates are simply not what separates these algorithms here,
-and `refusal_rate`'s tie set includes `immediate` because with three seeds its refusal rate is not
-distinguishable from `backoff`'s, even though the means look 9 points apart.
+`leases_active_at_end` is 0.0 everywhere, where the zero-everywhere rule crowns nobody. `error_rate` is a
+two-way tie (`wait`, `sticky`) among the four algorithms that did comparable work: the independent failure
+rates are simply not what separates these algorithms here.
 
 **What is not in the table.** `failover` and `least_busy` are declared unsuited to this scenario and are
 not run by default: one pool gives `failover` nothing to fail over to, and the pool's default selection is

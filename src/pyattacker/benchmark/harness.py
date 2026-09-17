@@ -27,7 +27,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..algorithm import resolve_algorithm
-from ..errors import FatalError, PyAttackerError, ResourceUnavailable, RetryableError, error_class_of
+from ..errors import (
+    ConfigError,
+    FatalError,
+    PyAttackerError,
+    ResourceUnavailable,
+    RetryableError,
+    error_class_of,
+)
 from ..resource import Pool, Resource
 from ..task import TaskContext
 from .clock import VirtualClock
@@ -104,6 +111,10 @@ class Harness:
         resolve_algorithm(algorithm)
         self.algorithm = algorithm
         self.seed = scenario.seed if seed is None else seed
+        if wall_budget <= 0:
+            # A non-positive budget cancels the run before it starts and would then be reported as
+            # "stalled", which is a lie about the scenario: it is the budget that is impossible.
+            raise ConfigError(f"wall_budget must be positive, got {wall_budget}")
         self.wall_budget = wall_budget
         self.supervise_interval_s = supervise_interval_s
         self.clock = clock or VirtualClock()

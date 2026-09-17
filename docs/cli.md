@@ -99,20 +99,23 @@ assumptions, the metrics and how to read the table; this table is the flag surfa
 | `--scenario NAME` | which simulated world to run in; default `bursty_provider` |
 | `--list` | print the scenarios, the algorithms and every metric with its unit and direction, then exit 0 |
 | `--algorithms A,B` | comma-separated subset; default is every algorithm the scenario can exercise — asking for one it declares unsuited runs it anyway with an N/A column (e.g. `failover`, which a single-pool scenario cannot show at its best) |
-| `--seeds N` | how many seeds to average over, as `scenario.seed + 0 .. N-1` (default 3) |
-| `--jobs N` | override the scenario's job count |
-| `--concurrency N` | override the worker count — the client's in-flight count, so an assumption as well as a cost knob |
-| `--horizon S` | override the simulated-time horizon, which stops new jobs rather than truncating one |
-| `--wall-budget S` | real seconds any single run may take (default 600); a run that cannot finish raises rather than returning partial metrics |
+| `--seeds N` | how many seeds to average over, as `scenario.seed + 0 .. N-1` (default 3; at least 1) |
+| `--jobs N` | override the scenario's job count (at least 1) |
+| `--concurrency N` | override the worker count — the client's in-flight count, so an assumption as well as a cost knob (at least 1) |
+| `--horizon S` | override the simulated-time horizon, which stops new jobs rather than truncating one (positive) |
+| `--wall-budget S` | real seconds any single run may take (default 600, positive); a run that cannot finish raises rather than returning partial metrics |
 | `--clock {virtual,real}` | `virtual` (default) is simulated time that costs nothing; `real` replays the scenario in compressed real time to validate the simulator, and is much slower |
-| `--speedup F` | compression factor for `--clock real` (default 10) |
+| `--speedup F` | compression factor for `--clock real` (default 10, positive) |
 | `--json PATH` | write the full report as JSON (`-` for stdout) |
 | `--markdown PATH` | write the report as a markdown table, including per-endpoint admissions |
 | `--quiet` | no progress on stderr |
 
 The table goes to stdout and progress to stderr, so `pyattacker bench --json - --quiet | jq .` composes.
 Exit codes follow the rest of the CLI: `0` for a completed sweep, `2` for an unknown scenario or
-algorithm. A benchmark that cannot finish is a `2` as well — never a partial table.
+algorithm. A benchmark that cannot finish is a `2` as well — never a partial table. A budget outside its
+range is refused the same way (`--seeds 0` says "at least 1") rather than clamped: a sweep that silently
+ran a different experiment than the one it announced would report the wrong numbers under the right
+heading.
 
 ---
 

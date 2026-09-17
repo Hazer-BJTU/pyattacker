@@ -197,6 +197,25 @@ class Scenario:
         default_factory=lambda: Retrying(max_attempts=5, base=0.5, factor=2.0, cap=8.0, jitter="full")
     )
 
+    def __post_init__(self) -> None:
+        """Refuse a budget that cannot run, instead of clamping it into a different experiment.
+
+        These fields are the experiment's shape, and the failure mode this package is written against is
+        a number that looks authoritative while answering another question: a sweep asked for zero seeds
+        or zero jobs and silently given one would report the wrong experiment under the right heading.
+        Every check is on a value that has no meaningful reading at or below its boundary.
+        """
+        if self.jobs < 1:
+            raise ConfigError(f"scenario {self.name!r}: jobs must be at least 1, got {self.jobs}")
+        if self.concurrency < 1:
+            raise ConfigError(f"scenario {self.name!r}: concurrency must be at least 1, got {self.concurrency}")
+        if self.horizon_s <= 0:
+            raise ConfigError(f"scenario {self.name!r}: horizon_s must be positive, got {self.horizon_s}")
+        if self.steps_per_job < 1:
+            raise ConfigError(f"scenario {self.name!r}: steps_per_job must be at least 1, got {self.steps_per_job}")
+        if self.calls_per_step < 1:
+            raise ConfigError(f"scenario {self.name!r}: calls_per_step must be at least 1, got {self.calls_per_step}")
+
     def with_overrides(self, **changes) -> "Scenario":
         """A copy with a few fields replaced — for sweeps and for tests that need a small world."""
         return replace(self, **changes)

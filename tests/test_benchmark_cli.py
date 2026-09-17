@@ -70,6 +70,18 @@ def test_the_progress_header_counts_the_algorithms_the_scenario_will_run(capsys)
     assert "(n/a)" not in captured.out, "nothing was asked for by name here"
 
 
+def test_a_budget_that_cannot_run_is_refused_before_anything_is_announced(capsys):
+    """`--seeds 0` used to print "x 0 seed(s)" and then run one: the wrong experiment, announced."""
+    assert main(["bench", *SMALL, "--seeds", "0"]) == 2
+    assert "seeds must be at least 1" in capsys.readouterr().err
+
+    assert main(["bench", *SMALL, "--jobs", "0"]) == 2
+    assert "jobs must be at least 1" in capsys.readouterr().err
+
+    assert main(["bench", *SMALL, "--speedup", "0", "--clock", "real"]) == 2
+    assert "speedup must be positive" in capsys.readouterr().err
+
+
 def test_json_to_stdout_replaces_the_table(capsys):
     assert main(["bench", *SMALL, "--algorithms", "wait", "--json", "-", "--quiet"]) == 0
 

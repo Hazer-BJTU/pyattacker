@@ -56,9 +56,21 @@ All notable changes to this project are documented here. The format follows
   (so an algorithm that finished 0.23% of the work could lead a latency row). Throughput divides by the
   run's own makespan again — the honest definition, now that the gate below makes it safe, and no longer a
   linear rescaling of `jobs_done` that cannot tell a run which finished in 200s from one which took 500s —
-  the latency metrics are named `successful_job_latency_*`, and every conditional metric refuses to crown
-  an algorithm that completed less than 90% of the best completion, naming the excluded ones in the table,
+  the latency metrics are named `successful_job_latency_*`, and every *quality* metric refuses to crown an
+  algorithm that completed less than 90% of the best completion, naming the excluded ones in the table,
   the markdown and the JSON.
+* **The completion gate was too narrow to do its job.** It covered the rows where the metric is literally
+  undefined without completions (throughput, latency, per-completed-job attempts) and left the rates
+  exposed — but the client controls the denominator of those too: `refusal_rate` is
+  `refusals / requests_sent`, and an algorithm that abandons contention before asking sends no request to
+  be refused; `error_rate` and `failed_attempt_rate` have the same shape; `retry_rate` is low for an
+  algorithm that never gets far enough to meet a retryable failure; and `utilization` integrates offered
+  capacity over a run whose length the client chose. `immediate` was therefore still eligible to tie for
+  `refusal_rate` at 7 of 3000 jobs completed. The flag is now
+  `Metric.requires_comparable_completion` and it covers every directional row except `jobs_done` (which
+  *is* the comparison of how much work got done) and the `leases_active_at_end` correctness counter; the
+  table marks all thirteen, and a test hands a do-nothing algorithm the best value on each of them to
+  prove it cannot win any.
 * **Two metrics did not mean what their names said.** `retry_rate` counted every failed attempt, including
   the ones the retry policy abandoned without retrying, and `attempts_per_job` counted step attempts per
   *completed* job while documenting a "1.0 = no retries" baseline that this scenario's three-step jobs can
@@ -69,7 +81,7 @@ All notable changes to this project are documented here. The format follows
   attempts per *attempted* step, where 1.0 really does mean "not one step had to be repeated".
 * **The completion baseline ignored which algorithms a scenario can exercise.** An unsuited algorithm run
   because it was asked for by name could set the 90% floor and exclude every algorithm the scenario was
-  actually about. The baseline now comes from comparable algorithms only — and a conditional row with a
+  actually about. The baseline now comes from comparable algorithms only — and a gated row with a
   single eligible contestant has no winner at all, with the report naming it (`not_compared` in the JSON,
   `only X was eligible` in the markdown) instead of crowning a one-horse race. A report containing one
   algorithm never awards a star on any row: a star is a comparative statement.
@@ -97,13 +109,22 @@ All notable changes to this project are documented here. The format follows
   Each can be minimised by doing less work — never start a job and nothing fails; start everything and fail
   it and nothing is left unstarted — so they stay in the table, where the totals have to close, and award
   no star.
+* **Benchmark budgets are validated instead of clamped.** `run_benchmark(seeds=0)` ran one seed
+  (`range(max(1, seeds))`) while the CLI announced "x 0 seed(s)", i.e. it printed a different experiment
+  than it ran; `Scenario` now refuses `jobs < 1`, `concurrency < 1`, `horizon_s <= 0`, `steps_per_job < 1`
+  and `calls_per_step < 1`, `run_benchmark`/`Harness` refuse a non-positive seed count or wall budget, and
+  `ScaledClock` refuses a non-positive speedup (as a `ConfigError`, so the CLI exits 2 with a message
+  rather than a traceback). The CLI checks them before it prints its progress header, so the
+  announcement cannot describe a sweep that will not happen.
 * **Documentation and CLI text that had drifted from the code.** `BenchmarkReport.winners()` and
   `docs/benchmark.md` still described the independent-samples standard error the report no longer uses, the
   virtual-vs-real clock table quoted throughput from the retired fixed-denominator formula, the worked
   example still said "21 runs" where the scenario now runs 15, `Harness.run`'s timeout was documented as
-  `asyncio.wait_for` where it races the workers against a supervisor, and `bench`'s progress header counted
+  `asyncio.wait_for` where it races the workers against a supervisor, `bench`'s progress header counted
   the framework's seven algorithms where the scenario would run five (as did the README's "about 20
-  seconds" and `--algorithms`'s "every built-in algorithm").
+  seconds" and `--algorithms`'s "every built-in algorithm"), and `jobs_done` was described as "jobs that
+  finished before the horizon" although the horizon stops *admission* and lets a step in flight finish
+  (hence a 600s scenario with a makespan above 600s).
 
 * **PyYAML is no longer a dependency — it is the optional `yaml` extra.** `pip install pyattacker` now
   installs nothing at all: the kernel and the declarative layer's JSON/TOML paths are the standard library.

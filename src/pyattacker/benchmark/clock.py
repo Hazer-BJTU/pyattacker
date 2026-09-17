@@ -48,6 +48,8 @@ import time
 from collections.abc import Coroutine, Iterator
 from typing import Any
 
+from ..errors import ConfigError
+
 __all__ = ["ScaledClock", "VirtualClock"]
 
 
@@ -237,7 +239,9 @@ class ScaledClock:
 
     def __init__(self, speedup: float = 10.0) -> None:
         if speedup <= 0:
-            raise ValueError("speedup must be positive")
+            # A CLI flag, so the same error type as every other impossible budget: the CLI prints the
+            # message and exits 2 instead of showing a traceback.
+            raise ConfigError(f"speedup must be positive, got {speedup}")
         self.speedup = speedup
         self._started = time.monotonic()
 

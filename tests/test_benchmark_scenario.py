@@ -109,3 +109,20 @@ def test_a_scenario_can_be_built_by_hand():
 
     assert scenario.cycle.factor(12.3) == scenario.cycle.peak
     assert math.isclose(scenario.cycle.integral(0.0, 10.0), 10.0 * scenario.cycle.peak)
+
+
+def test_a_scenario_refuses_a_budget_that_cannot_run():
+    """Zero jobs, zero workers or a zero horizon are different experiments, not smaller ones.
+
+    Clamping them (as `range(max(1, seeds))` did for seeds) means the sweep reports the wrong experiment
+    under the right heading, which is the failure this package exists to avoid.
+    """
+    for changes, expected in (
+        ({"jobs": 0}, "jobs must be at least 1"),
+        ({"concurrency": 0}, "concurrency must be at least 1"),
+        ({"horizon_s": 0.0}, "horizon_s must be positive"),
+        ({"steps_per_job": 0}, "steps_per_job must be at least 1"),
+        ({"calls_per_step": 0}, "calls_per_step must be at least 1"),
+    ):
+        with pytest.raises(ConfigError, match=expected):
+            Scenario(name="unit", summary="a world", endpoints=get_scenario("bursty_provider").endpoints, **changes)

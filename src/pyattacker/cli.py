@@ -628,6 +628,14 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     if overrides:
         scenario = scenario.with_overrides(**overrides)
     algorithms = [name.strip() for name in args.algorithms.split(",") if name.strip()] if args.algorithms else None
+    # Validated here rather than only in the library so the announcement below cannot describe a sweep
+    # that will not happen: `--seeds 0` used to print "x 0 seed(s)" and then quietly run one.
+    if args.seeds < 1:
+        raise ConfigError(f"--seeds must be at least 1, got {args.seeds}: a sweep needs a seed to be reproducible")
+    if args.wall_budget <= 0:
+        raise ConfigError(f"--wall-budget must be positive, got {args.wall_budget}")
+    if args.speedup <= 0:
+        raise ConfigError(f"--speedup must be positive, got {args.speedup}")
     if algorithms:
         for name, reason in scenario.unsuited:
             if name in algorithms:

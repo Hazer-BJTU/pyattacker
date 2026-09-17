@@ -13,6 +13,7 @@ import pytest
 
 from pyattacker.benchmark import METRICS, RunResult, aggregate, get_scenario, percentile, run_benchmark
 from pyattacker.benchmark.report import BenchmarkReport, default_algorithms
+from pyattacker.errors import ConfigError
 
 
 def _small():
@@ -38,6 +39,49 @@ def test_every_metric_declares_a_unit_and_a_direction():
         assert metric.unit, name
         assert metric.better in ("higher", "lower", "neutral"), name
         assert len(metric.description) > 20, f"{name} needs a description a reader can use"
+
+
+def test_every_quality_row_requires_comparable_completion():
+    """The invariant the winner rule rests on, asserted against the declarations rather than by hand.
+
+    A directional metric is a quality claim, and an algorithm that did a fraction of the work can win one
+    by selection: fewer requests means fewer 429s and errors in the denominator, fewer attempts means
+    less retry pressure to show, and a shorter run serves less of the capacity it was offered. Only two
+    directional metrics may escape the gate — `jobs_done`, which *is* the comparison of how much work got
+    done, and the correctness counter. Anything else added here has to justify itself in a test.
+    """
+    ungated = {
+        name
+        for name, metric in METRICS.items()
+        if metric.better != "neutral" and not metric.requires_comparable_completion
+    }
+
+    assert ungated == {"jobs_done", "leases_active_at_end"}
+
+
+@pytest.mark.parametrize("metric", sorted(name for name, m in METRICS.items() if m.requires_comparable_completion))
+def test_an_algorithm_that_does_almost_nothing_cannot_win_any_quality_row(metric):
+    """The extreme fail-fast case, on every row the gate covers: `a` is best *because* it did nothing.
+
+    `a` completes 1 of 1000 jobs and barely reaches the provider — its rates are low because there is
+    almost nothing in their denominators, not because its behaviour is better. It must be visible as
+    excluded from every quality row and must never appear among the winners.
+    """
+    info = METRICS[metric]
+    # `a` is handed the numerically best value on the row, whatever "best" means for this metric.
+    best_for_a = 0.0 if info.better == "lower" else 1_000_000.0
+    worse = (1.0, 2.0) if info.better == "lower" else (1.0, 0.5)
+    hands = {"a": best_for_a, "b": worse[0], "c": worse[1]}
+    report = _multi(
+        {
+            algorithm: {"jobs_done": [done], metric: [hands[algorithm]]}
+            for algorithm, done in (("a", 1.0), ("b", 1000.0), ("c", 950.0))
+        }
+    )
+
+    assert "a" in {name for name, _ in report.excluded_by_completion(metric)}
+    assert "a" not in report.winners(metric)
+    assert report.winners(metric), "the row is still decided between the algorithms that did the work"
 
 
 # ------------------------------------------------------------------ aggregation
@@ -118,17 +162,18 @@ def _multi(series: dict[str, dict[str, list[float]]]) -> BenchmarkReport:
 
 
 def test_winners_respect_the_direction_of_each_metric():
-    report = _plain(
+    # `slow` completed 98% of the best, so it clears the completion gate on the rows it is meant to win.
+    report = _multi(
         {
-            "jobs_done": {"fast": 100.0, "slow": 10.0},  # higher is better
-            "makespan_s": {"fast": 5.0, "slow": 50.0},  # neutral: nobody wins it
-            "refusal_rate": {"fast": 0.4, "slow": 0.1},  # lower is better
+            "fast": {"jobs_done": [100.0], "makespan_s": [5.0], "refusal_rate": [0.4], "utilization": [0.2]},
+            "slow": {"jobs_done": [98.0], "makespan_s": [50.0], "refusal_rate": [0.1], "utilization": [0.8]},
         }
     )
 
-    assert report.winners("jobs_done") == ["fast"]
-    assert report.winners("refusal_rate") == ["slow"]
-    assert report.winners("makespan_s") == []
+    assert report.winners("jobs_done") == ["fast"], "higher is better"
+    assert report.winners("refusal_rate") == ["slow"], "lower is better"
+    assert report.winners("utilization") == ["slow"]
+    assert report.winners("makespan_s") == [], "neutral: nobody wins it"
 
 
 def test_a_gap_inside_the_paired_spread_is_a_tie():
@@ -168,7 +213,7 @@ def test_a_metric_that_is_zero_for_everyone_crowns_nobody():
     assert report.winners("refusal_rate") == []
 
 
-def test_a_conditional_metric_cannot_crown_an_algorithm_that_completed_almost_nothing():
+def test_a_quality_metric_cannot_crown_an_algorithm_that_completed_almost_nothing():
     """The reviewer's 1-of-1000 case: fail-fast must not buy a latency or throughput win.
 
     `fast` has the best successful-job latency in the table and completed 0.1% of the work; the row has
@@ -363,6 +408,19 @@ def test_the_json_carries_the_exclusions_the_gate_made():
     payload = report.to_dict()
 
     assert set(payload["excluded_by_completion"]) == {
-        name for name, metric in METRICS.items() if metric.gated_by_completion
+        name for name, metric in METRICS.items() if metric.requires_comparable_completion
     }
     assert payload["unsuited"] == {}  # nothing unsuited was asked for here
+
+
+def test_the_sweep_refuses_a_budget_that_cannot_run():
+    """The API is held to the same rule as the CLI: refuse, never silently clamp.
+
+    `range(max(1, seeds))` turned `seeds=0` into a one-seed sweep, so the caller got a reproducible
+    number for an experiment nobody asked for.
+    """
+    with pytest.raises(ConfigError, match="seeds must be at least 1"):
+        run_benchmark(_small(), ["wait"], seeds=0)
+
+    with pytest.raises(ConfigError, match="wall_budget must be positive"):
+        run_benchmark(_small(), ["wait"], seeds=1, wall_budget=0.0)

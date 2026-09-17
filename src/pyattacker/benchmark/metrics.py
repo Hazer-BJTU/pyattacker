@@ -27,20 +27,38 @@ class Metric:
     unit: str
     better: str  # "higher" | "lower" | "neutral"
     description: str
-    #: True when the metric is only defined for work that *completed*, so an algorithm that gave up on
-    #: most of the workload cannot be crowned on it (see `BenchmarkReport.winners`). Latency percentiles
-    #: and throughput are the obvious cases: an algorithm that abandons 99.7% of its jobs has very few
-    #: latencies to be slow at, and a small makespan to divide by.
-    gated_by_completion: bool = False
+    #: True when the metric is a *quality* claim that only means something between algorithms that did a
+    #: comparable amount of useful work, so the completion gate applies (see `BenchmarkReport.winners`).
+    #: The rule is not "defined only for completed work": several of these are per-request or per-attempt
+    #: rates whose denominator the client itself controls, and one is an integral over a run whose length
+    #: the client also controls. An algorithm that abandons work before it reaches the provider has no
+    #: 429s in the denominator, no failures to retry and no offered capacity it used — it can look like
+    #: the best-behaved client in the table by doing almost nothing. `jobs_done` is ungated (it *is* the
+    #: comparison of how much work got done) and the correctness/diagnostic counters are ungated because
+    #: they make no quality claim at all.
+    requires_comparable_completion: bool = False
 
 
 def _m(name: str, unit: str, better: str, description: str, *, gated: bool = False) -> tuple[str, Metric]:
-    return name, Metric(name=name, unit=unit, better=better, description=description, gated_by_completion=gated)
+    return name, Metric(
+        name=name,
+        unit=unit,
+        better=better,
+        description=description,
+        requires_comparable_completion=gated,
+    )
 
 
 METRICS: dict[str, Metric] = dict(
     [
-        _m("jobs_done", "jobs", "higher", "Jobs that finished successfully before the horizon."),
+        _m(
+            "jobs_done",
+            "jobs",
+            "higher",
+            "Jobs completed successfully among the work admitted before the horizon cutoff. The horizon "
+            "stops new jobs rather than truncating one already in flight, so a job admitted at 599s may "
+            "finish after 600s and still counts here.",
+        ),
         _m(
             "jobs_failed",
             "jobs",
@@ -99,24 +117,43 @@ METRICS: dict[str, Metric] = dict(
             "ratio",
             "lower",
             "Failed step attempts as a fraction of all step attempts. Includes attempts the retry policy "
-            "then abandoned, which `retry_rate` excludes.",
+            "then abandoned, which `retry_rate` excludes. Conditional: an algorithm that abandons work "
+            "before it reaches the provider collects few failures to be measured on.",
+            gated=True,
         ),
         _m(
             "retry_rate",
             "ratio",
             "lower",
             "Retries the policy actually scheduled, as a fraction of all step attempts. "
-            "`failed_attempt_rate` minus this is the share of failures that were given up on.",
+            "`failed_attempt_rate` minus this is the share of failures that were given up on. "
+            "Conditional: an algorithm that never gets far enough to meet a retryable failure schedules "
+            "no retries, which is not the same thing as being gentle with the provider.",
             gated=True,
         ),
-        _m("refusal_rate", "ratio", "lower", "Requests refused by the provider (429) per request sent."),
-        _m("error_rate", "ratio", "lower", "Requests that failed with an error per request sent."),
+        _m(
+            "refusal_rate",
+            "ratio",
+            "lower",
+            "Requests refused by the provider (429) per request sent. Conditional: the client decides "
+            "whether a request exists at all, so an algorithm that abandons contention before asking "
+            "cannot collect refusals — the denominator is partly its own choice.",
+            gated=True,
+        ),
+        _m(
+            "error_rate",
+            "ratio",
+            "lower",
+            "Requests that failed with an error per request sent. Conditional for the same reason as "
+            "`refusal_rate`: fewer requests means fewer chances to be counted against.",
+            gated=True,
+        ),
         _m(
             "successful_job_latency_p50_ms",
             "ms",
             "lower",
-            "Median time of a job that *succeeded*, retries included. Conditional by name: jobs that "
-            "gave up have no completion time, so the value describes the survivors.",
+            "Median time of a job that *succeeded*, retries included. The name is the qualifier: jobs "
+            "that gave up have no completion time, so the value describes the survivors.",
             gated=True,
         ),
         _m(
@@ -149,7 +186,15 @@ METRICS: dict[str, Metric] = dict(
             gated=True,
         ),
         _m("request_latency_p50_ms", "ms", "neutral", "Median served request latency (a property of the world)."),
-        _m("utilization", "ratio", "higher", "Served work-seconds over offered capacity-seconds."),
+        _m(
+            "utilization",
+            "ratio",
+            "higher",
+            "Served work-seconds over offered capacity-seconds, integrated over the run's own makespan. "
+            "Conditional twice over: the interval differs from run to run, and an algorithm that stops "
+            "after a few seconds never offers the capacity it left unused a chance to be used.",
+            gated=True,
+        ),
         _m(
             "endpoint_spread",
             "ratio",

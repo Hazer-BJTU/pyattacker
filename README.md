@@ -282,7 +282,9 @@ algorithms rather than between moods. (Their realized provider state still diver
 and the in-flight count react to what each of them did — that divergence is the measurement.)
 It reports a vector of metrics (throughput, tail latency, retries, refusals provoked, capacity
 utilisation, fairness across endpoints) instead of one weighted score, and it names the winner per metric
-— including when the winner is "nobody", and never when there was only one algorithm left to compare.
+— including when the winner is "nobody", when there was only one algorithm left to compare, and never for
+an algorithm that completed a fraction of the work: a strategy that abandons the queue cannot win a rate
+by keeping its denominator small.
 
 [`docs/benchmark.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/benchmark.md) has the assumptions, the metrics, the current numbers, and
 what they do not say.

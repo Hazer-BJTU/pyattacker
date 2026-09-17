@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..algorithm import ALGORITHMS
+from ..errors import ConfigError
 from .harness import Harness, RunResult
 from .metrics import METRICS, aggregate
 from .scenario import Scenario
@@ -35,8 +36,9 @@ TIE_TOLERANCE = 0.01
 # scorer and the spread column is what warns the reader.
 SIGNIFICANCE_K = 2.0
 
-# An algorithm has to complete this fraction of the best algorithm's jobs before a *conditional*
-# metric (throughput, successful-job latency) is allowed to crown it. See Metric.gated_by_completion.
+# An algorithm has to complete this fraction of the best algorithm's jobs before any *quality* metric is
+# allowed to crown it — not only the ones whose value is undefined without completions, but every row
+# whose denominator the client partly controls. See Metric.requires_comparable_completion.
 COMPLETION_FLOOR = 0.9
 
 
@@ -97,12 +99,12 @@ class BenchmarkReport:
         return series
 
     def excluded_by_completion(self, metric: str) -> list[tuple[str, float]]:
-        """Algorithms the completion gate kept out of a conditional metric, with their completion ratio.
+        """Algorithms the completion gate kept out of a quality row, with their completion ratio.
 
         Returned for the report to print: an algorithm that would have won a latency row by finishing
         0.3% of the workload should be visible as *excluded*, not silently dropped and not crowned.
         """
-        if not METRICS[metric].gated_by_completion:
+        if not METRICS[metric].requires_comparable_completion:
             return []
         # The baseline is the best *comparable* completion. An algorithm the scenario cannot exercise,
         # run only because it was asked for by name, must not set the threshold that excludes the
@@ -122,7 +124,7 @@ class BenchmarkReport:
         """The runs this metric may be compared on: suited algorithms that clear the completion gate."""
         series = self.series(metric)
         eligible = {name: values for name, values in series.items() if name not in self.unsuited}
-        if METRICS[metric].gated_by_completion:
+        if METRICS[metric].requires_comparable_completion:
             gated = {name for name, _ in self.excluded_by_completion(metric)}
             eligible = {name: values for name, values in eligible.items() if name not in gated}
         return eligible
@@ -135,7 +137,7 @@ class BenchmarkReport:
         metrics on purpose, and to rows that started with more than one contestant — this explains a row
         the gate emptied, not a report that only ever contained one algorithm.
         """
-        if not METRICS[metric].gated_by_completion:
+        if not METRICS[metric].requires_comparable_completion:
             return None
         if len(self.series(metric)) < 2:
             return None
@@ -207,7 +209,7 @@ class BenchmarkReport:
                     for name, ratio in self.excluded_by_completion(metric)
                 ]
                 for metric in METRICS
-                if METRICS[metric].gated_by_completion
+                if METRICS[metric].requires_comparable_completion
             },
             "unsuited": dict(self.unsuited),
             # Rows where the completion gate left a single contestant: no star, and the reason on record.
@@ -256,8 +258,8 @@ class BenchmarkReport:
         if excluded:
             detail = ", ".join(f"{name} on {metric} ({ratio:.1%} of the best completion)" for metric, name, ratio in excluded[:4])
             lines.append(
-                "conditional rows (throughput, latency, attempt pressure) only consider algorithms that "
-                f"completed at least {COMPLETION_FLOOR:.0%} of the best completion; excluded: {detail}"
+                "quality rows only consider algorithms that completed at least "
+                f"{COMPLETION_FLOOR:.0%} of the best completion; excluded: {detail}"
             )
         sole = {metric: name for metric in names if (name := self.unrivaled(metric)) is not None}
         if sole:
@@ -340,9 +342,14 @@ def run_benchmark(
     and a seed count. `wall_budget` applies per run, not to the whole sweep: a single run that cannot
     finish raises `BenchmarkTimeout` with the numbers it did reach. `clock_factory` exists so the same
     scenario can be replayed on the reference (real-time) clock and compared — see `ScaledClock`.
+
+    The budget arguments are validated rather than clamped: a sweep that ran a different experiment than
+    the one it was asked for would report the wrong numbers under the right heading.
     """
+    if seeds < 1:
+        raise ConfigError(f"seeds must be at least 1, got {seeds}: a sweep needs a seed to be reproducible")
     names = algorithms or default_algorithms(scenario)
-    seed_list = [scenario.seed + offset for offset in range(max(1, seeds))]
+    seed_list = [scenario.seed + offset for offset in range(seeds)]
     runs: list[RunResult] = []
     started = time.monotonic()
     for name in names:
