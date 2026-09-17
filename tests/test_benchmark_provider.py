@@ -184,36 +184,68 @@ def test_failures_look_like_provider_errors_the_framework_can_classify():
     assert provider.stats.endpoints["only"].failed == 30
 
 
-def test_a_storm_is_a_property_of_time_not_of_traffic():
-    """The same (endpoint, window) always makes the same weather decision, whoever asks."""
+def test_storm_state_does_not_depend_on_request_cadence():
+    """The regression the first version of this test missed.
+
+    Same seed, same endpoint, deliberately different traffic: the weather at a given time must be the
+    same. The old implementation decided the weather when a request arrived and remembered "checked
+    until now + window", so a request at t=9 could suppress the window a request at t=10 would have
+    evaluated — two algorithms, two worlds. Asserting reproducibility under an *identical* schedule
+    would not have caught it.
+    """
     scenario = _scenario(
         failures=FailureProfile(error_rate=0.0, storm_rate=0.5, storm_check_s=10.0, storm_duration_s=30.0),
         rate_limit=None,
         quota_units=None,
     )
-    decisions: list[list[float]] = []
-    for _ in range(2):
-        clock = ManualClock()
-        provider = SimulatedProvider(scenario, clock, seed=4242)
 
-        async def drive(provider=provider, clock=clock) -> list[float]:
-            storms = []
-            for window in range(8):
-                clock.t = window * 10.0
+    def storm_by_time(times: list[float], seed: int) -> dict[float, bool]:
+        clock = ManualClock()
+        provider = SimulatedProvider(scenario, clock, seed=seed)
+        states: dict[float, bool] = {}
+
+        async def drive() -> None:
+            for when in times:
+                clock.t = when
                 task = asyncio.ensure_future(provider.perform("only"))
                 await clock.settle()
                 clock.release()
-                try:
+                with contextlib.suppress(Exception):  # a storm makes the request fail; that is fine
                     await task
-                except Exception:
-                    pass
-                finally:
-                    storms.append(provider._storm_until["only"])
-            return storms
+                states[when] = provider.storm_until("only", when) > 0.0
 
-        decisions.append(run(drive()))
+        run(drive())
+        return states
 
-    assert decisions[0] == decisions[1]
+    compared = 0
+    for seed in range(1, 8):
+        dense = storm_by_time([0.0, 10.0, 11.0, 20.0, 21.0, 40.0], seed)
+        sparse = storm_by_time([9.0, 11.0, 21.0, 40.0], seed)
+        for when in sorted(set(dense) & set(sparse)):
+            compared += 1
+            assert dense[when] == sparse[when], f"seed {seed}, t={when}: {dense[when]} vs {sparse[when]}"
+
+    assert compared >= 20, "the two cadences have to overlap somewhere for this to mean anything"
+    assert any(storm_by_time([0.0, 10.0, 20.0], seed).values() for seed in range(1, 8)), (
+        "at least one seed has to produce a storm, or the test proves nothing"
+    )
+
+
+def test_the_storm_interval_is_anchored_to_its_window():
+    """A storm runs from its window's start, not from the moment a request noticed it."""
+    scenario = _scenario(
+        failures=FailureProfile(error_rate=0.0, storm_rate=1.0, storm_check_s=10.0, storm_duration_s=30.0),
+        rate_limit=None,
+        quota_units=None,
+    )
+    clock = ManualClock()
+    provider = SimulatedProvider(scenario, clock, seed=5)
+
+    # storm_rate=1.0: every window storms, so window k covers [10k, 10k + 30), and windows overlap.
+    assert provider.storm_until("only", 0.0) == 30.0   # window 0 only
+    assert provider.storm_until("only", 9.999) == 30.0
+    assert provider.storm_until("only", 10.0) == 40.0  # window 1 has started, 0 is still running
+    assert provider.storm_until("only", 25.0) == 50.0  # windows 0, 1 and 2 all cover t=25
 
 
 # ------------------------------------------------------------------ fairness

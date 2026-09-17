@@ -27,10 +27,15 @@ class Metric:
     unit: str
     better: str  # "higher" | "lower" | "neutral"
     description: str
+    #: True when the metric is only defined for work that *completed*, so an algorithm that gave up on
+    #: most of the workload cannot be crowned on it (see `BenchmarkReport.winners`). Latency percentiles
+    #: and throughput are the obvious cases: an algorithm that abandons 99.7% of its jobs has very few
+    #: latencies to be slow at, and a small makespan to divide by.
+    gated_by_completion: bool = False
 
 
-def _m(name: str, unit: str, better: str, description: str) -> tuple[str, Metric]:
-    return name, Metric(name=name, unit=unit, better=better, description=description)
+def _m(name: str, unit: str, better: str, description: str, *, gated: bool = False) -> tuple[str, Metric]:
+    return name, Metric(name=name, unit=unit, better=better, description=description, gated_by_completion=gated)
 
 
 METRICS: dict[str, Metric] = dict(
@@ -45,22 +50,57 @@ METRICS: dict[str, Metric] = dict(
             "Simulated seconds until the last job finished or gave up — read it next to `jobs_done`, "
             "since finishing early by failing fast is not an achievement.",
         ),
-        _m("throughput_rps", "jobs/s", "higher", "Completed jobs per simulated second of makespan."),
+        _m(
+            "throughput_rps",
+            "jobs/s",
+            "higher",
+            "Completed jobs per simulated second of the scenario's budget. The denominator is fixed on "
+            "purpose: dividing by each run's own makespan would let an algorithm that abandons every job "
+            "manufacture throughput out of finishing early.",
+            gated=True,
+        ),
         _m("requests", "requests", "neutral", "Requests sent, including refusals and retries."),
         _m("attempts_per_job", "attempts", "lower", "Step attempts per completed job (1.0 = no retries)."),
         _m("retry_rate", "ratio", "lower", "Failed step attempts as a fraction of all step attempts."),
         _m("refusal_rate", "ratio", "lower", "Requests refused by the provider (429) per request sent."),
         _m("error_rate", "ratio", "lower", "Requests that failed with an error per request sent."),
-        _m("job_latency_p50_ms", "ms", "lower", "Median wall time of a job, retries included."),
-        _m("job_latency_p95_ms", "ms", "lower", "95th percentile job time: the tail a user notices."),
-        _m("job_latency_p99_ms", "ms", "lower", "99th percentile job time."),
+        _m(
+            "successful_job_latency_p50_ms",
+            "ms",
+            "lower",
+            "Median time of a job that *succeeded*, retries included. Conditional by name: jobs that "
+            "gave up have no completion time, so the value describes the survivors.",
+            gated=True,
+        ),
+        _m(
+            "successful_job_latency_p95_ms",
+            "ms",
+            "lower",
+            "95th percentile job time among successful jobs: the tail a user notices.",
+            gated=True,
+        ),
+        _m(
+            "successful_job_latency_p99_ms",
+            "ms",
+            "lower",
+            "99th percentile job time among successful jobs.",
+            gated=True,
+        ),
         _m("acquire_wait_p50_ms", "ms", "lower", "Median time a step spent waiting for a lease."),
         _m("acquire_wait_p99_ms", "ms", "lower", "99th percentile lease wait: what a saturated pool costs."),
         _m("request_latency_p50_ms", "ms", "neutral", "Median served request latency (a property of the world)."),
         _m("utilization", "ratio", "higher", "Served work-seconds over offered capacity-seconds."),
-        _m("endpoint_spread", "ratio", "lower", "Relative spread of admitted requests across endpoints (0 = even)."),
+        _m(
+            "endpoint_spread",
+            "ratio",
+            "neutral",
+            "Relative spread of admitted requests across endpoints (0 = perfectly even). Diagnostic: the "
+            "endpoints are deliberately unlike each other, so piling traffic onto the dependable one is "
+            "good practice that *raises* this number. A fairness metric would have to compare each "
+            "endpoint's admitted share against the share it was offered.",
+        ),
         _m("leases_active_at_end", "leases", "lower", "Leases still held when the run ended; must be zero."),
-        _m("wall_s", "s", "lower", "Real seconds the harness spent simulating (cost, not quality)."),
+        _m("wall_s", "s", "neutral", "Real seconds the harness spent simulating: cost, never quality."),
     ]
 )
 

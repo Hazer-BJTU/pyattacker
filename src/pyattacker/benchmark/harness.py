@@ -111,7 +111,6 @@ class Harness:
         self._jobs_failed = 0
         self._attempts = 0
         self._failed_attempts = 0
-        self._acquire_gave_up = 0
         self._job_latencies: list[float] = []
         self._wait_ms: list[float] = []
         self._request_ms: list[float] = []
@@ -149,11 +148,25 @@ class Harness:
         )
 
     # ------------------------------------------------------------------ the workers
+    def acquire_stream(self, job: int, step: int, attempt: int) -> random.Random:
+        """The randomness the acquire algorithm under test may consume during one attempt.
+
+        Derived from the logical identity of the attempt, never from the worker that happened to claim
+        the job: with a per-worker stream, an algorithm that changes request timing changes which worker
+        takes which job, which changes how many draws the *previous* job consumed — and the same logical
+        attempt then sees different randomness under two algorithms. The Runner does the same thing for
+        the same reason (it seeds per pipeline/task/attempt, see `runner.py`).
+        """
+        return random.Random(f"{self.seed}:acquire:{job}:{step}:{attempt}")
+
+    def retry_stream(self, job: int, step: int, attempt: int) -> random.Random:
+        """The randomness the retry policy may consume, in its own stream: separate subsystem, separate draws."""
+        return random.Random(f"{self.seed}:retry:{job}:{step}:{attempt}")
+
     async def _worker(self, worker_id: int) -> None:
-        rng = random.Random(f"{self.seed}:worker:{worker_id}")
         while (job := self._claim_job()) is not None:
             started = self.clock.now()
-            succeeded = await self._run_job(job, rng)
+            succeeded = await self._run_job(job)
             if succeeded:
                 self._jobs_done += 1
                 self._job_latencies.append((self.clock.now() - started) * 1000.0)
@@ -167,13 +180,13 @@ class Harness:
         self._next_job += 1
         return self._next_job - 1
 
-    async def _run_job(self, job: int, rng: random.Random) -> bool:
+    async def _run_job(self, job: int) -> bool:
         for step in range(self.scenario.steps_per_job):
-            if not await self._run_step(job, step, rng):
+            if not await self._run_step(job, step):
                 return False
         return True
 
-    async def _run_step(self, job: int, step: int, rng: random.Random) -> bool:
+    async def _run_step(self, job: int, step: int) -> bool:
         """One step of a job: attempts, retries, and the retry policy the framework itself applies."""
         policy = self.scenario.retry
         started = self.clock.now()
@@ -181,24 +194,32 @@ class Harness:
         while True:
             attempt += 1
             self._attempts += 1
-            context = self._context(job, step, attempt, rng)
+            context = self._context(job, step, attempt)
             try:
                 await self._call_sequence(context)
-            except ResourceUnavailable:
-                # The algorithm itself declined to wait (immediate, or a failover with nowhere to
-                # go). That is a strategy outcome, not a provider error, so it is not retried here:
-                # retrying a pool the algorithm just refused to queue on measures nothing.
-                self._acquire_gave_up += 1
-                return False
-            except (ProviderError, ConnectionError, TimeoutError, RetryableError, FatalError) as exc:
-                # Only failures the *world* can produce are counted as attempts that failed. Anything
-                # else (a config error, a framework bug) propagates: turning it into a metric would
-                # hide it behind a plausible-looking number.
+            except (
+                ProviderError,
+                ConnectionError,
+                TimeoutError,
+                RetryableError,
+                FatalError,
+                ResourceUnavailable,
+            ) as exc:
+                # `ResourceUnavailable` is in this list on purpose: the algorithm declining to wait is
+                # an ordinary failed attempt, and the *policy* decides what it is worth — with the
+                # scenario's default `Retrying` it is classified `unknown` and not retried, but a
+                # scenario that sets `retry_unknown=True` or `on=(ResourceUnavailable,)` gets the
+                # framework's semantics instead of a hidden special case. Anything not listed here (a
+                # config error, a framework bug) propagates: turning it into a metric would hide it
+                # behind a plausible-looking number.
                 self._failed_attempts += 1
                 error_class = error_class_of(exc)
                 self._error_classes[error_class] = self._error_classes.get(error_class, 0) + 1
                 decision = policy.decide(
-                    exc, attempts_used=attempt, rng=rng, elapsed=self.clock.now() - started
+                    exc,
+                    attempts_used=attempt,
+                    rng=self.retry_stream(job, step, attempt),
+                    elapsed=self.clock.now() - started,
                 )
                 if not decision["retry"]:
                     return False
@@ -232,7 +253,7 @@ class Harness:
             finally:
                 lease.release_now()
 
-    def _context(self, job: int, step: int, attempt: int, rng: random.Random) -> TaskContext:
+    def _context(self, job: int, step: int, attempt: int) -> TaskContext:
         return TaskContext(
             run_id=f"bench-{self.seed}",
             pipeline_id=f"{self.scenario.name}-{job}",
@@ -243,7 +264,7 @@ class Harness:
             attempt=attempt,
             clock=self.clock,
             pools={"providers": self.pool},
-            rng=rng,
+            rng=self.acquire_stream(job, step, attempt),
             default_pool="providers",
         )
 
@@ -266,15 +287,17 @@ class Harness:
             "jobs_failed": float(self._jobs_failed),
             "jobs_unstarted": float(max(0, self.scenario.jobs - self._next_job)),
             "makespan_s": makespan,
-            "throughput_rps": (done / makespan) if makespan > 0 else 0.0,
+            # Fixed denominator: see METRICS["throughput_rps"]. Dividing by this run's own makespan
+            # would reward an algorithm for finishing early by abandoning its work.
+            "throughput_rps": (done / self.scenario.horizon_s) if self.scenario.horizon_s > 0 else 0.0,
             "requests": float(requests),
             "attempts_per_job": (self._attempts / done) if done else 0.0,
             "retry_rate": (self._failed_attempts / self._attempts) if self._attempts else 0.0,
             "refusal_rate": (provider.refusals / requests) if requests else 0.0,
             "error_rate": (provider.failed / requests) if requests else 0.0,
-            "job_latency_p50_ms": percentile(self._job_latencies, 0.50),
-            "job_latency_p95_ms": percentile(self._job_latencies, 0.95),
-            "job_latency_p99_ms": percentile(self._job_latencies, 0.99),
+            "successful_job_latency_p50_ms": percentile(self._job_latencies, 0.50),
+            "successful_job_latency_p95_ms": percentile(self._job_latencies, 0.95),
+            "successful_job_latency_p99_ms": percentile(self._job_latencies, 0.99),
             "acquire_wait_p50_ms": percentile(self._wait_ms, 0.50),
             "acquire_wait_p99_ms": percentile(self._wait_ms, 0.99),
             "request_latency_p50_ms": percentile(self._request_ms, 0.50),

@@ -13,10 +13,15 @@ Two further properties make comparisons fair rather than merely black-box:
   algorithm has sent or where it sent them.
 * **Each request's draws are indexed by its ordinal at that endpoint**, not by wall order across the
   run: request *j* to an endpoint always sees the same latency and the same failure roll, whichever
-  algorithm produced it (a per-request `random.Random(f"{seed}:{endpoint}:{j}")`). Two algorithms
-  therefore meet the same world even though they visit it in a different order. This is the
-  variance-reduction trick the simulation literature calls common random numbers, and it is what
-  makes a 3% difference between two algorithms meaningful instead of noise.
+  algorithm produced it (a per-request `random.Random(f"{seed}:{endpoint}:{j}")`). This is the
+  variance-reduction trick the simulation literature calls common random numbers.
+
+What those two properties buy, precisely: two algorithms share the same **exogenous** randomness and the
+same time-indexed conditions (the cycle, the storm windows). They do *not* experience the same realized
+provider state, and they are not supposed to: the token bucket, the in-flight count and the adaptive
+tightening all respond to what the client did, so an algorithm that hammers arrives at a different state
+than one that spreads its load. That divergence *is* the measurement. The claim is "same dice, same
+weather", not "same trajectory".
 
 Errors are raised the way a vendor SDK raises them — a status code, sometimes a `Retry-After` — and
 deliberately *not* as the framework's own `RetryableError`. `errors.error_class_of` decides what is
@@ -121,16 +126,13 @@ class SimulatedProvider:
         self._tokens: dict[str, float] = {}
         self._allowance: dict[str, float] = {}
         self._refilled_at: dict[str, float] = {}
-        self._storm_until: dict[str, float] = {}
-        self._storm_checked_at: dict[str, float] = {}
+        self._storm_windows: dict[tuple[str, int], bool] = {}  # (endpoint, window) -> storm? pure
         self._integrated_at: dict[str, float] = {}
         for endpoint in scenario.endpoints:
             bucket = endpoint.rate_limit
             self._tokens[endpoint.id] = bucket.burst_size if bucket else math.inf
             self._allowance[endpoint.id] = 1.0
             self._refilled_at[endpoint.id] = 0.0
-            self._storm_until[endpoint.id] = 0.0
-            self._storm_checked_at[endpoint.id] = 0.0
             self._integrated_at[endpoint.id] = 0.0
 
     # ------------------------------------------------------------------ the one public door
@@ -232,18 +234,44 @@ class SimulatedProvider:
         self._tokens[endpoint_id] = max(0.0, self._tokens[endpoint_id] - 1.0)
         return 1.0
 
+    def storm_until(self, endpoint_id: str, t: float) -> float:
+        """When the last storm covering ``t`` ends, or ``0.0`` if there is none.
+
+        A pure function of ``(seed, endpoint, t)``: the weather is decided per fixed time window
+        (``[k * storm_check_s, (k + 1) * storm_check_s)``), and a storm runs from its window's start
+        for ``storm_duration_s``. Nothing here consults request history, which is the whole point —
+        an earlier version decided the weather when a request arrived and remembered "checked until
+        now + window", so a request at t=9 could suppress the window a request at t=10 would have
+        evaluated. Two algorithms sending at different times then met different worlds, which quietly
+        breaks every comparison the benchmark exists to make.
+        """
+        profile = self._profiles[endpoint_id]
+        failures = profile.failures
+        if failures.storm_rate <= 0.0 or failures.storm_duration_s <= 0.0:
+            return 0.0
+        check = max(failures.storm_check_s, 1e-9)
+        first = int(max(0.0, t - failures.storm_duration_s) // check)  # an older storm may still cover t
+        last = int(t // check)
+        latest_end = 0.0
+        for window in range(first, last + 1):
+            if self._storm_window(endpoint_id, window):
+                latest_end = max(latest_end, (window + 1) * check + failures.storm_duration_s - check)
+        return latest_end if latest_end > t else 0.0
+
+    def _storm_window(self, endpoint_id: str, window: int) -> bool:
+        """Whether the given time window starts a storm. Cached; the value depends only on the key."""
+        key = (endpoint_id, window)
+        cached = self._storm_windows.get(key)
+        if cached is None:
+            profile = self._profiles[endpoint_id]
+            weather = random.Random(f"{self.seed}:{endpoint_id}:storm:{window}")
+            cached = weather.random() < profile.failures.storm_rate
+            self._storm_windows[key] = cached
+        return cached
+
     def _failure(self, endpoint_id: str, profile: EndpointProfile, now: float, rng: random.Random):
         """Independent blips and storms. Returns the exception to raise, or None."""
-        in_storm = now < self._storm_until[endpoint_id]
-        if not in_storm and now >= self._storm_checked_at[endpoint_id]:
-            # Storms are decided per time window from a time-indexed stream: the endpoint's mood is
-            # a property of the world, not of how many requests arrived.
-            window = int(now // max(profile.failures.storm_check_s, 1e-9))
-            weather = random.Random(f"{self.seed}:{endpoint_id}:storm:{window}")
-            self._storm_checked_at[endpoint_id] = now + profile.failures.storm_check_s
-            if weather.random() < profile.failures.storm_rate:
-                self._storm_until[endpoint_id] = now + profile.failures.storm_duration_s
-                in_storm = True
+        in_storm = self.storm_until(endpoint_id, now) > 0.0
         if rng.random() >= profile.failures.error_probability(in_storm=in_storm):
             return None
         roll = rng.random()

@@ -9,6 +9,8 @@ algorithms tie" or "this metric does not separate them".
 from __future__ import annotations
 
 import math
+import statistics
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -25,20 +27,32 @@ __all__ = ["BenchmarkReport", "default_algorithms", "run_benchmark"]
 TIE_TOLERANCE = 0.01
 
 # The second, larger guard: a row is only a win if the gap survives the seed-to-seed noise. The
-# threshold is this many standard errors of the difference between the two means (about 95% for a
-# normal difference), computed from the seeds actually run. One seed has no spread to test against,
-# which is exactly why a single-seed report crowns the top scorer and warns the reader.
+# threshold is this many standard errors of the *paired* difference (every algorithm runs every seed,
+# so the runs are paired by construction and the covariance between them is exactly what common random
+# numbers buys). A heuristic, deliberately: with three seeds the Student-t critical value for 95% is
+# 4.3, and pretending 2.0 means "95% significant" would be a stronger claim than the experiment
+# supports. One seed has no spread to test against, which is why a single-seed report crowns the top
+# scorer and the spread column is what warns the reader.
 SIGNIFICANCE_K = 2.0
 
+# An algorithm has to complete this fraction of the best algorithm's jobs before a *conditional*
+# metric (throughput, successful-job latency) is allowed to crown it. See Metric.gated_by_completion.
+COMPLETION_FLOOR = 0.9
 
-def default_algorithms() -> list[str]:
-    """The algorithms the framework ships, in registration order.
 
-    `failover` is included even though a single-pool scenario is not what it is for (it is at its
-    best carrying a request across pools); leaving it out would be a quiet editorial choice, and the
-    report says so instead.
+def default_algorithms(scenario: Scenario | None = None) -> list[str]:
+    """The algorithms the framework ships, minus the ones a scenario declares itself unsuited for.
+
+    A scenario says which of its algorithms it cannot exercise (`Scenario.unsuited`): a single-pool
+    world has nothing for `failover` to fail over to, and the pool's default selection is already
+    least-busy-first, so `least_busy` is the same code path as `wait` there. Ranking them anyway
+    produces a number that looks comparable and is not, which is worse than saying "not run".
     """
-    return list(ALGORITHMS)
+    names = list(ALGORITHMS)
+    if scenario is None:
+        return names
+    unsuited = {name for name, _ in scenario.unsuited}
+    return [name for name in names if name not in unsuited]
 
 
 @dataclass
@@ -49,6 +63,8 @@ class BenchmarkReport:
     seeds: list[int]
     runs: list[RunResult]
     wall_s: float = 0.0
+    #: Algorithms that were run although the scenario cannot exercise them, with the reason.
+    unsuited: dict[str, str] = field(default_factory=dict)
     _aggregates: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ aggregation
@@ -72,6 +88,32 @@ class BenchmarkReport:
     def stdev(self, algorithm: str, metric: str) -> float:
         return self.aggregates(algorithm).get(metric, {}).get("stdev", 0.0)
 
+    def series(self, metric: str) -> dict[str, dict[int, float]]:
+        """Per-algorithm values indexed by seed, which is what makes a paired comparison possible."""
+        series: dict[str, dict[int, float]] = {}
+        for run in self.runs:
+            if metric in run.metrics:
+                series.setdefault(run.algorithm, {})[run.seed] = run.metrics[metric]
+        return series
+
+    def excluded_by_completion(self, metric: str) -> list[tuple[str, float]]:
+        """Algorithms the completion gate kept out of a conditional metric, with their completion ratio.
+
+        Returned for the report to print: an algorithm that would have won a latency row by finishing
+        0.3% of the workload should be visible as *excluded*, not silently dropped and not crowned.
+        """
+        if not METRICS[metric].gated_by_completion:
+            return []
+        best_done = max((self.mean(name, "jobs_done") for name in self.series(metric)), default=0.0)
+        if best_done <= 0:
+            return []
+        excluded = []
+        for name in self.series(metric):
+            ratio = self.mean(name, "jobs_done") / best_done
+            if ratio < COMPLETION_FLOOR:
+                excluded.append((name, ratio))
+        return sorted(excluded, key=lambda item: -item[1])
+
     def winners(self, metric: str) -> list[str]:
         """The algorithms that can claim this metric: the best mean, and anyone within noise of it.
 
@@ -85,33 +127,37 @@ class BenchmarkReport:
         Comparing against the leader rather than against the growing group keeps the rule one line
         long and its meaning obvious.
         """
-        direction = METRICS[metric].better
+        info = METRICS[metric]
+        direction = info.better
         if direction == "neutral":
             return []
-        means = {name: self.mean(name, metric) for name in self.algorithms}
-        if not means:
+        series = self.series(metric)
+        # A scenario that cannot exercise an algorithm has no opinion about it (see Scenario.unsuited).
+        eligible = {name: values for name, values in series.items() if name not in self.unsuited}
+        if info.gated_by_completion:
+            gated = {name for name, _ in self.excluded_by_completion(metric)}
+            eligible = {name: values for name, values in eligible.items() if name not in gated}
+        if not eligible:
             return []
+        means = {name: statistics.fmean(values.values()) for name, values in eligible.items()}
         best = max(means.values()) if direction == "higher" else min(means.values())
         # A metric that is zero everywhere (no refusals, say) separates nothing; calling the zeros
         # "winners" would dress up the absence of a difference as a result.
         if best == 0 and all(value == 0 for value in means.values()):
             return []
         scale = abs(best) if abs(best) > 1e-12 else 1.0
-        if direction == "higher":
-            leader = max(means, key=lambda name: means[name])
-        else:
-            leader = min(means, key=lambda name: means[name])
-        leader_sd = self.stdev(leader, metric)
-        seeds = max(1, len(self.seeds))
-        winners = [
-            name
-            for name, value in means.items()
-            if abs(value - best)
-            <= max(
-                TIE_TOLERANCE * scale,
-                SIGNIFICANCE_K * math.sqrt((leader_sd**2 + self.stdev(name, metric) ** 2) / seeds),
-            )
-        ]
+        leader = max(means, key=lambda name: means[name]) if direction == "higher" else min(means, key=lambda name: means[name])
+        leader_series = eligible[leader]
+        winners = []
+        for name, values in eligible.items():
+            gap = abs(means[name] - best)
+            common = sorted(set(values) & set(leader_series))
+            # Paired by seed: the spread that matters is the spread of the *difference*, which is small
+            # exactly when common random numbers worked.
+            spread = statistics.stdev([values[seed] - leader_series[seed] for seed in common]) if len(common) > 1 else 0.0
+            standard_error = spread / math.sqrt(len(common)) if common else 0.0
+            if gap <= max(TIE_TOLERANCE * scale, SIGNIFICANCE_K * standard_error):
+                winners.append(name)
         return sorted(winners, key=lambda name: (-means[name] if direction == "higher" else means[name]))
 
     # ------------------------------------------------------------------ serialisation
@@ -129,6 +175,15 @@ class BenchmarkReport:
                 for name in self.algorithms
             },
             "winners": {metric: self.winners(metric) for metric in METRICS},
+            "excluded_by_completion": {
+                metric: [
+                    {"algorithm": name, "completion_ratio": round(ratio, 6)}
+                    for name, ratio in self.excluded_by_completion(metric)
+                ]
+                for metric in METRICS
+                if METRICS[metric].gated_by_completion
+            },
+            "unsuited": dict(self.unsuited),
         }
 
     # ------------------------------------------------------------------ rendering
@@ -137,7 +192,9 @@ class BenchmarkReport:
         names = metrics or [name for name in METRICS if any(name in run.metrics for run in self.runs)]
         algorithms = self.algorithms
         label_width = max(len(METRICS[name].name) + len(METRICS[name].unit) + 4 for name in names)
-        header = "metric".ljust(label_width) + "".join(name.center(16) for name in algorithms)
+        header = "metric".ljust(label_width) + "".join(
+            (f"{name} (n/a)" if name in self.unsuited else name).center(16) for name in algorithms
+        )
         lines = [header, "-" * len(header)]
         for metric in names:
             info = METRICS[metric]
@@ -161,8 +218,22 @@ class BenchmarkReport:
         )
         lines.append(
             "* best mean; anyone whose gap is inside the 1% tolerance or two standard errors of the "
-            "difference shares the mark. Rows without a mark separate nobody."
+            "paired difference shares the mark. Rows without a mark separate nobody."
         )
+        excluded = [
+            (metric, name, ratio)
+            for metric in names
+            for name, ratio in self.excluded_by_completion(metric)
+        ]
+        if excluded:
+            detail = ", ".join(f"{name} on {metric} ({ratio:.1%} of the best completion)" for metric, name, ratio in excluded[:4])
+            lines.append(
+                "conditional rows (throughput, successful-job latency) only consider algorithms that "
+                f"completed at least {COMPLETION_FLOOR:.0%} of the best completion; excluded: {detail}"
+            )
+        if self.unsuited:
+            detail = "; ".join(f"{name} ({reason})" for name, reason in sorted(self.unsuited.items()))
+            lines.append(f"not applicable in {self.scenario.name}: {detail}")
         return "\n".join(lines)
 
     def render_markdown(self, *, metrics: list[str] | None = None) -> str:
@@ -194,6 +265,9 @@ class BenchmarkReport:
                     rendered = f"{rendered} ±{spread:,.2f}" if info.unit in ("s", "ms") else f"{rendered} ±{spread:,.4f}"
                 cells.append(rendered)
             verdict = ", ".join(f"`{name}`" for name in best) if best else "—"
+            gated = self.excluded_by_completion(metric)
+            if gated:
+                verdict += " (excluded: " + ", ".join(f"`{name}` {ratio:.1%}" for name, ratio in gated) + ")"
             lines.append(f"| {info.name} ({info.unit}) | " + " | ".join(cells) + f" | {verdict} |")
         lines.append("")
         lines.append("Per-endpoint admissions (last run of each algorithm):")
@@ -206,6 +280,13 @@ class BenchmarkReport:
                 continue
             cells = [str(last.endpoint_admitted.get(endpoint.id, 0)) for endpoint in self.scenario.endpoints]
             lines.append(f"| `{algorithm}` | " + " | ".join(cells) + " |")
+        if self.unsuited:
+            lines.append("")
+            lines.append(
+                "Not applicable in this scenario, and marked N/A above: "
+                + "; ".join(f"`{name}` — {reason}" for name, reason in sorted(self.unsuited.items()))
+                + "."
+            )
         return "\n".join(lines)
 
 
@@ -225,9 +306,10 @@ def run_benchmark(
     finish raises `BenchmarkTimeout` with the numbers it did reach. `clock_factory` exists so the same
     scenario can be replayed on the reference (real-time) clock and compared — see `ScaledClock`.
     """
-    names = algorithms or default_algorithms()
+    names = algorithms or default_algorithms(scenario)
     seed_list = [scenario.seed + offset for offset in range(max(1, seeds))]
     runs: list[RunResult] = []
+    started = time.monotonic()
     for name in names:
         for seed in seed_list:
             result = Harness(
@@ -236,4 +318,11 @@ def run_benchmark(
             runs.append(result)
             if on_run is not None:
                 on_run(result)
-    return BenchmarkReport(scenario=scenario, seeds=seed_list, runs=runs)
+    return BenchmarkReport(
+        scenario=scenario,
+        seeds=seed_list,
+        runs=runs,
+        wall_s=time.monotonic() - started,
+        # Asked for explicitly, run anyway, marked N/A in the table.
+        unsuited={name: reason for name, reason in scenario.unsuited if name in names},
+    )

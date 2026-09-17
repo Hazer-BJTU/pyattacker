@@ -311,3 +311,35 @@ def test_pool_stats_reflect_capacity_and_utilization():
     for lease in leases:
         lease.release_now()
     assert pool.stats().active == 0
+
+
+# ------------------------------------------------- cooldown expiry is a real wakeup
+
+
+def test_a_wait_that_only_a_cooldown_can_end_actually_ends():
+    """Regression: a degraded slot recovers lazily, and nothing used to announce it.
+
+    Every resource cooling down, one waiter, and no other lease in flight: the only thing that can
+    release that waiter is the cooldown deadline. It emits no event of its own (nothing is released or
+    added), so unless the pool registers the deadline with its clock the waiter parks forever — a
+    starvation bug in real time, a hang under a simulated clock.
+    """
+    clock = FakeClock()
+    pool = make_pool(count=1, capacity=1, degrade_after=1, dead_after=9, cooldown_s=30.0)
+    pool.clock = clock
+    doomed = pool.try_acquire()
+    doomed.report(ok=False)  # -> degraded until now + 30
+    doomed.release_now()
+    assert pool.snapshot()[0]["state"] == "degraded"
+    assert pool.try_acquire() is None
+
+    async def wait_then_acquire() -> bool:
+        got = await pool.wait_slot(None)
+        lease = pool.try_acquire()
+        if lease is not None:
+            lease.report(ok=True)
+            lease.release_now()
+        return got and lease is not None
+
+    # Without an armed cooldown timer this never returns: the timeout is what turns a hang into a test.
+    assert run(asyncio.wait_for(wait_then_acquire(), timeout=2.0)) is True

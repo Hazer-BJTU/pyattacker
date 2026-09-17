@@ -185,6 +185,12 @@ class Scenario:
     steps_per_job: int = 3
     calls_per_step: int = 2
     seed: int = 20260917
+    #: Algorithms this scenario cannot exercise in the shape they are designed for, with the reason.
+    #: `default_algorithms` leaves them out and the report says so; asking for one explicitly still runs
+    #: it, but the column is marked N/A, because a number produced by a capability that cannot operate
+    #: here looks comparable and is not. (`docs/benchmark.md` §9 has the long version.)
+    unsuited: tuple[tuple[str, str], ...] = ()
+
     # The client's own retry policy is an assumption too: it is the same for every algorithm, and a
     # stingy budget would turn the whole comparison into "who ran out of attempts first".
     retry: Retrying = field(
@@ -241,6 +247,17 @@ def _base_scenario() -> Scenario:
             ),
         ),
         cycle=LoadCycle(period_s=120.0, trough=0.35, peak=1.0),
+        unsuited=(
+            (
+                "failover",
+                "this scenario has a single pool; failover is designed to carry a request across pools",
+            ),
+            (
+                "least_busy",
+                "the pool's default selection is already least-busy-first with round-robin, so in one "
+                "pool this is the same code path as wait",
+            ),
+        ),
         horizon_s=600.0,
         jobs=3000,
         concurrency=12,

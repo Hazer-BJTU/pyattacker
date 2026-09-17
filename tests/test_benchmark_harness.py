@@ -17,13 +17,17 @@ import pytest
 
 from pyattacker.benchmark import (
     BenchmarkTimeout,
+    EndpointProfile,
+    FailureProfile,
     Harness,
+    LatencyProfile,
     ProviderError,
     SimulatedProvider,
     get_scenario,
 )
-from pyattacker.benchmark.report import run_benchmark
+from pyattacker.benchmark.report import default_algorithms, run_benchmark
 from pyattacker.errors import ResourceUnavailable
+from pyattacker.task import Retrying
 
 
 def _small(**overrides):
@@ -181,9 +185,14 @@ class _RecordingProvider(SimulatedProvider):
         return outcome
 
 
-def test_two_algorithms_meet_the_same_world():
+def test_two_algorithms_see_the_same_exogenous_draws():
     """Common random numbers, observed from outside: for the requests both algorithms got served, the
-    world's draws are identical, however differently the two visited it."""
+    world's *draws* are identical, however differently the two visited it.
+
+    The realized provider state is a different matter, and deliberately so: the bucket, the in-flight
+    count and the tightening all react to the client's own traffic. Same dice, same weather — not the
+    same trajectory.
+    """
     scenario = _small(jobs=60, concurrency=4)
     recorded: dict[str, dict[tuple[str, int], str]] = {}
     for algorithm in ("wait", "quota_aware"):
@@ -242,3 +251,128 @@ def test_the_benchmark_package_imports_nothing_that_can_reach_the_network():
             if re.search(rf"^\s*(import|from)\s+{re.escape(name)}\b", text, re.MULTILINE):
                 offenders.append(f"{path.name}: {name}")
     assert offenders == []
+
+
+# ------------------------------------------------------------------ client-side randomness
+
+
+def test_client_randomness_follows_the_logical_identity_not_the_worker():
+    """A per-worker stream would couple the algorithm's timing to its own future randomness.
+
+    The acquire algorithm and the retry policy each get a stream derived from `(seed, job, step,
+    attempt)`; which worker happened to claim the job does not enter into it, so an algorithm that
+    spends more draws inside one attempt cannot change what a later attempt or a later job sees. The
+    two subsystems are also kept apart, so a change in retry jitter cannot shift acquire backoff.
+    """
+    harness = Harness(_small(), "wait", seed=23)
+    other = Harness(_small(), "wait", seed=23)
+
+    assert harness.acquire_stream(3, 1, 2).random() == other.acquire_stream(3, 1, 2).random()
+    assert harness.retry_stream(3, 1, 2).random() == other.retry_stream(3, 1, 2).random()
+    assert harness.acquire_stream(3, 1, 2).random() != harness.acquire_stream(3, 1, 3).random()
+    assert harness.acquire_stream(3, 1, 2).random() != harness.retry_stream(3, 1, 2).random()
+    assert harness.acquire_stream(3, 1, 2).random() != other.acquire_stream(4, 1, 2).random()
+
+
+# ------------------------------------------------------------------ a refusal is a normal failure
+
+
+def _saturating_scenario(**overrides):
+    """One endpoint with room for a single request, so a second worker is refused immediately."""
+    endpoint = EndpointProfile(
+        id="only",
+        capacity=1,
+        latency=LatencyProfile(median_s=1.0, sigma=0.0, tail_rate=0.0),
+        failures=FailureProfile(error_rate=0.0, storm_rate=0.0),
+        rate_limit=None,
+    )
+    return _small(endpoints=(endpoint,), jobs=4, concurrency=2, steps_per_job=1, calls_per_step=1, **overrides)
+
+
+def test_an_acquire_refusal_reaches_the_retry_policy_like_any_other_failure():
+    """`ResourceUnavailable` is a failed attempt, not a special case the harness decides on its own.
+
+    With the scenario's default policy it is classified `unknown` and not retried, exactly as the
+    Runner would treat it; a scenario that asks for it to be retried (`on=(ResourceUnavailable,)`, or
+    `retry_unknown=True`) gets that, because the decision belongs to `Retrying` and not to the harness.
+    """
+    forgiving = _saturating_scenario(
+        retry=Retrying(max_attempts=6, base=0.1, factor=2.0, jitter="none", on=(ResourceUnavailable,))
+    )
+    retried = Harness(forgiving, "immediate", seed=24).run()
+
+    assert retried.metrics["jobs_done"] == 4, "the policy retried the refusal until a lease came free"
+    assert retried.metrics["attempts_per_job"] > 1
+
+    strict = _saturating_scenario(retry=Retrying(max_attempts=6, base=0.1, factor=2.0, jitter="none"))
+    refused = Harness(strict, "immediate", seed=24).run()
+
+    assert refused.metrics["jobs_done"] < 4, "the default policy classifies it unknown and declines"
+    assert refused.error_classes.get("unknown", 0) > 0
+
+
+# ------------------------------------------------------------------ unsuited algorithms
+
+
+def test_a_scenario_declares_which_algorithms_it_cannot_exercise():
+    scenario = get_scenario("bursty_provider")
+    unsuited = dict(scenario.unsuited)
+
+    assert "failover" in unsuited and "single pool" in unsuited["failover"]
+    assert "least_busy" in unsuited and "same code path" in unsuited["least_busy"]
+    assert "failover" not in default_algorithms(scenario)
+    assert "least_busy" not in default_algorithms(scenario)
+    assert "wait" in default_algorithms(scenario)
+    assert "failover" in default_algorithms(), "the framework's list is still the framework's list"
+
+
+def test_an_algorithm_the_scenario_cannot_exercise_is_marked_not_ranked():
+    """Asked for explicitly it still runs, but it gets no stars and the report says why."""
+    report = run_benchmark(_small(), ["wait", "failover"], seeds=1, wall_budget=120.0)
+
+    assert set(report.unsuited) == {"failover"}
+    assert "single pool" in report.unsuited["failover"]
+    assert "failover" not in report.winners("jobs_done")
+    assert "failover" not in report.winners("throughput_rps")
+    assert "failover (n/a)" in report.render_table()
+    assert "Not applicable" in report.render_markdown()
+
+
+# ------------------------------------------------------------------ a cooldown is a real timer here too
+
+
+def test_a_wait_that_only_a_cooldown_can_end_advances_simulated_time():
+    """The benchmark-side version of the kernel regression: the simulated clock has to reach 30s.
+
+    No provider request is in flight and no retry sleep is pending — the only thing left to happen is a
+    circuit-break cooldown expiring. If the pool does not register that deadline with the clock, there is
+    no timer for the virtual clock to advance to, and the run stalls until the wall-clock budget kills it.
+    """
+    from pyattacker.benchmark.clock import VirtualClock
+    from pyattacker.resource import Pool, Resource
+
+    clock = VirtualClock()
+    pool = Pool(
+        "providers",
+        [Resource.create("llm", id="only", capacity=1, degrade_after=1, dead_after=9, cooldown_s=30.0)],
+        clock=clock,
+        deadlock_warn_s=None,
+    )
+
+    async def main() -> tuple[float, bool]:
+        doomed = pool.try_acquire()
+        doomed.report(ok=False)  # -> degraded until t=30
+        doomed.release_now()
+
+        async def waiter() -> bool:
+            with clock.blocked():
+                return await pool.wait_slot(None)
+
+        task = clock.spawn(waiter())
+        got = await asyncio.wait_for(task, 2.0)  # real seconds; the simulated wait is 30
+        return clock.now(), got
+
+    simulated, got = asyncio.run(main())
+
+    assert got is True
+    assert simulated == 30.0, "the clock advanced to the cooldown deadline, not by accident"

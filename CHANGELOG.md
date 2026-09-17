@@ -16,8 +16,9 @@ All notable changes to this project are documented here. The format follows
   seconds. It reports a vector of metrics — throughput, job tail latency, refusals provoked, capacity
   utilisation, endpoint fairness — with the spread over seeds, and names the best algorithm per metric
   instead of inventing a weighted score. The world is a black box by construction, each request's draws
-  are indexed by `(endpoint, ordinal)` so two algorithms meet the same world, and the same seed
-  reproduces the numbers exactly. `docs/benchmark.md` documents the assumptions, the metrics, the
+  are indexed by `(endpoint, ordinal)` so two algorithms share the same exogenous randomness and the
+  same time-indexed conditions (their realized state still diverges, because the bucket and the
+  in-flight count react to what each of them did), and the same seed reproduces the numbers exactly. `docs/benchmark.md` documents the assumptions, the metrics, the
   current results and their limits.
 * **`Retrying.decide`** — the retry decision (retry or give up, and after how long) is now a method on
   the policy rather than a block inside the Runner's attempt loop, so the benchmark can ask the same

@@ -71,30 +71,34 @@ def test_percentile_matches_the_textbook_definition():
 # ------------------------------------------------------------------ winners
 
 
-def _handmade(metrics: dict[str, dict[str, float]], spreads: dict[str, float] | None = None) -> BenchmarkReport:
-    """A report assembled by hand, so the winner logic can be tested at its edges.
+def _handmade(series: dict[str, list[float]], metric: str = "jobs_done") -> BenchmarkReport:
+    """A report assembled from explicit per-seed values, so the winner logic can be tested at its edges.
 
-    `spreads` gives each algorithm a seed-to-seed standard deviation, which needs at least two runs.
+    `series[algorithm]` is that algorithm's value on seeds 1..n: writing the values out is the only
+    honest way to test a paired comparison, because what matters is not each algorithm's spread but the
+    spread of their difference.
     """
-    algorithms = list(next(iter(metrics.values())))
-    runs = []
-    for algorithm in algorithms:
-        for offset in range(2 if spreads else 1):
-            jitter = (spreads or {}).get(algorithm, 0.0) * (1 if offset else -1)
-            runs.append(
-                RunResult(
-                    scenario="unit",
-                    algorithm=algorithm,
-                    seed=1 + offset,
-                    metrics={name: values[algorithm] + jitter for name, values in metrics.items()},
-                )
-            )
+    runs = [
+        RunResult(scenario="unit", algorithm=algorithm, seed=index + 1, metrics={metric: value})
+        for algorithm, values in series.items()
+        for index, value in enumerate(values)
+    ]
     scenario = _small()
-    return BenchmarkReport(scenario=scenario, seeds=[1, 2] if spreads else [1], runs=runs)
+    seeds = sorted({run.seed for run in runs})
+    return BenchmarkReport(scenario=scenario, seeds=seeds, runs=runs)
+
+
+def _plain(metrics: dict[str, dict[str, float]]) -> BenchmarkReport:
+    """One run per algorithm: for the cases where the direction of a metric is all that is tested."""
+    runs = [
+        RunResult(scenario="unit", algorithm=algorithm, seed=1, metrics={name: values[algorithm] for name, values in metrics.items()})
+        for algorithm in next(iter(metrics.values()))
+    ]
+    return BenchmarkReport(scenario=_small(), seeds=[1], runs=runs)
 
 
 def test_winners_respect_the_direction_of_each_metric():
-    report = _handmade(
+    report = _plain(
         {
             "jobs_done": {"fast": 100.0, "slow": 10.0},  # higher is better
             "makespan_s": {"fast": 5.0, "slow": 50.0},  # neutral: nobody wins it
@@ -107,30 +111,78 @@ def test_winners_respect_the_direction_of_each_metric():
     assert report.winners("makespan_s") == []
 
 
-def test_a_gap_inside_the_tolerance_is_reported_as_a_tie():
-    report = _handmade({"jobs_done": {"a": 100.0, "b": 99.5, "c": 80.0}})
+def test_a_gap_inside_the_paired_spread_is_a_tie():
+    """Two algorithms whose difference is noise: the row crowns nobody.
+
+    `a` and `b` both swing wildly from seed to seed, and the swing is *not* shared, so the paired
+    difference is as noisy as the values themselves — which is the situation where a benchmark honestly
+    has nothing to say.
+    """
+    report = _handmade({"a": [100.0, 130.0, 100.0], "b": [120.0, 100.0, 130.0]})
 
     assert sorted(report.winners("jobs_done")) == ["a", "b"]
 
 
-def test_a_gap_smaller_than_the_seed_to_seed_spread_is_a_tie():
-    """The polite lie this guards against: a 2% edge on a metric that moves 10% between seeds."""
-    report = _handmade({"jobs_done": {"a": 102.0, "b": 100.0}}, spreads={"a": 5.0, "b": 5.0})
+def test_a_constant_paired_difference_is_a_win_however_noisy_the_absolute_values():
+    """The case common random numbers exist for: identical world, different client, constant gap.
 
-    assert sorted(report.winners("jobs_done")) == ["a", "b"]
-
-
-def test_a_gap_wider_than_the_spread_is_a_win():
-    report = _handmade({"jobs_done": {"a": 150.0, "b": 100.0}}, spreads={"a": 1.0, "b": 1.0})
+    `a` beats `b` by 20 jobs on every seed, while both swing by 30 between seeds. Comparing the two
+    absolute means with an independent-samples standard error would call this a tie and throw away the
+    strongest property of the design; comparing the paired differences sees a gap with no spread at all.
+    """
+    report = _handmade({"a": [100.0, 130.0, 160.0], "b": [80.0, 110.0, 140.0]})
 
     assert report.winners("jobs_done") == ["a"]
 
 
+def test_a_gap_smaller_than_the_one_percent_floor_is_a_tie_even_when_paired():
+    report = _handmade({"a": [100.0, 100.0, 100.0], "b": [99.5, 99.5, 99.5]})
+
+    assert sorted(report.winners("jobs_done")) == ["a", "b"]
+
+
 def test_a_metric_that_is_zero_for_everyone_crowns_nobody():
     """No refusals anywhere is an absence of a difference, not a win for all seven algorithms."""
-    report = _handmade({"refusal_rate": {"a": 0.0, "b": 0.0}})
+    report = _plain({"refusal_rate": {"a": 0.0, "b": 0.0}})
 
     assert report.winners("refusal_rate") == []
+
+
+def test_a_conditional_metric_cannot_crown_an_algorithm_that_completed_almost_nothing():
+    """The reviewer's 1-of-1000 case: fail-fast must not buy a latency or throughput win.
+
+    `fast` has the best successful-job latency in the table and completed 0.1% of the work; the row has
+    to be decided between the algorithms that actually did the work, and `fast` has to be visible as
+    excluded rather than silently dropped.
+    """
+    runs = []
+    for algorithm, done, latency in (("fast", 1.0, 10.0), ("steady", 1000.0, 500.0), ("slow", 950.0, 900.0)):
+        runs.append(
+            RunResult(
+                scenario="unit",
+                algorithm=algorithm,
+                seed=1,
+                metrics={"jobs_done": done, "successful_job_latency_p95_ms": latency},
+            )
+        )
+    report = BenchmarkReport(scenario=_small(), seeds=[1], runs=runs)
+
+    assert report.winners("successful_job_latency_p95_ms") == ["steady"]
+    # `slow` completed 95% of the best, which clears the 90% floor: it stays in the contest and simply
+    # loses to `steady`. Only `fast` is excluded, and it is named so the exclusion is visible.
+    assert [(name, round(ratio, 3)) for name, ratio in report.excluded_by_completion("successful_job_latency_p95_ms")] == [
+        ("fast", 0.001)
+    ]
+    # A metric that does not depend on completing anything is not gated.
+    assert report.excluded_by_completion("jobs_done") == []
+
+
+def test_an_unsuited_algorithm_has_no_opinion_recorded_about_it():
+    """A scenario that cannot exercise an algorithm must not rank it (see Scenario.unsuited)."""
+    report = _handmade({"a": [100.0], "b": [1.0]})
+    report.unsuited = {"b": "this scenario has one pool"}
+
+    assert report.winners("jobs_done") == ["a"]
 
 
 # ------------------------------------------------------------------ rendering
@@ -180,3 +232,38 @@ def test_the_default_algorithm_list_is_what_the_framework_ships():
 
     assert default_algorithms() == list(ALGORITHMS)
     assert "wait" in default_algorithms() and "quota_aware" in default_algorithms()
+    assert default_algorithms(_small()) == [
+        name for name in ALGORITHMS if name not in {unsuited for unsuited, _ in _small().unsuited}
+    ]
+
+
+def test_the_report_measures_its_own_wall_time():
+    """`wall_s` on the report used to be a field nobody assigned, so every report claimed 0.0s."""
+    report = _report(("wait",), 1)
+
+    assert report.wall_s > 0.0
+    assert f"wall {report.wall_s:.1f}s" in report.render_table()
+    assert f"wall {report.wall_s:.1f}s" in report.render_markdown()
+
+
+def test_cost_and_diagnostic_metrics_crown_nobody():
+    """`wall_s` is what the sweep cost and `endpoint_spread` describes a heterogeneous fleet: neither
+    is evidence about algorithm quality, so neither gets a winner."""
+    report = _report(("wait", "immediate"), 1)
+
+    assert METRICS["wall_s"].better == "neutral"
+    assert METRICS["endpoint_spread"].better == "neutral"
+    assert report.winners("wall_s") == []
+    assert report.winners("endpoint_spread") == []
+    assert report.to_dict()["winners"]["wall_s"] == []
+
+
+def test_the_json_carries_the_exclusions_the_gate_made():
+    report = _report(("wait", "immediate"), 1)
+
+    payload = report.to_dict()
+
+    assert set(payload["excluded_by_completion"]) == {
+        name for name, metric in METRICS.items() if metric.gated_by_completion
+    }
+    assert payload["unsuited"] == {}  # nothing unsuited was asked for here

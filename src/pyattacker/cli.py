@@ -607,6 +607,9 @@ def _cmd_bench(args: argparse.Namespace) -> int:
         for name, scenario in SCENARIOS.items():
             print(f"  {name}  ({scenario.jobs} jobs, {scenario.concurrency} workers, {scenario.horizon_s:.0f}s horizon)")
             print(f"      {scenario.summary}")
+            if scenario.unsuited:
+                unsuited = "; ".join(f"{algorithm} ({reason})" for algorithm, reason in scenario.unsuited)
+                print(f"      not applicable here, run only if asked for: {unsuited}")
         print("\nalgorithms:")
         print("  " + ", ".join(default_algorithms()))
         print("\nmetrics (name [unit] direction):")
@@ -625,6 +628,14 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     if overrides:
         scenario = scenario.with_overrides(**overrides)
     algorithms = [name.strip() for name in args.algorithms.split(",") if name.strip()] if args.algorithms else None
+    if algorithms:
+        for name, reason in scenario.unsuited:
+            if name in algorithms:
+                print(
+                    f"warning: {name} is marked not applicable to {scenario.name} ({reason}); "
+                    "its column will be marked N/A",
+                    file=sys.stderr,
+                )
 
     def progress(result) -> None:
         if args.quiet:

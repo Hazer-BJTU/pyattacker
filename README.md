@@ -277,7 +277,9 @@ uv run pyattacker bench --algorithms wait,backoff --seeds 5 --json runs/bench.js
 
 It is a black box on purpose: the provider never exposes its state to the algorithm, its mood is a
 function of time rather than of who is asking, and each request's draws are indexed by its ordinal — so
-two algorithms meet the same world and the comparison is between algorithms rather than between moods.
+two algorithms meet the same *exogenous* randomness and the same weather, and the comparison is between
+algorithms rather than between moods. (Their realized provider state still diverges, because the bucket
+and the in-flight count react to what each of them did — that divergence is the measurement.)
 It reports a vector of metrics (throughput, tail latency, refusals provoked, capacity utilisation,
 fairness across endpoints) instead of one weighted score, and it names the winner per metric —
 including when the winner is "nobody".
