@@ -206,6 +206,89 @@ class MemoryStore:
         ]
 
     # ----------------------------------------------------------- query views
+    # Batched whole-kind reads (the optional PagedStore extension). A memory store already holds
+    # every row, so "bounded memory" is inherent; these yield the live records (no copies, and an
+    # artifact's payload is hydrated on demand) while keeping the order and the live-store semantics
+    # identical to SqliteStore's.
+    def iter_pipelines(
+        self, *, run_id: str | None = None, state: str | None = None
+    ) -> Iterator[PipelineRecord]:
+        """``created_at`` then ``pipeline_id`` — total, because ``pipeline_id`` is the key and the
+        upsert never rewrites ``created_at``."""
+        items = [
+            p
+            for p in self._pipelines.values()
+            if (run_id is None or p.run_id == run_id) and (state is None or p.state == state)
+        ]
+        items.sort(key=lambda p: (p.created_at, p.pipeline_id))
+        yield from items
+
+    def iter_tasks(
+        self, pipeline_id: str | None = None, *, run_id: str | None = None
+    ) -> Iterator[TaskRecord]:
+        """``pipeline_id``, ``seq``, then ``task_run_id`` — the last one makes the cursor unique."""
+        items = [
+            t
+            for t in self._tasks.values()
+            if (pipeline_id is None or t.pipeline_id == pipeline_id) and (run_id is None or t.run_id == run_id)
+        ]
+        items.sort(key=lambda t: (t.pipeline_id, t.seq, t.task_run_id))
+        yield from items
+
+    def iter_attempts(
+        self, *, run_id: str | None = None, pipeline_id: str | None = None
+    ) -> Iterator[AttemptRecord]:
+        """``attempt_id`` (total, monotonic); bounded by the mark taken when iteration starts."""
+        mark = max(
+            (
+                record.attempt_id
+                for record in self._attempts
+                if record.attempt_id is not None
+                and (run_id is None or record.run_id == run_id)
+                and (pipeline_id is None or record.pipeline_id == pipeline_id)
+            ),
+            default=None,
+        )
+        if mark is None:
+            return  # nothing matched when the iterator started
+        for record in self._attempts:
+            if record.attempt_id is not None and record.attempt_id > mark:
+                return  # appended after the mark: bounded, like the SQLite side
+            if (run_id is None or record.run_id == run_id) and (
+                pipeline_id is None or record.pipeline_id == pipeline_id
+            ):
+                yield record
+
+    def iter_events(
+        self, *, pipeline_id: str | None = None, run_id: str | None = None
+    ) -> Iterator[EventRecord]:
+        """``event_id`` (total, monotonic); bounded by the mark taken when iteration starts."""
+        mark = max(
+            (
+                event.event_id
+                for event in self._events
+                if event.event_id is not None
+                and (pipeline_id is None or event.pipeline_id == pipeline_id)
+                and (run_id is None or event.run_id == run_id)
+            ),
+            default=None,
+        )
+        if mark is None:
+            return  # nothing matched when the iterator started
+        for event in self._events:
+            if event.event_id is not None and event.event_id > mark:
+                return  # appended after the mark: bounded, like the SQLite side
+            if (pipeline_id is None or event.pipeline_id == pipeline_id) and (
+                run_id is None or event.run_id == run_id
+            ):
+                yield event
+
+    def iter_artifacts(self, *, pipeline_id: str) -> Iterator[Artifact]:
+        """``seq`` then ``artifact_id`` — the last one makes the cursor unique within a pipeline."""
+        items = [a for (pid, _), a in self._artifacts.items() if pid == pipeline_id]
+        for artifact in sorted(items, key=lambda a: (a.seq, a.id)):
+            yield _hydrate(artifact, self.backend)
+
     def pipelines(
         self, *, run_id: str | None = None, state: str | None = None, limit: int | None = None
     ) -> list[PipelineRecord]:
@@ -282,7 +365,7 @@ class MemoryStore:
         return out[-limit:]
 
     def export_rows(self, *, run_id: str | None = None) -> Iterator[dict[str, Any]]:
-        for p in self.pipelines(run_id=run_id):
+        for p in self.iter_pipelines(run_id=run_id):
             yield {
                 "pipeline_id": p.pipeline_id,
                 "key": p.key,

@@ -8,6 +8,7 @@ Coverage
 * interrupt_stale: running pipeline with an expired heartbeat → interrupted; keep_run_id protection
 * record_attempt: appends instead of overwriting (every attempt of the same task is kept)
 * events: run / pipeline filtering, limit returns the most recent entries, event_id increases
+* paged iteration (the optional PagedStore extension): same rows, order and filters as the list APIs
 * export_rows: structure (key set / tasks / artifacts / duration_ms / payload decoding)
 * stats: pipelines.by_state, tasks.by_name, attempts_total, events_total, duration percentiles
 
@@ -18,7 +19,9 @@ this is the only verifiable way to check "was the record really appended?".
 
 from __future__ import annotations
 
+import dataclasses
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -27,8 +30,10 @@ from pyattacker import Artifact, MemoryStore, SqliteStore
 from pyattacker.artifact import DEFAULT_REGISTRY
 from pyattacker.errors import ArtifactCodecError, RetryableError
 from pyattacker.store import (
+    ITER_BATCH_SIZE,
     AttemptRecord,
     EventRecord,
+    PagedStore,
     PipelineRecord,
     RunRecord,
     TaskRecord,
@@ -385,6 +390,115 @@ def test_events_query_filters_orders_and_limits(store):
     # limit takes the "most recent N", but still returns them in ascending time order
     assert [e.event_id for e in store.events(limit=2)] == [2, 3]
     assert [e.kind for e in store.events(run_id="run-1", limit=1)] == ["task.failed"]
+
+
+# ------------------------------------------------------------- paged iteration
+
+
+def test_paged_iterators_match_the_list_apis(store):
+    """The optional PagedStore extension yields the list APIs' rows, in the same order and filters."""
+    assert isinstance(store, PagedStore)
+    store.upsert_pipeline(_pipeline("p1", created_at=1000.0, state="succeeded"))
+    store.upsert_pipeline(_pipeline("p2", run_id="run-2", created_at=1001.0, state="failed"))
+    store.record_task(TaskRecord(task_run_id="p1:0", pipeline_id="p1", run_id="run-1", name="ask", seq=0))
+    store.record_task(TaskRecord(task_run_id="p2:0", pipeline_id="p2", run_id="run-2", name="ask", seq=0))
+    store.record_task(TaskRecord(task_run_id="p1:1", pipeline_id="p1", run_id="run-1", name="ask", seq=1))
+    store.record_attempt(_attempt(attempt_no=1, outcome="failed", run_id="run-1", pipeline_id="p1"))
+    store.record_attempt(_attempt(attempt_no=1, outcome="succeeded", run_id="run-2", pipeline_id="p2"))
+    store.emit_event(EventRecord(ts=1.0, kind="task.succeeded", run_id="run-1", pipeline_id="p1"))
+    store.emit_event(EventRecord(ts=2.0, kind="pipeline.succeeded", run_id="run-2", pipeline_id="p2"))
+    store.put_artifact(_artifact(pipeline_id="p1", seq=0))
+    store.put_artifact(_artifact(pipeline_id="p1", seq=1))
+    store.put_artifact(_artifact(pipeline_id="p2", seq=0))
+
+    assert [p.pipeline_id for p in store.iter_pipelines()] == [
+        p.pipeline_id for p in store.pipelines()
+    ] == ["p1", "p2"]
+    assert [p.pipeline_id for p in store.iter_pipelines(run_id="run-2")] == ["p2"]
+    assert [p.pipeline_id for p in store.iter_pipelines(state="failed")] == ["p2"]
+
+    assert [t.task_run_id for t in store.iter_tasks()] == [
+        t.task_run_id for t in store.tasks()
+    ] == ["p1:0", "p1:1", "p2:0"]
+    assert [t.task_run_id for t in store.iter_tasks("p1")] == [
+        t.task_run_id for t in store.tasks("p1")
+    ] == ["p1:0", "p1:1"]
+    assert [t.task_run_id for t in store.iter_tasks(run_id="run-2")] == ["p2:0"]
+
+    assert [a.attempt_id for a in store.iter_attempts()] == [
+        a.attempt_id for a in store.attempts()
+    ] == [1, 2]
+    assert [a.attempt_id for a in store.iter_attempts(run_id="run-1", pipeline_id="p1")] == [1]
+    assert [a.attempt_id for a in store.iter_attempts(run_id="run-2")] == [2]
+
+    assert [e.event_id for e in store.iter_events()] == [
+        e.event_id for e in store.events()
+    ] == [1, 2]
+    assert [e.kind for e in store.iter_events(run_id="run-2")] == ["pipeline.succeeded"]
+    assert [e.kind for e in store.iter_events(pipeline_id="p1")] == ["task.succeeded"]
+
+    assert [a.seq for a in store.iter_artifacts(pipeline_id="p1")] == [
+        a.seq for a in store.artifacts("p1")
+    ] == [0, 1]
+
+    # a lazy stream, not a materialized list — that is the whole point of the extension
+    assert isinstance(store.iter_events(), Iterator)
+
+
+def test_paged_iterators_break_cursor_ties_on_the_primary_key(store):
+    """Rows may share ``(pipeline_id, seq)`` / ``seq``; the cursor must end in a unique key.
+
+    The schema keys ``tasks`` by ``task_run_id`` and ``artifacts`` by ``artifact_id``, and the list
+    APIs order by the non-unique prefix alone, so this pins the iterator contract directly instead
+    of comparing it with an order the store never promised.
+    """
+    store.upsert_pipeline(_pipeline("p1", created_at=1000.0))
+    store.record_task(
+        TaskRecord(task_run_id="p1:0", pipeline_id="p1", run_id="run-1", name="ask", seq=0)
+    )
+    store.record_task(
+        TaskRecord(task_run_id="p1:0-alt", pipeline_id="p1", run_id="run-1", name="ask", seq=0)
+    )
+    store.put_artifact(_artifact(pipeline_id="p1", seq=0))
+    store.put_artifact(dataclasses.replace(_artifact(pipeline_id="p1", seq=0), id="p1:0-alt"))
+
+    assert [t.task_run_id for t in store.iter_tasks()] == ["p1:0", "p1:0-alt"]
+
+    # MemoryStore keys artifacts by (pipeline_id, seq), so it stores one of the two; SqliteStore
+    # keys them by artifact_id and stores both. Either way the iterator's order is the documented
+    # key, `(seq, artifact_id)`.
+    stored = store.artifacts("p1")
+    assert [a.id for a in store.iter_artifacts(pipeline_id="p1")] == [
+        a.id for a in sorted(stored, key=lambda a: (a.seq, a.id))
+    ]
+
+
+def test_paged_iterators_mirror_the_live_store_semantics(store):
+    """``events``/``attempts`` are bounded by the mark taken when iteration starts.
+
+    Both backends have to agree, and a full page is consumed before the append so the producer's
+    write lands after the iterator's last page: without the bound the next page would pick it up.
+    The mark is per iterator, not permanent — a new read sees the new rows.
+    """
+    for index in range(ITER_BATCH_SIZE):
+        store.emit_event(EventRecord(ts=float(index), kind=f"event.{index}", run_id="run-1"))
+        store.record_attempt(_attempt(attempt_no=index + 1, run_id="run-1"))
+
+    events = store.iter_events()
+    attempts = store.iter_attempts()
+    first_events = [next(events) for _ in range(ITER_BATCH_SIZE)]  # the marks are fixed here
+    first_attempts = [next(attempts) for _ in range(ITER_BATCH_SIZE)]
+    assert (first_events[0].kind, first_attempts[0].attempt_no) == ("event.0", 1)
+
+    store.emit_event(EventRecord(ts=1.0, kind="event.late", run_id="run-1"))
+    store.record_attempt(_attempt(attempt_no=ITER_BATCH_SIZE + 1, run_id="run-1"))
+
+    assert list(events) == []  # bounded: the late rows are not part of this traversal
+    assert list(attempts) == []
+
+    # a fresh iterator does see them
+    assert [e.kind for e in store.iter_events()][-1] == "event.late"
+    assert [a.attempt_no for a in store.iter_attempts()][-1] == ITER_BATCH_SIZE + 1
 
 
 # ----------------------------------------------------------------- export_rows

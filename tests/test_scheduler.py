@@ -14,7 +14,7 @@ from helpers import FakeClock, run
 
 from pyattacker import Artifact, MemoryStore
 from pyattacker.scheduler import DelayQueue, interruptible_sleep
-from pyattacker.store.base import AttemptRecord, EventRecord, PipelineRecord, TaskRecord
+from pyattacker.store.base import AttemptRecord, EventRecord, PagedStore, PipelineRecord, TaskRecord
 from pyattacker.store.writebehind import WriteBehindStore, wrap_write_behind
 
 
@@ -226,6 +226,24 @@ def test_ids_are_assigned_when_the_batch_is_flushed():
     assert (first.attempt_id, second.attempt_id) == (None, None)
     store.flush()
     assert (first.attempt_id, second.attempt_id) == (1, 2)
+
+
+def test_paged_iterators_flush_first():
+    """The paged reads are delegated explicitly, so a buffered fact can never be missed.
+
+    ``__getattr__`` would forward ``iter_events`` to the inner store without the flush that every
+    list API performs, and an export would silently lose the last batch.
+    """
+    inner = MemoryStore()
+    store = WriteBehindStore(inner, batch_size=64, flush_interval=999.0)
+    store.emit_event(EventRecord(ts=0.0, kind="task.succeeded", pipeline_id="p1", run_id="r1"))
+    store.record_attempt(_attempt(1, outcome="succeeded"))
+    assert (inner.all_events(), inner.attempts()) == ([], [])
+
+    assert [event.kind for event in store.iter_events()] == ["task.succeeded"]
+    assert [item.outcome for item in store.iter_attempts()] == ["succeeded"]
+    assert store.pending == 0
+    assert isinstance(store, PagedStore)
 
 
 def test_finish_run_and_close_never_leave_facts_buffered():

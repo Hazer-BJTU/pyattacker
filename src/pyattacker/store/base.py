@@ -7,6 +7,10 @@ Conventions:
 * Facts live on three levels: ``pipelines`` (state) / ``tasks``+``attempts`` (history) / ``artifacts`` (state carriers).
 * `journal` modes: ``full`` keeps the artifact payload (**the precondition for resume**);
   ``summary`` keeps only the summary and metadata, in which case intermediate artifacts cannot be reused and resume can only re-run whole pipelines.
+* The list queries (``pipelines``/``tasks``/``attempts``/``events``/``artifacts``) are the required
+  interface and may materialize their result. Whole-kind reads that must stay bounded in memory go
+  through the ``iter_*`` helpers, which use the optional :class:`PagedStore` extension when the
+  store provides it and otherwise fall back to the list API — see ``docs/reference.md``.
 """
 
 from __future__ import annotations
@@ -25,13 +29,28 @@ __all__ = [
     "AttemptRecord",
     "EventRecord",
     "Store",
+    "PagedStore",
     "PIPELINE_STATES",
     "TASK_STATES",
+    "ITER_BATCH_SIZE",
+    "iter_pipelines",
+    "iter_tasks",
+    "iter_attempts",
+    "iter_events",
+    "iter_artifacts",
     "open_store",
 ]
 
 PIPELINE_STATES = ("pending", "running", "succeeded", "failed", "interrupted", "canceled")
 TASK_STATES = ("pending", "running", "succeeded", "failed", "interrupted", "canceled")
+
+# Rows a paged store may hold in Python at once. One batch is a fixed, small working set, which is
+# what keeps an export's memory independent of the table's row count.
+ITER_BATCH_SIZE = 1000
+
+# The list API's ``events(limit=...)`` means "the most recent N" and defaults to 200, so a
+# list-only store can only be asked for its whole log with the largest limit an int can express.
+_LIST_LIMIT_ALL = 2**63 - 1
 
 
 def _now() -> float:
@@ -220,6 +239,14 @@ class EventRecord:
 
 @runtime_checkable
 class Store(Protocol):
+    """The required store interface: writes plus point/list queries.
+
+    The list queries may materialize their result, which is fine for a report but not for an
+    export of a large store. :class:`PagedStore` is the *optional* extension that adds bounded
+    whole-kind iteration; the ``iter_*`` helpers below use it when available and fall back to the
+    list API when it is not, so every store written against this protocol keeps working.
+    """
+
     journal: str
 
     def start_run(self, run: RunRecord) -> RunRecord: ...
@@ -301,6 +328,136 @@ class Store(Protocol):
     def export_rows(self, *, run_id: str | None = None) -> Iterator[dict[str, Any]]: ...
 
     def close(self) -> None: ...
+
+
+@runtime_checkable
+class PagedStore(Protocol):
+    """Optional extension to :class:`Store`: batched, bounded-memory iteration over a whole kind.
+
+    Nothing in the framework *requires* it. ``Store`` stays the only protocol ``open_store()``
+    checks, so a third-party store written against the list API keeps working unchanged — the
+    ``iter_*`` helpers below prefer a native paged method when the store has one and otherwise
+    delegate to the list API. Implement the methods here when a whole-kind read must not
+    materialize the table (``SqliteStore`` does):
+
+    * yield in the documented order (see :func:`pyattacker.export.iter_rows`) and **end that order in
+      a unique key**. The tables are keyed by ``task_run_id`` / ``artifact_id`` while the natural
+      order is by ``(pipeline_id, seq)`` / ``seq``, and paging with a strict ``>`` cursor over a
+      non-unique prefix skips every row that ties with the last row of a page;
+    * read at most ``ITER_BATCH_SIZE`` rows per query;
+    * keep the Python-side working set at one batch — for the *nested* per-pipeline data, one
+      pipeline is the documented unit (see ``docs/reference.md`` § Stores);
+    * where the order key is monotonic (``event_id`` / ``attempt_id``), capture its high-water mark
+      before the first page and bound every page to it, so an export of a live store cannot chase
+      rows appended after it started. Where it is not (``pipelines`` / ``tasks`` / ``artifacts``),
+      the traversal is best-effort over the live table and must be documented as such.
+    """
+
+    def iter_pipelines(
+        self, *, run_id: str | None = None, state: str | None = None
+    ) -> Iterator[PipelineRecord]: ...
+
+    def iter_tasks(
+        self, pipeline_id: str | None = None, *, run_id: str | None = None
+    ) -> Iterator[TaskRecord]: ...
+
+    def iter_attempts(
+        self, *, run_id: str | None = None, pipeline_id: str | None = None
+    ) -> Iterator[AttemptRecord]: ...
+
+    def iter_events(
+        self, *, pipeline_id: str | None = None, run_id: str | None = None
+    ) -> Iterator[EventRecord]: ...
+
+    def iter_artifacts(self, *, pipeline_id: str) -> Iterator[Artifact]: ...
+
+
+def iter_pipelines(
+    store: Store, *, run_id: str | None = None, state: str | None = None
+) -> Iterator[PipelineRecord]:
+    """Stream pipelines oldest first: ``created_at``, ties broken by ``pipeline_id``.
+
+    The tie-break is what makes a paged read safe: ``created_at`` alone is not unique (a fast
+    scheduler writes many pipelines inside one clock tick), and paging on a non-unique key can
+    skip or repeat a row. ``pipeline_id`` is the primary key and the upsert never rewrites
+    ``created_at``, so this cursor is total and stable.
+
+    Live-store semantics: best-effort traversal. A pipeline inserted ahead of the cursor while the
+    iterator runs can appear; one inserted behind it cannot.
+    """
+    native = getattr(store, "iter_pipelines", None)
+    if callable(native):
+        yield from native(run_id=run_id, state=state)
+    else:
+        # Compatibility fallback: the list API. It materializes the kind — correctness first,
+        # bounded memory only where the store implements the paged extension.
+        yield from store.pipelines(run_id=run_id, state=state)
+
+
+def iter_tasks(
+    store: Store, pipeline_id: str | None = None, *, run_id: str | None = None
+) -> Iterator[TaskRecord]:
+    """Stream tasks ordered by ``pipeline_id``, ``seq``, then ``task_run_id``.
+
+    ``(pipeline_id, seq)`` alone is not unique — the table is keyed by ``task_run_id`` — so the id
+    is part of the cursor; without it a page boundary inside a tie drops the rest of the tie.
+    Live-store semantics: best-effort traversal (see :func:`iter_pipelines`); the fallback for a
+    store without the extension is the list API.
+    """
+    native = getattr(store, "iter_tasks", None)
+    if callable(native):
+        yield from native(pipeline_id=pipeline_id, run_id=run_id)
+    else:
+        yield from store.tasks(pipeline_id=pipeline_id, run_id=run_id)
+
+
+def iter_attempts(
+    store: Store, *, run_id: str | None = None, pipeline_id: str | None = None
+) -> Iterator[AttemptRecord]:
+    """Stream attempts in insertion order (``attempt_id``), oldest first.
+
+    ``attempt_id`` is monotonic, so the iterator is bounded by the high-water mark taken when its
+    first page is read: attempts recorded after that are not part of this traversal (per iterator,
+    not permanent — a new iterator sees them).
+    """
+    native = getattr(store, "iter_attempts", None)
+    if callable(native):
+        yield from native(run_id=run_id, pipeline_id=pipeline_id)
+    else:
+        yield from store.attempts(run_id=run_id, pipeline_id=pipeline_id)
+
+
+def iter_events(
+    store: Store, *, pipeline_id: str | None = None, run_id: str | None = None
+) -> Iterator[EventRecord]:
+    """Stream events in insertion order (``event_id``), oldest first.
+
+    ``event_id`` is the store's own monotonic counter, so this order is total and paging on it
+    cannot drop or duplicate a row. The iterator is bound to the high-water mark taken when its
+    first page is read: events emitted after that are not part of this traversal (per iterator, not
+    permanent — a new iterator sees them).
+    """
+    native = getattr(store, "iter_events", None)
+    if callable(native):
+        yield from native(pipeline_id=pipeline_id, run_id=run_id)
+    else:
+        # The list API's own `limit` means "the most recent N" (default 200) and cannot express
+        # "everything", so the fallback asks for the largest limit it can represent. Both built-in
+        # stores return the selected events oldest first, which is the order the export documents.
+        yield from store.events(pipeline_id=pipeline_id, run_id=run_id, limit=_LIST_LIMIT_ALL)
+
+
+def iter_artifacts(store: Store, *, pipeline_id: str) -> Iterator[Artifact]:
+    """Stream one pipeline's artifacts ordered by ``seq``, then ``artifact_id``.
+
+    ``seq`` alone is not unique — the table is keyed by ``artifact_id`` — so the id is part of the
+    cursor. Live-store semantics: best-effort traversal (see :func:`iter_pipelines`).
+    """
+    native = getattr(store, "iter_artifacts", None)
+    if callable(native):
+        yield from native(pipeline_id=pipeline_id)
+    else:
+        yield from store.artifacts(pipeline_id)
 
 
 def open_store(

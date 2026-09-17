@@ -24,7 +24,19 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 from ..artifact import Artifact
-from .base import AttemptRecord, EventRecord, PipelineRecord, RunRecord, Store, TaskRecord
+from .base import (
+    AttemptRecord,
+    EventRecord,
+    PipelineRecord,
+    RunRecord,
+    Store,
+    TaskRecord,
+)
+from .base import iter_artifacts as _iter_artifacts
+from .base import iter_attempts as _iter_attempts
+from .base import iter_events as _iter_events
+from .base import iter_pipelines as _iter_pipelines
+from .base import iter_tasks as _iter_tasks
 
 __all__ = ["WriteBehindStore", "wrap_write_behind"]
 
@@ -209,6 +221,37 @@ class WriteBehindStore:
         return self.inner.resources(pool=pool)
 
     # ---------------------------------------------------------------- read views
+    # The paged iterators are delegated explicitly, not through `__getattr__`: forwarding them to
+    # the inner store would skip the flush, so an export could silently miss the buffered
+    # attempts/events that the list APIs always flush first.
+    def iter_pipelines(
+        self, *, run_id: str | None = None, state: str | None = None
+    ) -> Iterator[PipelineRecord]:
+        self.flush()
+        return _iter_pipelines(self.inner, run_id=run_id, state=state)
+
+    def iter_tasks(
+        self, pipeline_id: str | None = None, *, run_id: str | None = None
+    ) -> Iterator[TaskRecord]:
+        self.flush()
+        return _iter_tasks(self.inner, pipeline_id=pipeline_id, run_id=run_id)
+
+    def iter_attempts(
+        self, *, run_id: str | None = None, pipeline_id: str | None = None
+    ) -> Iterator[AttemptRecord]:
+        self.flush()
+        return _iter_attempts(self.inner, run_id=run_id, pipeline_id=pipeline_id)
+
+    def iter_events(
+        self, *, pipeline_id: str | None = None, run_id: str | None = None
+    ) -> Iterator[EventRecord]:
+        self.flush()
+        return _iter_events(self.inner, pipeline_id=pipeline_id, run_id=run_id)
+
+    def iter_artifacts(self, *, pipeline_id: str) -> Iterator[Artifact]:
+        self.flush()
+        return _iter_artifacts(self.inner, pipeline_id=pipeline_id)
+
     def pipelines(
         self, *, run_id: str | None = None, state: str | None = None, limit: int | None = None
     ) -> list[PipelineRecord]:
