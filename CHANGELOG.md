@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+* **The workflows moved off the deprecated Node 20 action runtime.** `actions/checkout` v4 → v7,
+  `actions/upload-artifact` v4 → v7, `actions/download-artifact` v4 → v8, and `astral-sh/setup-uv` v5 →
+  v10.1.0 — the last one pinned to a commit, because setup-uv stopped publishing floating major tags at v8
+  and now recommends pinning. The two publishing jobs also stop asking for a dependency cache: they never
+  check out the repository, so there is no lockfile to key one on, and the run did nothing but warn about it.
+
 ## [0.1.1] — 2026-09-17
 
 Documentation and release tooling. **No library changes** — the code in this release is identical to 0.1.0,
@@ -112,5 +122,6 @@ hard limit; asyncio tasks only (wrap blocking code with `asyncio.to_thread`); on
 balance is statistical; a merged report is a union, not a sum; a pipeline is a linear chain; the HTTP endpoint
 is unauthenticated.
 
+[Unreleased]: https://github.com/Hazer-BJTU/pyattacker/compare/v0.1.1...HEAD
 [0.1.1]: https://github.com/Hazer-BJTU/pyattacker/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Hazer-BJTU/pyattacker/releases/tag/v0.1.0
