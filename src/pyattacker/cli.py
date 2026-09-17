@@ -596,6 +596,111 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+# ---------------------------------------------------------------- bench
+def _cmd_bench(args: argparse.Namespace) -> int:
+    """Compare acquire algorithms on a simulated provider. Simulation only: no network, ever."""
+    from .benchmark import METRICS, SCENARIOS, get_scenario, run_benchmark
+    from .benchmark.report import default_algorithms
+
+    if args.list:
+        print("scenarios:")
+        for name, scenario in SCENARIOS.items():
+            print(f"  {name}  ({scenario.jobs} jobs, {scenario.concurrency} workers, {scenario.horizon_s:.0f}s horizon)")
+            print(f"      {scenario.summary}")
+            if scenario.unsuited:
+                unsuited = "; ".join(f"{algorithm} ({reason})" for algorithm, reason in scenario.unsuited)
+                print(f"      not applicable here, run only if asked for: {unsuited}")
+        print("\nalgorithms (all built-ins; each scenario skips the ones it marks not applicable):")
+        print("  " + ", ".join(default_algorithms()))
+        print("\nmetrics (name [unit] direction):")
+        for name, metric in METRICS.items():
+            print(f"  {name} [{metric.unit}] {metric.better}: {metric.description}")
+        return 0
+
+    scenario = get_scenario(args.scenario)
+    overrides = {}
+    if args.jobs is not None:
+        overrides["jobs"] = args.jobs
+    if args.concurrency is not None:
+        overrides["concurrency"] = args.concurrency
+    if args.horizon is not None:
+        overrides["horizon_s"] = args.horizon
+    if overrides:
+        scenario = scenario.with_overrides(**overrides)
+    algorithms = [name.strip() for name in args.algorithms.split(",") if name.strip()] if args.algorithms else None
+    # Validated here rather than only in the library so the announcement below cannot describe a sweep
+    # that will not happen: `--seeds 0` used to print "x 0 seed(s)" and then quietly run one.
+    if args.seeds < 1:
+        raise ConfigError(f"--seeds must be at least 1, got {args.seeds}: a sweep needs a seed to be reproducible")
+    if args.wall_budget <= 0:
+        raise ConfigError(f"--wall-budget must be positive, got {args.wall_budget}")
+    if args.speedup <= 0:
+        raise ConfigError(f"--speedup must be positive, got {args.speedup}")
+    if algorithms:
+        for name, reason in scenario.unsuited:
+            if name in algorithms:
+                print(
+                    f"warning: {name} is marked not applicable to {scenario.name} ({reason}); "
+                    "its column will be marked N/A",
+                    file=sys.stderr,
+                )
+
+    def progress(result) -> None:
+        if args.quiet:
+            return
+        metrics = result.metrics
+        print(
+            f"  {result.algorithm:<12} seed {result.seed}  "
+            f"{metrics['jobs_done']:.0f} done / {metrics['jobs_failed']:.0f} failed  "
+            f"{metrics['throughput_rps']:.2f} jobs/s  util {metrics['utilization']:.2f}  "
+            f"({metrics['wall_s']:.1f}s wall)",
+            file=sys.stderr,
+        )
+
+    if not args.quiet:
+        # The header counts what will actually run: a scenario that cannot exercise an algorithm
+        # leaves it out, and the count has to agree with the columns and with `run_benchmark`.
+        planned = algorithms if algorithms else default_algorithms(scenario)
+        print(
+            f"benchmarking {len(planned)} algorithms "
+            f"x {args.seeds} seed(s) on {scenario.name} "
+            f"({scenario.jobs} jobs x {scenario.steps_per_job} steps x {scenario.calls_per_step} calls, "
+            f"{scenario.concurrency} workers)",
+            file=sys.stderr,
+        )
+    factory = None
+    if args.clock == "real":
+        from .benchmark import ScaledClock
+
+        factory = lambda: ScaledClock(args.speedup)  # noqa: E731 - a one-line factory reads better here
+    report = run_benchmark(
+        scenario,
+        algorithms,
+        seeds=args.seeds,
+        wall_budget=args.wall_budget,
+        on_run=progress,
+        clock_factory=factory,
+    )
+
+    if args.json:
+        payload = json.dumps(report.to_dict(), ensure_ascii=False, indent=2)
+        if args.json == "-":
+            print(payload)
+        else:
+            path = Path(args.json)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(payload + "\n", encoding="utf-8")
+            print(f"wrote {path}", file=sys.stderr)
+    if args.markdown:
+        path = Path(args.markdown)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(report.render_markdown() + "\n", encoding="utf-8")
+        print(f"wrote {path}", file=sys.stderr)
+    if not args.quiet or not (args.json or args.markdown):
+        print(report.render_table())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pyattacker",
@@ -652,6 +757,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_validate.add_argument("-c", "--config", required=True)
     p_validate.add_argument("--strict-env", action="store_true")
     p_validate.set_defaults(func=_cmd_validate)
+
+    p_bench = sub.add_parser("bench", help="benchmark acquire algorithms against a simulated provider")
+    p_bench.add_argument("--scenario", default="bursty_provider", help="which simulated world to run in (--list shows them)")
+    p_bench.add_argument("--list", action="store_true", help="list scenarios, algorithms and metrics, then exit")
+    p_bench.add_argument(
+        "--algorithms",
+        default=None,
+        help="comma-separated names (default: every algorithm the scenario can exercise; see --list)",
+    )
+    p_bench.add_argument("--seeds", type=int, default=3, help="how many seeds to average over")
+    p_bench.add_argument("--jobs", type=int, default=None, help="override the scenario's job count")
+    p_bench.add_argument("--concurrency", type=int, default=None, help="override the scenario's worker count")
+    p_bench.add_argument("--horizon", type=float, default=None, help="override the scenario's simulated-time horizon")
+    p_bench.add_argument("--wall-budget", type=float, default=600.0, help="real seconds any single run may take")
+    p_bench.add_argument(
+        "--clock",
+        choices=("virtual", "real"),
+        default="virtual",
+        help="virtual = simulated time that costs nothing; real = the same scenario in compressed real time "
+        "(used to validate the simulator, and much slower)",
+    )
+    p_bench.add_argument("--speedup", type=float, default=10.0, help="compression factor for --clock real")
+    p_bench.add_argument("--json", default=None, metavar="PATH", help="write the full report as JSON ('-' for stdout)")
+    p_bench.add_argument("--markdown", default=None, metavar="PATH", help="write the report as a markdown table")
+    p_bench.add_argument("--quiet", action="store_true", help="no progress on stderr")
+    p_bench.set_defaults(func=_cmd_bench)
 
     p_demo = sub.add_parser("demo", help="run simulated tasks with zero config to verify the install")
     p_demo.add_argument("--store", default="runs/demo.db")

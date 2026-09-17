@@ -318,6 +318,10 @@ class Pool:
         self.kind = kind
         self.bus = bus
         self.clock = clock or _RealClock()
+        # Set while a cooldown is pending and somebody is waiting for it; see _ensure_cooldown_notifier.
+        self._cooldown_task: asyncio.Task[None] | None = None
+        #: The deadline that task is sleeping until, so a *newer* but earlier one can replace it.
+        self._cooldown_deadline: float | None = None
         self.deadlock_warn_s = deadlock_warn_s
         self.on_event = on_event
         self._slots: dict[str, _Slot] = {}
@@ -607,6 +611,8 @@ class Pool:
         """Wait for the "at least one resource available" broadcast. Returns whether one appeared before the timeout (acquiring it is not guaranteed)."""
         waiter = _Waiter(selector=dict(selector or {}), where=where)
         self._waiters.append(waiter)
+        # A wait that can only end when a cooldown expires needs that deadline to be a real timer.
+        self._ensure_cooldown_notifier()
         started = self.clock.now()
         deadline = None if timeout is None else started + timeout
         warn_task: asyncio.Task[None] | None = None
@@ -678,6 +684,73 @@ class Pool:
         self._notify(slot)  # only waiters that can use *this* resource need to wake up
         return True
 
+    def _ensure_cooldown_notifier(self) -> None:
+        """Wake the waiters when a circuit-break cooldown expires.
+
+        A degraded slot becomes usable again lazily, when somebody asks `state_at(now)`, and that
+        expiry emits no event: nothing is released, nothing is added, nothing is revoked. So a pool in
+        which *every* resource is cooling down and no lease is in flight has no event left to
+        broadcast — the waiters park on the broadcast, and the deadline they are actually waiting for
+        passes unnoticed. In real time that is a starvation bug that resolves itself only when some
+        unrelated activity happens to notify the pool; under a simulated clock it is a hang, because
+        nothing else will ever move that time forward.
+
+        Arming one task per pool (not per slot, and only while somebody is waiting) closes both: the
+        deadline is registered with the pool's clock, so a virtual clock can advance to it, and the
+        broadcast that follows is what actually releases the waiters.
+
+        One task is enough only if it is the *earliest* deadline that owns it, which is why the armed
+        deadline is tracked next to the task. A cooldown that starts later can still end earlier — B
+        breaks at t=5 with a 5s cooldown while A's 30s notifier is already sleeping — and keeping the
+        old timer would wake the waiters long after the resource they were waiting for came back.
+        """
+        if not self._waiters:
+            return  # nobody is waiting, so there is nobody to wake; the next waiter arms this again
+        now = self.clock.now()
+        # Only a DEGRADED slot has a cooldown that time alone can end (DEAD and REVOKED are permanent),
+        # and only a deadline still in the future is worth a timer: `state_at` clears the *state* when a
+        # cooldown expires but leaves `blocked_until` behind, so a stale timestamp here would arm a
+        # zero-delay timer over and over — a livelock that advances no simulated time at all.
+        pending = [
+            slot.blocked_until
+            for slot in self._slots.values()
+            if slot.state is ResourceState.DEGRADED and slot.blocked_until > now
+        ]
+        if not pending:
+            if any(
+                slot.state is ResourceState.DEGRADED and slot.blocked_until > 0.0 for slot in self._slots.values()
+            ):
+                # It expired while nobody was looking: the slot is usable again, so one nudge is all the
+                # waiters need (their next check runs `state_at` and finds READY).
+                self._notify()
+            return
+        deadline = min(pending)
+        armed = self._cooldown_task
+        if armed is not None and not armed.done():
+            if self._cooldown_deadline is not None and self._cooldown_deadline <= deadline:
+                return  # already waking at or before this deadline
+            # An earlier deadline appeared after this timer was armed; the armed one is now too late.
+            armed.cancel()
+        delay = deadline - now
+
+        async def _wake_after_cooldown() -> None:
+            this_task = asyncio.current_task()
+            try:
+                await self.clock.sleep(delay)
+            finally:
+                # Only the notifier that is still the armed one may clear the registration: a task
+                # replaced for an earlier deadline runs its `finally` after its successor was stored,
+                # and clearing unconditionally would erase that successor's deadline.
+                if self._cooldown_task is this_task:
+                    self._cooldown_task = None
+                    self._cooldown_deadline = None
+            self._notify()
+            # Another slot may have started cooling down while this one was pending.
+            self._ensure_cooldown_notifier()
+
+        self._cooldown_task = asyncio.create_task(_wake_after_cooldown())
+        self._cooldown_deadline = deadline
+
     def _report(
         self,
         lease: "Lease",
@@ -732,6 +805,7 @@ class Pool:
                 },
             )
             self._notify()
+            self._ensure_cooldown_notifier()
 
     def _degrade(self, lease: "Lease", reason: str) -> None:
         slot = lease.slot
@@ -740,6 +814,7 @@ class Pool:
         slot.stats.degraded_count += 1
         self._emit("resource.degraded", resource_id=slot.resource.id, data={"reason": reason})
         self._notify()
+        self._ensure_cooldown_notifier()
 
     # ------------------------------------------------------------ publish/subscribe
     def subscribe(

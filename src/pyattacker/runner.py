@@ -49,7 +49,6 @@ from .errors import (
     PyAttackerError,
     StoreUnavailable,
     error_class_of,
-    retry_after_of,
 )
 from .pipeline import PipelineSpec
 from .resource import Bus, Pool, ResourceEvent
@@ -1140,33 +1139,13 @@ class Runner:
             )
 
         # ---------------- failure: decide whether to retry ----------------
-        error_class = error_class_of(error)
-        retry_after = retry_after_of(error)
+        # The policy itself lives on Retrying (task.py): the benchmark harness asks it the same
+        # question outside a run, and one implementation is one thing to keep correct.
         elapsed = self.clock.now() - state.task_started
-        decision: dict[str, Any] = {
-            "retry": False,
-            "error_class": error_class,
-            "max_attempts": retry.max_attempts,
-            "attempt": attempts_used,
-            "retry_after": retry_after,
-            "leaked_leases": leaked,
-        }
-        delay = 0.0
-        if attempts_used >= retry.max_attempts:
-            decision["reason"] = "attempts_exhausted"
-        elif not retry.should_retry(error, error_class):
-            decision["reason"] = "policy_declined"
-        else:
-            delay = retry.delay_for(attempts_used, rng, retry_after)
-            if retry.max_total_s is not None and elapsed + delay > retry.max_total_s:
-                decision["reason"] = "total_budget"
-                delay = 0.0
-            else:
-                decision["retry"] = True
-                decision["reason"] = "retryable"
-        # Always present, per the documented schema (docs/design.md §4.4) — 0.0 when there is no
-        # retry to delay, not a missing key that turns "why did it give up" queries into a KeyError.
-        decision["delay_s"] = round(delay, 4)
+        decision = retry.decide(error, attempts_used=attempts_used, rng=rng, elapsed=elapsed)
+        decision["leaked_leases"] = leaked
+        delay = decision["delay_s"]
+        error_class = decision["error_class"]
         self._last_traceback = "".join(tb_mod.format_exception(type(error), error, error.__traceback__))
         self._record_attempt(
             spec, task_spec, task_run_id, attempts_used, attempt_started, attempt_ms,

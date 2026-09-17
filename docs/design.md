@@ -489,15 +489,18 @@ src/pyattacker/
   plugins.py      entry-point discovery for tasks/algorithms/codecs/stores (M4)
   backends.py     where artifact payloads live: inline / content-addressed files / null (M4)
   server.py       read-only HTTP view of a store: /stats, /events, /pipelines (M4)
-  cli.py          run/resume/report/watch/export/serve/plugins/validate/demo (+ --shard / --shards)
+  cli.py          run/resume/report/watch/export/serve/plugins/validate/demo/bench (+ --shard / --shards)
   __main__.py     `python -m pyattacker`, used by the shard children
+  benchmark/      clock (simulated time) / scenario (assumptions as data) / provider (the black-box
+                  world) / harness (closed-loop client) / metrics / report — drives pools, not runs
   tasks/          built-in utility tasks: mock.* / fanout / shell.run / file.write_jsonl / jsonl_source
 ```
 
 The dependency direction is strictly one-way: `errors → artifact → task → pipeline → resource/algorithm → store → runner → cli`,
 and `resource` does not depend on `algorithm` in reverse (algorithms are injected through `pool.acquire`).
 `shard`/`merge`/`export` sit beside the kernel: they read stores and pipeline streams, and nothing in the kernel
-depends on them.
+depends on them. `benchmark/` sits beside it too, one level lower: it drives `Pool` and the algorithms directly
+and never enters a run, which is what keeps its simulated clock exact (see §8.14).
 
 ---
 
@@ -546,6 +549,14 @@ depends on them.
     file at the moment that file is read — the check is per file, from its suffix, never at import time. The
     cost is one extra install step for the readers who want YAML; the benefit is that everyone else, including
     every SDK-only user, pays nothing for a parser they never call.
+14. **The benchmark is a simulation, and its numbers are a property of its assumptions.** It compares
+    acquisition algorithms in a written-down world (capacity cycle, token bucket, latency tail, storms,
+    three endpoints) so that "which algorithm is better here" becomes a question with an answer and a
+    seed. It is not a measurement of anyone's provider, and changing an assumption can change the
+    ranking; two of the seven built-ins cannot be exercised in this world at all — `failover` has nothing
+    to fail over to with one pool, and `least_busy` is the pool's default selection under another name —
+    which the scenario declares (and marks N/A) rather than hides behind a plausible-looking number. See
+    `docs/benchmark.md`.
 
 ---
 
@@ -590,6 +601,14 @@ depends on them.
   a *broken* PyYAML surfaces its own error rather than that hint, and the CLI turns the missing-extra case into
   exit code 2. `sys.modules["yaml"] = None` simulates the absence, so all of this runs on every ordinary test
   run rather than only in the job that has no PyYAML.
+* `tests/test_benchmark_*.py` — the simulated benchmark, tested at the level of its claims rather than its
+  output: hand-computed timelines for the virtual clock (32 concurrent 1 s sleeps cost one second, a
+  runnable worker is never skipped past), the provider's own dynamics (a full endpoint refuses with a 429,
+  a refusal costs future allowance, storms are a function of time not of traffic), what makes the
+  comparison fair (two algorithms are served identical draws for the same `(endpoint, ordinal)`; nothing
+  hands the algorithm a reference to the environment; the same seed reproduces the numbers exactly), and
+  that the whole thing opens no network connections. The virtual clock is additionally checked against a
+  compressed real-time clock, which is correct by construction and too slow to use.
 * **The YAML-dependent tests are marked `requires_yaml`** instead of being guarded with `importorskip()`, so
   the development suite *fails* when the extra goes missing rather than silently skipping a third of itself.
   CI therefore runs the suite twice: with the extra (everything), and against a bare `pip install` of the

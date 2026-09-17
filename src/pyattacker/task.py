@@ -32,6 +32,7 @@ from .errors import (
     RetryableError,
     error_class_of,
     is_retryable_class,
+    retry_after_of,
 )
 from .resource import Lease, Pool, Resource
 
@@ -71,6 +72,53 @@ class Retrying:
         if retry_after is not None:
             return max(0.0, retry_after)
         return backoff_delay(attempt, rng, base=self.base, factor=self.factor, cap=self.cap, jitter=self.jitter)
+
+    def decide(
+        self,
+        exc: BaseException,
+        *,
+        attempts_used: int,
+        rng: random.Random,
+        elapsed: float,
+    ) -> dict[str, Any]:
+        """The full retry decision for one failed attempt, as the record schema documents it.
+
+        Answers "retry or not, and after how long" from the exception alone plus the attempt budget
+        spent so far (``elapsed`` is the wall-clock time this task has been running, which is what
+        ``max_total_s`` bounds). The result is the ``decision`` object stored on every attempt
+        record (``docs/design.md`` §4.4) — ``retry``/``reason``/``delay_s``/``error_class``/
+        ``max_attempts``/``attempt``/``retry_after``.
+
+        This lives here rather than in the Runner because the Runner is not the only caller: the
+        benchmark harness drives the same policy outside a run, and a second copy of these rules
+        would be a second thing to keep in step (see ``backoff_delay`` for the same reasoning).
+        """
+        error_class = error_class_of(exc)
+        retry_after = retry_after_of(exc)
+        decision: dict[str, Any] = {
+            "retry": False,
+            "error_class": error_class,
+            "max_attempts": self.max_attempts,
+            "attempt": attempts_used,
+            "retry_after": retry_after,
+        }
+        delay = 0.0
+        if attempts_used >= self.max_attempts:
+            decision["reason"] = "attempts_exhausted"
+        elif not self.should_retry(exc, error_class):
+            decision["reason"] = "policy_declined"
+        else:
+            delay = self.delay_for(attempts_used, rng, retry_after)
+            if self.max_total_s is not None and elapsed + delay > self.max_total_s:
+                decision["reason"] = "total_budget"
+                delay = 0.0
+            else:
+                decision["retry"] = True
+                decision["reason"] = "retryable"
+        # Always present, per the documented schema — 0.0 when there is no retry to delay, not a
+        # missing key that turns "why did it give up" queries into a KeyError.
+        decision["delay_s"] = round(delay, 4)
+        return decision
 
 
 @dataclass(frozen=True)
