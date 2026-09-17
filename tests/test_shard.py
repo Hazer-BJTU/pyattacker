@@ -301,3 +301,45 @@ def test_shards_with_retrying_resource_pool_pipelines_merge_cleanly(tmp_path, ca
     merged = merge_reports([str(shard0), str(shard1)])
     assert merged.stats()["pipelines"]["by_state"] == {"succeeded": 12}
     assert merged.stats()["attempts_total"] == attempts0 + attempts1
+
+
+# --------------------------------------------------- resume across the same shard layout
+
+_RESUME_CONFIG = {
+    "pools": {"apis": {"capacity": 2, "resources": [{"id": "api-1"}, {"id": "api-2"}]}},
+    "pipeline": {"name": "shard-resume", "resource": "apis", "tasks": [{"use": "echo"}]},
+    "run": {"concurrency": 2},
+    "source": {"kind": "range", "n": 12},
+}
+
+
+def _store_summary(path) -> tuple[int, set[str]]:
+    """(attempts recorded, pipeline ids owned) for one shard store."""
+    store = SqliteStore(str(path), read_only=True)
+    try:
+        return store.stats()["attempts_total"], {row.pipeline_id for row in store.pipelines()}
+    finally:
+        store.close()
+
+
+def test_shards_resume_reruns_nothing_and_keeps_the_partition(tmp_path, capsys):
+    """`resume --shards N` is the documented way to continue a sharded run, and it depends on two
+    properties at once: shard assignment is a pure function of the pipeline key (so an unfinished
+    pipeline lands in the shard that owns it) and a succeeded pipeline is skipped rather than
+    re-executed. A partition that drifted between runs would show up here as re-run attempts.
+    """
+    cfg = tmp_path / "resume.json"
+    cfg.write_text(json.dumps(_RESUME_CONFIG), encoding="utf-8")
+    base = tmp_path / "resume.db"
+    shards = [tmp_path / "resume.shard0of2.db", tmp_path / "resume.shard1of2.db"]
+
+    assert main(["run", "-c", str(cfg), "--shards", "2", "--jobs", "2", "--store", str(base)]) == 0
+    before = [_store_summary(path) for path in shards]
+    assert sum(attempts for attempts, _ in before) == 12  # one attempt per pipeline, none re-run
+
+    capsys.readouterr()
+    assert main(["resume", "-c", str(cfg), "--shards", "2", "--jobs", "2", "--store", str(base)]) == 0
+
+    after = [_store_summary(path) for path in shards]
+    assert [attempts for attempts, _ in after] == [attempts for attempts, _ in before]
+    assert [owners for _, owners in after] == [owners for _, owners in before]

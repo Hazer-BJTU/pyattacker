@@ -480,6 +480,20 @@ class Runner:
         self._live["started_at"] = started
         rid = run_id or cfg.run_id or f"run-{time.strftime('%Y%m%d-%H%M%S')}-{digest_of(str(started_wall))[:6]}"
         self._run_id = rid
+        write_batch = int(getattr(self.store, "batch_size", 0))
+        run_config = {
+            "concurrency": cfg.concurrency,
+            "journal": cfg.journal,
+            "write_behind": bool(write_batch),
+            "artifact_backend": getattr(getattr(self.store, "backend", None), "name", None),
+        }
+        if write_batch:
+            # Recorded only when batching is actually on: it is what makes a configured
+            # write_batch/flush_interval verifiable from the run record itself, instead of only
+            # from the store object the Runner owns.
+            run_config["write_batch"] = write_batch
+            run_config["flush_interval"] = getattr(self.store, "flush_interval", None)
+        run_config.update(cfg.meta)
         self.store.start_run(
             RunRecord(
                 run_id=rid,
@@ -490,13 +504,7 @@ class Runner:
                 code_version=_code_version(),
                 python=sys.version.split()[0],
                 host=socket.gethostname(),
-                config={
-                    "concurrency": cfg.concurrency,
-                    "journal": cfg.journal,
-                    "write_behind": bool(getattr(self.store, "batch_size", 0)),
-                    "artifact_backend": getattr(getattr(self.store, "backend", None), "name", None),
-                    **cfg.meta,
-                },
+                config=run_config,
                 notes=cfg.notes,
             )
         )

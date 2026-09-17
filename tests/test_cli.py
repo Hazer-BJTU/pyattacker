@@ -404,3 +404,382 @@ def test_run_with_progress_flag_completes_without_error(tmp_path, capsys):
     assert db.exists()
     err = capsys.readouterr().err
     assert "Traceback" not in err
+
+
+# ------------------------------- run config mapping, CLI overrides and preflight validation
+#
+# The three modes of "run" (one process, one manual shard, auto-sharded children) all have to end
+# up with the same backend / write-behind configuration, and the only honest place to check that is
+# the persisted run record: `runs.config_json` is what the issue measured and what an operator
+# reads back afterwards.
+
+def _write_json_config(tmp_path: Path, name: str, config: dict) -> Path:
+    path = tmp_path / name
+    path.write_text(json.dumps(config), encoding="utf-8")
+    return path
+
+
+def _shard_config(**run: object) -> dict:
+    """A complete JSON config: a declared pool, one pipeline, six seeds to split over two shards."""
+    return {
+        "pools": {"apis": {"capacity": 1, "resources": [{"id": "api-1"}]}},
+        "pipeline": {"name": "backend-check", "resource": "apis", "tasks": [{"use": "echo"}]},
+        "run": {"concurrency": 1, **run},
+        "source": {"kind": "range", "n": 6},
+    }
+
+
+def _run_manifest(db: Path) -> list[dict]:
+    """Every persisted run record's config, read from ``runs.config_json`` with the stdlib."""
+    import sqlite3
+
+    connection = sqlite3.connect(str(db))
+    try:
+        rows = connection.execute("SELECT config_json FROM runs").fetchall()
+    finally:
+        connection.close()
+    return [json.loads(row[0]) for row in rows]
+
+
+BACKEND_CONFIG = """
+pools:
+  apis:
+    capacity: 1
+    resources:
+      - id: api-1
+pipeline:
+  name: backend-check
+  resource: apis
+  tasks:
+    - use: echo
+run:
+  concurrency: 1
+  artifact_backend: "null"
+  write_batch: 7
+  flush_interval: 0.25
+"""
+
+BACKEND_FORM_CONFIG = """
+pools:
+  apis:
+    capacity: 1
+    resources:
+      - id: api-1
+pipeline:
+  name: backend-form
+  resource: apis
+  tasks:
+    - use: echo
+run:
+  concurrency: 1
+  artifact_backend: {value}
+"""
+
+
+@pytest.mark.requires_yaml
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("null", "inline"), ('"null"', "null"), ("inline", "inline")],
+    ids=["bare-null-is-inline", "quoted-null-is-the-null-backend", "inline"],
+)
+def test_artifact_backend_forms_mean_what_they_say(tmp_path, value, expected):
+    """Pin the spelling: in YAML a bare ``null`` is the null *value*, which
+    ``resolve_backend(None)`` documents as the same thing as ``inline``; the *string* ``"null"`` is
+    what selects the hash-only null backend. The bug was that the field never reached RunConfig at
+    all, so every spelling was recorded as ``inline``.
+    """
+    cfg = _write_config(tmp_path, "form.yaml", BACKEND_FORM_CONFIG.format(value=value))
+    db = tmp_path / "form.db"
+
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 0
+
+    (manifest,) = _run_manifest(db)
+    assert manifest["artifact_backend"] == expected
+
+
+def test_mapping_and_json_backend_specs_are_accepted_without_touching_the_filesystem(tmp_path):
+    """The accepted side of the backend invariant, and the one place `validate` could grow a side
+    effect: a mapping spec (and its JSON-string spelling) must validate, the real `run` must
+    construct it, and `validate` itself must not create the directory the backend owns."""
+    forms = [
+        ({"kind": "file", "root": str(tmp_path / "mapping")}, "file", tmp_path / "mapping"),
+        ({"kind": "file", "root": str(tmp_path / "json"), "min_bytes": 1}, "file", tmp_path / "json"),
+        ({"kind": "null"}, "null", None),
+        (json.dumps({"kind": "file", "root": str(tmp_path / "string")}), "file", tmp_path / "string"),
+    ]
+    for index, (backend, expected, root) in enumerate(forms):
+        cfg = _write_json_config(tmp_path, f"backend-ok-{index}.json", _shard_config(artifact_backend=backend))
+        db = tmp_path / f"backend-ok-{index}.db"
+
+        assert main(["validate", "-c", str(cfg)]) == 0
+        if root is not None:
+            assert not Path(root).exists(), "validate must not construct an artifact backend"
+
+        assert main(["run", "-c", str(cfg), "--store", str(db)]) == 0
+        if root is not None:
+            assert Path(root).is_dir(), "the run must have constructed the configured backend"
+        (manifest,) = _run_manifest(db)
+        assert manifest["artifact_backend"] == expected
+
+
+# Every malformed backend declaration is asserted through *both* `validate` and `run`: the two share
+# the check, so a spec `validate` accepts has to be constructible by `resolve_backend`, or the
+# precheck sends the operator on with a config that dies during store setup.
+MALFORMED_BACKENDS = [
+    ({"kind": "file"}, "backend requires ['root']", "file-no-root"),
+    ({"kind": "file", "root": 5}, "run.artifact_backend.root", "file-root-not-a-string"),
+    ({"kind": "file", "root": ""}, "run.artifact_backend.root", "file-root-empty"),
+    ({"kind": "file", "root": "/data", "min_bytes": "big"}, "run.artifact_backend.min_bytes", "min-bytes-string"),
+    ({"kind": "file", "root": "/data", "min_bytes": -1}, "run.artifact_backend.min_bytes", "min-bytes-negative"),
+    ({"kind": "file", "root": "/data", "bse": 1}, "unknown field(s) 'bse'", "unknown-field"),
+    ({"kind": "nosuch", "root": "/data"}, "unknown artifact backend", "unknown-kind"),
+    ("{not json", "is not valid JSON", "json-string-unparseable"),
+    ('{"kind": "file"}', "backend requires ['root']", "json-string-no-root"),
+    ('{"kind": "nosuch", "root": "/data"}', "unknown artifact backend", "json-string-unknown-kind"),
+]
+
+
+@pytest.mark.parametrize(
+    ("backend", "fragment"),
+    [(backend, fragment) for backend, fragment, _ in MALFORMED_BACKENDS],
+    ids=[name for _, _, name in MALFORMED_BACKENDS],
+)
+def test_malformed_artifact_backends_are_refused_by_validate_and_by_run(tmp_path, capsys, backend, fragment):
+    cfg = _write_json_config(tmp_path, "backend-bad.json", _shard_config(artifact_backend=backend))
+    db = tmp_path / "backend-bad.db"
+    capsys.readouterr()  # discard earlier output
+
+    assert main(["validate", "-c", str(cfg)]) == 2
+    assert fragment in capsys.readouterr().err
+
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 2
+    assert fragment in capsys.readouterr().err
+    assert not db.exists()  # refused before a store file exists
+
+
+# `pipeline:` used to be dereferenced before it was checked, so a non-mapping section escaped as an
+# AttributeError from `pipe_cfg.get("tasks")` -- exit 1 with a traceback from both commands.
+MALFORMED_PIPELINES = [
+    ("hello", "pipeline", "scalar"),
+    ([1, 2], "pipeline", "list"),
+    (5, "pipeline", "number"),
+    ([], "pipeline", "empty-list"),
+    ({}, "pipeline", "empty-mapping"),
+    ({"tasks": "nope"}, "pipeline.tasks", "tasks-not-a-list"),
+]
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "fragment"),
+    [(pipeline, fragment) for pipeline, fragment, _ in MALFORMED_PIPELINES],
+    ids=[name for _, _, name in MALFORMED_PIPELINES],
+)
+def test_a_malformed_pipeline_section_is_a_config_error_not_a_traceback(tmp_path, capsys, pipeline, fragment):
+    cfg = _write_json_config(tmp_path, "pipeline-shape.json", {"pipeline": pipeline})
+    db = tmp_path / "pipeline-shape.db"
+    capsys.readouterr()
+
+    assert main(["validate", "-c", str(cfg)]) == 2
+    err = capsys.readouterr().err
+    assert fragment in err
+    assert "Traceback" not in err
+
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 2
+    err = capsys.readouterr().err
+    assert fragment in err
+    assert "Traceback" not in err
+    assert not db.exists()
+
+
+@pytest.mark.requires_yaml
+def test_config_backend_and_no_write_behind_reach_the_run_record(tmp_path):
+    """The issue's first symptom, verbatim: a config that asks for the null backend plus
+    ``--no-write-behind`` used to be recorded as ``artifact_backend: inline`` and
+    ``write_behind: true`` — the CLI filtered the config field out and never applied the flag.
+    """
+    cfg = _write_config(tmp_path, "backend.yaml", BACKEND_CONFIG)
+    db = tmp_path / "backend.db"
+
+    assert main(["run", "-c", str(cfg), "--store", str(db), "--no-write-behind"]) == 0
+
+    (manifest,) = _run_manifest(db)
+    assert manifest["artifact_backend"] == "null"
+    assert manifest["write_behind"] is False
+
+
+@pytest.mark.requires_yaml
+def test_config_batch_write_knobs_take_effect_without_a_flag(tmp_path):
+    """``write_behind``/``write_batch``/``flush_interval`` are config fields like any other: with no
+    flag at all they must reach the RunConfig the store is opened with."""
+    cfg = _write_config(tmp_path, "backend.yaml", BACKEND_CONFIG)
+    db = tmp_path / "batched.db"
+
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 0
+
+    (manifest,) = _run_manifest(db)
+    assert manifest["artifact_backend"] == "null"
+    assert manifest["write_behind"] is True
+    assert manifest["write_batch"] == 7
+    assert manifest["flush_interval"] == 0.25
+
+
+def test_manual_shard_applies_the_config_backend_and_the_no_write_behind_flag(tmp_path):
+    cfg = _write_json_config(tmp_path, "manual.json", _shard_config(artifact_backend="null"))
+    db = tmp_path / "manual.db"
+
+    rc = main(["run", "-c", str(cfg), "--shard", "1/2", "--store", str(db), "--no-write-behind"])
+
+    assert rc == 0
+    (manifest,) = _run_manifest(db)
+    assert manifest["artifact_backend"] == "null"
+    assert manifest["write_behind"] is False
+
+
+def test_auto_shards_pass_the_backend_and_write_behind_to_every_child(tmp_path, capsys):
+    """The issue's second symptom: ``run --shards 2 --artifact-backend null`` spawned children
+    whose command line did not carry the flag, so every child recorded the default inline backend.
+    """
+    cfg = _write_json_config(tmp_path, "auto.json", _shard_config())
+    base = tmp_path / "auto.db"
+
+    rc = main(
+        [
+            "run",
+            "-c",
+            str(cfg),
+            "--shards",
+            "2",
+            "--jobs",
+            "2",
+            "--store",
+            str(base),
+            "--artifact-backend",
+            "null",
+            "--no-write-behind",
+        ]
+    )
+
+    assert rc == 0
+    for index in range(2):
+        manifests = _run_manifest(tmp_path / f"auto.shard{index}of2.db")
+        assert manifests, f"shard {index} left no run record"
+        assert all(manifest["artifact_backend"] == "null" for manifest in manifests)
+        assert all(manifest["write_behind"] is False for manifest in manifests)
+    assert "shard 0/2" in capsys.readouterr().out
+
+
+def test_cli_flags_override_the_config_run_block(tmp_path):
+    cfg = _write_json_config(
+        tmp_path,
+        "precedence.json",
+        _shard_config(concurrency=2, artifact_backend="inline", write_behind=True),
+    )
+    db = tmp_path / "precedence.db"
+
+    rc = main(
+        [
+            "run",
+            "-c",
+            str(cfg),
+            "--store",
+            str(db),
+            "--concurrency",
+            "3",
+            "--artifact-backend",
+            "null",
+            "--no-write-behind",
+        ]
+    )
+
+    assert rc == 0
+    (manifest,) = _run_manifest(db)
+    assert manifest["concurrency"] == 3  # the flag, not run.concurrency: 2
+    assert manifest["artifact_backend"] == "null"  # the flag, not run.artifact_backend: inline
+    assert manifest["write_behind"] is False  # the flag, not run.write_behind: true
+
+
+# Every entry is (config, the field path the error must name). A config that cannot run is a `2`
+# before anything is created -- no Runner, no store file, no shard child.
+INVALID_CONFIGS = [
+    (
+        {"pipeline": {"name": "x", "tasks": [{"use": "echo"}]}, "run": {"concurency": 4}},
+        "unknown field(s) 'concurency'",
+    ),
+    (
+        {"pipeline": {"name": "x", "tasks": [{"use": "echo"}]}, "run": {"concurrency": 0}},
+        "run.concurrency",
+    ),
+    (
+        {"pipeline": {"name": "x", "tasks": [{"use": "echo"}]}, "run": {"heartbeat_s": -1}},
+        "run.heartbeat_s",
+    ),
+    (
+        {"pipeline": {"name": "x", "resource": "nosuchpool", "tasks": [{"use": "echo"}]}},
+        "pipeline.resource",
+    ),
+    (
+        {"pipeline": {"name": "x", "tasks": [{"use": "echo", "resource": "nosuchpool"}]}},
+        "pipeline.tasks[0].resource",
+    ),
+    (
+        {"pipeline": {"name": "x", "tasks": [{"use": "echo", "tieout": 5}]}},
+        "pipeline.tasks[0]",
+    ),
+    (
+        {"pipeline": {"name": "x", "tasks": [{"use": "echo", "retry": {"max_attempts": 0}}]}},
+        "pipeline.tasks[0].retry.max_attempts",
+    ),
+    (
+        {"pools": {"apis": {"capcity": 2}}, "pipeline": {"name": "x", "tasks": [{"use": "echo"}]}},
+        "pools.apis",
+    ),
+    (
+        {
+            "pools": {"apis": {"algorithm": "nosuchalgorithm"}},
+            "pipeline": {"name": "x", "resource": "apis", "tasks": [{"use": "echo"}]},
+        },
+        "pools.apis.algorithm",
+    ),
+    (
+        {"pipeline": {"name": "x", "tasks": [{"use": "echo"}]}, "source": {"kind": "nosuchkind"}},
+        "source.kind",
+    ),
+    (
+        {"pipeline": {"name": "x", "tasks": [{"use": "echo"}]}, "source": {"kind": "jsonl"}},
+        "source.path",
+    ),
+    (
+        {"pipeline": {"name": "x", "tasks": [{"use": "echo"}]}, "source": {"kind": "jsonl", "path": "d.jsonl", "limit": None}},
+        "source.limit",
+    ),
+    (
+        {"pools": {"apis": {"capacity": None}}, "pipeline": {"name": "x", "tasks": [{"use": "echo"}]}},
+        "pools.apis.capacity",
+    ),
+    (
+        {"pipeline": {"name": "x", "include_code": None, "tasks": [{"use": "echo"}]}},
+        "pipeline.include_code",
+    ),
+]
+
+
+@pytest.mark.parametrize(("config", "field_path"), INVALID_CONFIGS, ids=[item[1] for item in INVALID_CONFIGS])
+def test_invalid_configs_are_refused_before_anything_runs(tmp_path, capsys, config, field_path):
+    """`validate` and `run` share one validation entry: the same config is a `2` on both, the error
+    names the field path, and no store file (in any of the three modes) is ever created."""
+    cfg = _write_json_config(tmp_path, "invalid.json", config)
+    db = tmp_path / "invalid.db"
+
+    assert main(["validate", "-c", str(cfg)]) == 2
+    err = capsys.readouterr().err
+    assert field_path in err, err
+    assert "Config error" in err
+
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 2
+    assert field_path in capsys.readouterr().err
+    assert not db.exists()
+
+    assert main(["run", "-c", str(cfg), "--shards", "2", "--store", str(db)]) == 2
+    assert not db.exists()
+    assert not (tmp_path / "invalid.shard0of2.db").exists()
+

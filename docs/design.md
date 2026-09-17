@@ -371,7 +371,9 @@ pipeline:
       resource: apis
       algorithm: backoff
       timeout_s: 30
-      retry: { max_attempts: 3, base: 0.2, on: [RetryableError, TimeoutError] }
+      kwargs: { latency_ms: 5, fail_rate: 0.1, tokens: 64 }   # factory arguments
+      # a bare `on` is a YAML 1.1 boolean key: the retry key must be quoted
+      retry: { max_attempts: 3, base: 0.2, "on": [RetryableError, TimeoutError] }
 source: { kind: jsonl, path: data.jsonl, limit: 100, key_field: id, repeats: 1 }
 ```
 

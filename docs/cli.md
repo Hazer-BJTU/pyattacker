@@ -178,9 +178,31 @@ your own proxy in front before binding it anywhere else.
 pyattacker validate -c config.yaml [--strict-env]
 ```
 
-Parses the config, resolves every `use:` target and pool, and prints the effective configuration. Exits `2`
-with the reason if anything is wrong. `--strict-env` promotes an unset `${VAR}` from a warning to an error —
-worth it in CI, where a silently empty API key is worse than a failed job.
+Parses the config, resolves every `use:` target and pool, checks the whole document and prints the
+effective configuration. Exit code `2` with the reason if anything is wrong. `--strict-env` promotes an
+unset `${VAR}` from a warning to an error — worth it in CI, where a silently empty API key is worse than a
+failed job.
+
+`run` and `resume` go through the same check before creating a store, so a config that `validate` refuses
+is a `2` there too, and no task starts. What is checked, with the field path in every message:
+
+| Area | Examples |
+|---|---|
+| unknown fields | `run.concurency` (with a "did you mean `run.concurrency`?"), `pools.apis.capcity` |
+| field types | `run.concurrency: "8"`, `pipeline.tasks[0].use: 5` |
+| numeric ranges | `run.concurrency: 0`, `run.heartbeat_s` at or below 0, `pools.apis.capacity: 0` |
+| pool references | `pipeline.resource`, `pipeline.tasks[0].resource`, and the `resource` a `use:` factory declares itself |
+| algorithms | `algorithm: nosuchalgorithm`, `algorithm: {name: backoff, bse: 1}` |
+| artifact backend | `artifact_backend: {kind: file}` with no `root`, an unknown `kind`, a JSON-string spec that does not parse, or a `min_bytes` that is not a non-negative integer |
+| sections | `pipeline:` (and every other section) must be a mapping — a scalar or a list is a config error, not a traceback |
+| source | `source.kind` must be `range`/`jsonl`; `jsonl` requires `source.path`; `source.repeats` at least 1 |
+| retry | `"on"` names, and the numeric/boolean fields of a retry block |
+
+It is a *declaration* check only: it does not open `source.path`, walk the dataset, build an
+`artifact_backend` (which would create its directory), or call a task. It does, however, check that an
+`artifact_backend` is one `resolve_backend` could construct — required fields such as a file backend's
+`root` included — so `validate` and `run` accept and refuse exactly the same specs. `${VAR}` values are
+expanded as described below.
 
 ## `plugins` — what is installed
 
@@ -199,9 +221,11 @@ raised, so it can never take a run down — but it also never fails silently.
 The example below is YAML, but every command that takes `-c` accepts the same document as `.json` or
 `.toml`; the loader picks the parser from the suffix. Only the YAML parser is an optional dependency
 (`pip install "pyattacker[yaml]"`) — and a missing one is reported as a config error naming the extra,
-exit code 2, before anything runs.
+exit code 2, before anything runs. The block is complete (every `use:` target is a built-in) and is passed
+through `validate` by the test suite.
 
 ```yaml
+# example/cli_config_reference.yaml
 run:
   store: runs/demo.db          # path, ":memory:", or a plugin scheme like s3://bucket/runs.db
   concurrency: 8
@@ -216,26 +240,48 @@ pools:
     resources:
       - id: api-1
         capacity: 4            # concurrent leases this endpoint allows
-        options: { model: gpt-4o, api_key: "${OPENAI_KEY}" }
+        options: { model: gpt-4o, api_key: "${OPENAI_KEY:-sk-demo}" }
 
 pipeline:
   name: qa_eval
   tasks:
     - { use: pyattacker.tasks:echo }
-    - use: my_pkg.tasks:ask_model     # or a plugin name registered in pyattacker.tasks
+    - use: pyattacker.tasks:simulate_llm   # or your own task: my_pkg.tasks:ask_model
       resource: apis
       algorithm: backoff
       timeout_s: 30
-      retry: { max_attempts: 3, base: 0.2, on: [RetryableError, TimeoutError] }
+      kwargs: { latency_ms: 5, fail_rate: 0.1, tokens: 64 }   # factory arguments
+      # YAML 1.1 parses a bare `on` as boolean true, so the retry key must be quoted
+      retry: { max_attempts: 3, base: 0.2, "on": [RetryableError, TimeoutError] }
 
 source: { kind: jsonl, path: data.jsonl, limit: 100, key_field: id, repeats: 1 }
 ```
+
+The `run:` block accepts exactly the fields the CLI maps onto `RunConfig`: `store`, `journal`,
+`concurrency`, `label`, `heartbeat_s`, `grace_s`, `stale_after_s`, `strict_leases`,
+`stop_after_failures`, `stop_after_s`, `retry_succeeded`, `seed`, `notes`, `write_behind`,
+`write_batch`, `flush_interval`, `artifact_backend` and `meta`. Anything else is a config error, not a
+quietly ignored line. Precedence is explicit: a flag on the command line wins over the `run:` block,
+which wins over the built-in default.
+
+`artifact_backend` takes the same values as `--artifact-backend`: `"inline"` (the default, payloads stay
+in the store), `"null"` (keep the digest, drop the bytes), `"file:///data/blobs"`, or the mapping form
+above. In YAML, quote it: a bare `artifact_backend: null` is the null *value*, which means `inline` (the
+same as omitting the field), while `"null"` is the backend that drops payload bytes. A resumed run needs
+the payloads a checkpoint is made of, so `journal: summary` and the null backend both cost you task-level
+resume.
 
 Task entries also accept `config: {model: model-a}` and `version: "prompt-v2"` for behavior that
 cannot be inferred from source. These join the recovery fingerprint; factory parameters remain
 separate. With `source.key_field`, changing task identity or seed contents under an existing key
 raises a config error (exit 2) and preserves the old result. Use a new key/store for changed work.
 See [resume identity](reference.md#resume-identity) before upgrading an existing store.
+
+A task entry is an **override over the resolved `use:` target**, and the two cases are distinct: a field
+the entry does not mention keeps whatever the target declares (its own `resource`, `algorithm`,
+`timeout_s`, `retry`, ...), while an explicit `field: null` clears a field that supports being empty
+(`resource`, `algorithm`, `timeout_s`, `version`). That is the same rule as
+[`TaskSpec.with_overrides`](reference.md#taskspec) in the SDK.
 
 `${VAR}` is expanded from the environment (see `--strict-env`). `source.kind` is `jsonl` or `range`;
 `repeats: k` is pass@k — k independent pipelines per seed. CLI flags override the `run:` block.

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .declarative import load_spec
+from .declarative import RUN_FIELDS, load_spec
 from .errors import ConfigError, PyAttackerError
 from .export import FORMATS, ROW_KINDS, export_store, export_stores
 from .merge import merge_reports
@@ -34,22 +34,6 @@ from .store import SqliteStore
 from .tasks import echo, simulate_llm
 
 __all__ = ["main"]
-
-_RUN_KEYS = {
-    "store",
-    "concurrency",
-    "journal",
-    "label",
-    "heartbeat_s",
-    "grace_s",
-    "stale_after_s",
-    "strict_leases",
-    "stop_after_failures",
-    "stop_after_s",
-    "retry_succeeded",
-    "seed",
-    "notes",
-}
 
 
 def _warn_unresolved_env(spec: Any, *, leading_blank_line: bool = False) -> None:
@@ -109,7 +93,9 @@ def _cmd_run(args: argparse.Namespace, *, resume: bool = False) -> int:
 
     spec = load_spec(args.config, strict_env=args.strict_env)
     _warn_unresolved_env(spec)
-    run_cfg = {k: v for k, v in spec.run.items() if k in _RUN_KEYS}
+    # `RUN_FIELDS` is the same schema `load_spec` validated against, so a config field can never be
+    # silently dropped here again (artifact_backend and the write-behind knobs used to be).
+    run_cfg = {k: v for k, v in spec.run.items() if k in RUN_FIELDS}
     if args.store:
         run_cfg["store"] = args.store
     if shard is not None and not args.store:
@@ -134,6 +120,10 @@ def _cmd_run(args: argparse.Namespace, *, resume: bool = False) -> int:
         run_cfg["retry_succeeded"] = True
     if args.artifact_backend:
         run_cfg["artifact_backend"] = args.artifact_backend
+    if args.no_write_behind:
+        # An explicit flag always wins over a config that asks for batching (the CLI overrides the
+        # `run:` block, the other way round from how the config's own value reaches RunConfig).
+        run_cfg["write_behind"] = False
     meta = dict(run_cfg.get("meta") or {})
     if shard is not None:
         meta["shard"] = f"{shard[0]}/{shard[1]}"
@@ -186,6 +176,10 @@ _CHILD_PASSTHROUGH = (
     ("journal", "--journal"),
     ("label", "--label"),
     ("stop_after_failures", "--stop-after-failures"),
+    # A shard child is the single-shard command, so every flag that changes *where state lives*
+    # has to travel with it; --artifact-backend used to be dropped here, which silently sent each
+    # child to the default inline backend while the parent's report described something else.
+    ("artifact_backend", "--artifact-backend"),
 )
 _CHILD_FLAGS = (
     ("retry_succeeded", "--retry-succeeded"),
