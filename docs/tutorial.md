@@ -17,7 +17,8 @@ How to read it:
 * Nothing here touches the network. Where a real program would do `await self.http.post(...)`, the examples
   do `await asyncio.sleep(...)`; the comment `# <- your HTTP call` marks the exact spot.
 * Reference material lives elsewhere: [`docs/design.md`](design.md) for the model and the tradeoffs,
-  [`README.md`](../README.md) for the compact API tour, [`examples/`](../examples) for full programs.
+  [`docs/cli.md`](cli.md) for every command-line flag, [`README.md`](../README.md) for the compact API
+  tour, [`examples/`](../examples) for full programs.
 
 ## Look up by feature, not just by step
 
@@ -40,7 +41,7 @@ want "how does X work", use this table instead of scanning headings:
 | Scheduler internals (`DelayQueue`, write-behind batching) | *mentioned only in passing (end of Step 8, troubleshooting notes) — no dedicated step* | [§4.5](design.md#45-delayed-continuations-and-batched-facts-m2) | `scheduler.py`, `store/writebehind.py` |
 | Data model / store tables, export | [Step 10](#step-10--reading-the-record) | [§5](design.md#5-data-model-sqlite-wal--synchronousnormal) | `store/`, `export.py` |
 | Declarative config | [Step 11](#step-11--the-declarative-path-and-the-cli) | [§6.2](design.md#62-declarative-simple-tasks) | `declarative.py` |
-| CLI reference (`validate`/`run`/`resume`/`report`/`watch`/`export`/`serve`/`plugins`/`demo`) | scattered across [Step 0](#step-0--install-and-sanity-check), [Step 11](#step-11--the-declarative-path-and-the-cli), [Step 12](#step-12--sharding-and-merging) — no single summary table yet | — | `cli.py` |
+| CLI reference (`validate`/`run`/`resume`/`report`/`watch`/`export`/`serve`/`plugins`/`demo`) | [Step 0](#step-0--install-and-sanity-check), [Step 11](#step-11--the-declarative-path-and-the-cli), [Step 12](#step-12--sharding-and-merging); every flag in [`docs/cli.md`](cli.md) | — | `cli.py` |
 | Sharding and merging | [Step 12](#step-12--sharding-and-merging) | [§6.3](design.md#63-sharding-merging-and-export-m3) | `shard.py`, `merge.py` |
 | Monitoring / HTTP endpoint | *one sentence at the end of Step 14 — no runnable example* | [§4.6](design.md#46-monitoring-cares-about-traffic-and-blocking-not-about-metrics), [§6.4](design.md#64-plugins-backends-and-the-monitoring-endpoint-m4) | `server.py`, `monitor.py` |
 | Custom types / codecs, artifact backends, plugins | [Step 14](#step-14--your-own-types-blobs-plugins) | [§6.4](design.md#64-plugins-backends-and-the-monitoring-endpoint-m4) | `artifact.py`, `backends.py`, `plugins.py` |
@@ -1668,6 +1669,7 @@ Looking for a specific feature rather than a whole document? See
 
 | Resource | What is in it |
 |---|---|
+| [`docs/cli.md`](cli.md) | every subcommand and flag, exit codes, the config file reference |
 | [`docs/design.md`](design.md) | conceptual model, six invariants, lease contract, data model, tradeoffs, milestones |
 | [`README.md`](../README.md) | the compact tour: scheduling guarantees, sharding, plugins, out of scope |
 | [`examples/quickstart.py`](../examples/quickstart.py) | the SDK in 60 lines, with a resume round |
