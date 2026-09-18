@@ -192,6 +192,7 @@ RUN_FIELDS = frozenset({
     "strict_leases",
     "stop_after_failures",
     "stop_after_s",
+    "max_handoffs",
     "retry_succeeded",
     "seed",
     "notes",
@@ -394,7 +395,7 @@ def _validate_run(raw: Any) -> None:
             _number(value, path, minimum=0, exclusive=True)
         elif key == "grace_s":
             _number(value, path, minimum=0)
-        elif key in ("stop_after_failures", "write_batch"):
+        elif key in ("stop_after_failures", "write_batch", "max_handoffs"):
             _integer(value, path, minimum=1)
         elif key in ("strict_leases", "retry_succeeded"):
             _flag(value, path)

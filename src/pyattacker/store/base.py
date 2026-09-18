@@ -178,6 +178,7 @@ class TaskRecord:
     traceback: str | None = None
     leases: list[dict[str, Any]] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
+    visit: int = 0
 
 
 @dataclass
@@ -217,6 +218,7 @@ class AttemptRecord:
     leases: list[dict[str, Any]] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
     attempt_id: int | None = None
+    visit: int = 0
 
 
 @dataclass
@@ -287,6 +289,10 @@ class HandoffRecord:
     reason: str = ""
     ts: float = field(default_factory=_now)
     handoff_id: int | None = None
+    operation: str = "forward"
+    from_visit: int = 0
+    to_visit: int | None = None
+    transition_version: int | None = None
 
 
 @runtime_checkable
@@ -476,7 +482,7 @@ def handoff_row(record: HandoffRecord) -> dict[str, Any]:
     Shared by both built-in stores rather than written twice, so "the exported handoff row" has exactly
     one definition and cannot drift between backends.
     """
-    return {
+    result = {
         "handoff_id": record.handoff_id,
         "run_id": record.run_id,
         "from_task": record.from_task,
@@ -489,6 +495,10 @@ def handoff_row(record: HandoffRecord) -> dict[str, Any]:
         "entry_reused": record.entry_reused,
         "ts": record.ts,
     }
+    if record.operation != "forward" or record.from_visit or record.transition_version is not None:
+        result.update(operation=record.operation, from_visit=record.from_visit,
+                      to_visit=record.to_visit, transition_version=record.transition_version)
+    return result
 
 
 def supports_handoff(store: Store) -> bool:

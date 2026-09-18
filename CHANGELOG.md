@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+* **Advanced backward traversal (opt-in, experimental):** `Handoff.rewind(target, value)` uses
+  author-selected state; `Handoff.retry_all()` replays immutable bound seed bytes. Separate declarations
+  require finite control budgets. Visit-aware atomic stores retain task/attempt/artifact occurrences,
+  effective lineage and exact pending inputs across rewind and resume. Revisited RNG includes `ctx.visit`;
+  visit-0 IDs and forward-only digests stay compatible. Optional `HistoryArtifact` payloads provide
+  detached snapshots, restoration, explicit pruning and registered-subclass codec round trips. Exports
+  and `/pipelines` expose visit-aware lineage. See [the backward guide](docs/backward.md).
+
 * **Advanced feature: handoffs — a task can skip ahead, on the record (opt-in, experimental).** A task may
   return `Handoff.to(target, value)` to continue at a declared later station, or `Handoff.end(value)` to
   finish the pipeline immediately. Until now the alternatives were to run the remaining stations anyway, to
@@ -28,7 +36,7 @@ All notable changes to this project are documented here. The format follows
   so no stored checkpoint, pipeline id or shard assignment is invalidated. Handoffs need a store that can
   commit them atomically; both built-in backends can, and a store that cannot is refused up front with a
   `ConfigError` rather than silently writing a non-durable jump. Marked *experimental until 1.0*;
-  backward/revoke handoffs, joins and cross-pipeline jumps are not included. See
+  the forward declaration excludes backward targets; joins and cross-pipeline jumps are not included. See
   [`docs/design.md` §4.8](docs/design.md#48-advanced-handoffs--declared-forward-jumps-opt-in-experimental),
   the [API reference](docs/reference.md#advanced-handoffs-opt-in) and
   [tutorial step 15](docs/tutorial.md#step-15--advanced-skipping-stations-handoffs).

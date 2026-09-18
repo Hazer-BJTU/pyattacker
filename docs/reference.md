@@ -390,6 +390,13 @@ destinations, sorted — so spelling a target as a name or as a seq is the same 
 
 ## Advanced: Handoffs (Opt-In)
 
+For separately declared backward traversal, see [rewind, retry-all and HistoryArtifact](backward.md).
+`Handoff.rewind(target, value, *, reason="")` requires explicit state; `Handoff.retry_all(*, reason="")`
+replays the bound seed. `ctx.visit`, visit-qualified task/artifact IDs, exact-ID artifact lookup, finite
+control budgets and optional visit-aware store capabilities are specified there. The forward API below
+retains its v1 behavior and fingerprint.
+
+
 **Advanced tier: opt-in, changes the execution model, not needed for ordinary pipelines, experimental until
 1.0.** A task may *skip ahead* by returning a framework-owned directive instead of a value; the pipeline
 continues at a declared later position (or finishes on the spot) and the framework records the jump durably.
@@ -1438,10 +1445,9 @@ payloads and unusable checkpoints can also require replay of earlier tasks.
 
 If your provider supports idempotency keys, derive one from the stable pipeline and task identity,
 for example `f"{ctx.pipeline_id}:{ctx.seq}"`, and reuse it across retries rather than including the
-attempt number. Two caveats: on a **control-enabled** pipeline a station can in principle be visited more
-than once once backward handoffs exist (they do not in this version, and a forward-only handoff cannot
-revisit a slot), so a key that must survive that should include the visit — which the planned v2 visit model
-will expose on `ctx`; and a handoff payload is *not* a task identity, so never key external work off an
+attempt number. In a backward-enabled pipeline, include `ctx.visit` when each regeneration should be a
+new operation, for example `f"{ctx.pipeline_id}:{ctx.seq}#{ctx.visit}"`. A handoff payload is *not* a task
+identity, so never key external work off an
 artifact address. Respect the provider's retention window and API contract. For file sinks, upsert
 by the same identity or write one atomically replaced file per pipeline/task; a plain append-only
 `write_jsonl` task can create duplicate lines on replay. Resource lease safety does not make those

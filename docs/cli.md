@@ -327,7 +327,7 @@ pipeline:
 ```
 
 A destination is a task name, a task's numeric seq, or `end`, and it must be strictly later than its source
-(this version is forward-only). A name that appears twice in the chain must be given as a seq. Declaring
+(the `edges` operation is forward-only). A name that appears twice in the chain must be given as a seq. Declaring
 `end` from the *last* task is refused, because it would have no effect. Every problem is reported as a field
 path — `pipeline.control.edges['judge'][0]: destination 'fetch' (seq 0) is not later than the source
 'judge' (seq 2); v1 handoffs are forward-only` — under `validate` (exit 2) as well as `run`, because both go
@@ -355,3 +355,13 @@ Anything it cannot express is a reason to use the SDK, not a reason to add YAML 
 * [`docs/reference.md`](reference.md) — every class and function the SDK exposes
 * [`docs/design.md`](design.md) — why the CLI has these commands and no others
 * [`README.md`](../README.md) — the compact tour
+
+
+### Advanced backward control declarations
+
+`pipeline.control` also accepts `rewind: {source: [earlier_targets]}`, `retry_all: [sources]` and
+required positive `max_handoffs` for backward traversal. `edges` is optional for backward-only plans;
+existing forward-only declarations stay unchanged. `run.max_handoffs` sets the runtime ceiling (default
+1000). Validation shares Python's name/seq resolution and reports configuration field paths. Rewind payloads
+are chosen by task code, not config. See [the backward guide](backward.md) for working Python examples,
+state-history interfaces, budget lifecycle and missing-payload recovery.

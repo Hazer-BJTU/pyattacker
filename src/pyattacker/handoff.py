@@ -67,8 +67,15 @@ class Handoff:
     target: str | int | None
     value: Any = UNSET
     reason: str = ""
+    operation: str = "forward"
 
     def __post_init__(self) -> None:
+        if self.operation not in ("forward", "rewind", "retry_all"):
+            raise FatalError(f"unknown handoff operation {self.operation!r}")
+        if self.operation == "rewind" and (self.value is UNSET or self.target is None):
+            raise FatalError("rewind requires a task target and an explicit value")
+        if self.operation == "retry_all" and (self.value is not UNSET or self.target != 0):
+            raise FatalError("retry_all accepts no replacement value and targets seq 0")
         # FatalError, not a build error: the directive is normally *built inside the task*, and an
         # authoring mistake must never be retried (`FatalError` is outside every retry policy).
         if self.target is not None and not isinstance(self.target, (str, int)):
@@ -96,6 +103,16 @@ class Handoff:
         """Finish the pipeline successfully here, with ``value`` as the final artifact."""
         return cls(None, value, reason)
 
+    @classmethod
+    def rewind(cls, target: str | int, value: Any = UNSET, *, reason: str = "") -> "Handoff":
+        """Re-enter an earlier task with author-selected state (an explicit value is required)."""
+        return cls(target, value, reason, "rewind")
+
+    @classmethod
+    def retry_all(cls, *, reason: str = "") -> "Handoff":
+        """Restart this pipeline from its original bound seed."""
+        return cls(0, UNSET, reason, "retry_all")
+
     @property
     def is_end(self) -> bool:
         return self.target is None
@@ -106,6 +123,10 @@ class Handoff:
         return self.value is UNSET
 
     def __repr__(self) -> str:  # the payload is omitted on purpose: it can be arbitrarily large
+        if self.operation == "retry_all":
+            return f"Handoff.retry_all(reason={self.reason!r})"
+        if self.operation == "rewind":
+            return f"Handoff.rewind({self.target!r}, value=<payload>, reason={self.reason!r})"
         head = "Handoff.end(" if self.target is None else f"Handoff.to({self.target!r}, "
         parts = [] if self.value is UNSET else ["value=<payload>"]
         parts.append(f"reason={self.reason!r}")
@@ -130,7 +151,27 @@ class ControlPlan:
     task_names: tuple[str, ...] = ()
     edges: Mapping[int, tuple[int | None, ...]] = field(default_factory=dict)
 
+    rewind_edges: Mapping[int, tuple[int, ...]] = field(default_factory=dict)
+    retry_all_sources: tuple[int, ...] = ()
+    max_handoffs: int | None = None
+
+    @property
+    def backward_enabled(self) -> bool:
+        return bool(self.rewind_edges or self.retry_all_sources)
+
     def __post_init__(self) -> None:
+        object.__setattr__(self, "rewind_edges", MappingProxyType({k: tuple(v) for k, v in self.rewind_edges.items()}))
+        object.__setattr__(self, "retry_all_sources", tuple(self.retry_all_sources))
+        if self.backward_enabled:
+            if isinstance(self.max_handoffs, bool) or not isinstance(self.max_handoffs, int) or self.max_handoffs <= 0:
+                raise PipelineBuildError("control.max_handoffs: a positive finite integer is required")
+            for source, targets in self.rewind_edges.items():
+                if isinstance(source, bool) or not isinstance(source, int) or not 0 <= source < len(self.task_names):
+                    raise PipelineBuildError("control.rewind: invalid source")
+                if not targets or any(isinstance(t, bool) or not isinstance(t, int) or not 0 <= t < source for t in targets):
+                    raise PipelineBuildError("control.rewind: targets must be strictly earlier tasks")
+            if any(isinstance(t, bool) or not isinstance(t, int) or not 0 <= t < len(self.task_names) for t in self.retry_all_sources):
+                raise PipelineBuildError("control.retry_all: invalid source")
         object.__setattr__(self, "task_names", tuple(self.task_names))
         object.__setattr__(self, "edges", MappingProxyType({
             source: tuple(targets) for source, targets in self.edges.items()
@@ -154,13 +195,22 @@ class ControlPlan:
         """The destinations declared for the task at ``from_seq`` (empty when it declares none)."""
         return tuple(self.edges.get(from_seq, ()))
 
-    def allows(self, from_seq: int, target: str | int | None) -> int | None:
+    def allows(self, from_seq: int, target: str | int | None, operation: str = "forward") -> int | None:
         """Resolve one runtime target against the declared edges, or raise :class:`FatalError`.
 
         The error is fatal by design: an undeclared edge is an authoring mistake, so it must not be
         retried, silently ignored, or turned into an ordinary value.
         """
         destination = self.resolve_target(target, where=f"task {self.task_names[from_seq]!r}")
+        if operation == "retry_all":
+            if from_seq not in self.retry_all_sources:
+                raise FatalError(f"task {self.task_names[from_seq]!r} declares no retry_all permission")
+            return 0
+        if operation == "rewind":
+            if destination not in self.rewind_edges.get(from_seq, ()):
+                raise FatalError(f"task {self.task_names[from_seq]!r} returned an undeclared rewind to {target!r}")
+            return destination
+
         if destination is None and from_seq == len(self.task_names) - 1:
             raise FatalError(
                 f"task {self.task_names[from_seq]!r} is the last task, so Handoff.end() has no effect; "
@@ -201,12 +251,16 @@ class ControlPlan:
     # ------------------------------------------------------------------ views
     def fingerprint(self) -> dict[str, Any]:
         """The canonical, digestable form: resolved seqs, so the spelling of a declaration is irrelevant."""
-        return {
+        result = {
             "edges": {
                 str(from_seq): [("end" if target is None else target) for target in targets]
                 for from_seq, targets in sorted(self.edges.items())
             }
         }
+        if self.backward_enabled:
+            result.update(rewind={str(k): list(v) for k, v in sorted(self.rewind_edges.items())},
+                          retry_all=list(sorted(self.retry_all_sources)), max_handoffs=self.max_handoffs)
+        return result
 
     def describe(self) -> dict[str, Any]:
         """A reusable declaration, with numeric seqs for ambiguous or reserved names."""
@@ -215,12 +269,21 @@ class ControlPlan:
             name = self.task_names[seq]
             return seq if name == END or self.task_names.count(name) > 1 else name
 
-        return {
+        result = {
             "edges": {
                 token(from_seq): [END if target is None else token(target) for target in targets]
                 for from_seq, targets in sorted(self.edges.items())
             }
         }
+        if self.backward_enabled:
+            if not self.edges:
+                result.pop("edges")
+            if self.rewind_edges:
+                result["rewind"] = {token(k): [token(t) for t in v] for k, v in sorted(self.rewind_edges.items())}
+            if self.retry_all_sources:
+                result["retry_all"] = [token(s) for s in sorted(self.retry_all_sources)]
+            result["max_handoffs"] = self.max_handoffs
+        return result
 
     def _render(self, target: int | None) -> str:
         if target is None:
@@ -260,7 +323,7 @@ def _lookup_name(
     )
 
 
-def build_control(raw: Any, task_names: Sequence[str]) -> ControlPlan:
+def _build_forward(raw: Any, task_names: Sequence[str]) -> ControlPlan:
     """Resolve and structurally validate a ``control=`` declaration.
 
     The single validation entry for both worlds: ``pipeline(control=...)`` calls it directly, and the
@@ -367,3 +430,50 @@ def _build_target(destination: Any, names: Sequence[str], *, from_seq: int, path
             f"{source!r} (seq {from_seq}); v1 handoffs are forward-only"
         )
     return target
+
+
+def build_control(raw: Any, task_names: Sequence[str]) -> ControlPlan:
+    """Build the shared forward/backward declaration with canonical resolved identities."""
+    if not isinstance(raw, Mapping) or not any(k in raw for k in ("rewind", "retry_all", "max_handoffs")):
+        return _build_forward(raw, task_names)
+    unknown = set(raw) - {"edges", "rewind", "retry_all", "max_handoffs"}
+    if unknown:
+        raise PipelineBuildError(f"control: unknown field(s) {sorted(map(str, unknown))}")
+    names = tuple(task_names)
+    forward = _build_forward({"edges": raw["edges"]}, names) if "edges" in raw else ControlPlan(names)
+
+    def resolve(token: Any, path: str, *, source: bool = False) -> int:
+        if source and isinstance(token, str) and token not in names and token.isascii() and token.isdecimal() and str(int(token)) == token:
+            token = int(token)
+        if isinstance(token, bool) or not isinstance(token, (str, int)):
+            raise PipelineBuildError(f"{path}: expected a task name or seq")
+        if isinstance(token, str):
+            if token == END:
+                raise PipelineBuildError(f"{path}: end is not a backward task target")
+            return _lookup_name(token, names, where=path, kind="task")
+        if not 0 <= token < len(names):
+            raise PipelineBuildError(f"{path}: unknown task seq {token}")
+        return token
+
+    rewinds = raw.get("rewind", {})
+    if not isinstance(rewinds, Mapping) or ("rewind" in raw and not rewinds):
+        raise PipelineBuildError("control.rewind: expected a nonempty mapping")
+    edges: dict[int, tuple[int, ...]] = {}
+    for source, targets in rewinds.items():
+        path = f"control.rewind[{source!r}]"
+        seq = resolve(source, path, source=True)
+        if seq in edges:
+            raise PipelineBuildError(f"{path}: duplicate source")
+        if not isinstance(targets, (list, tuple)) or not targets:
+            raise PipelineBuildError(f"{path}: expected a nonempty destination list")
+        values = tuple(sorted({resolve(t, f"{path}[{i}]") for i, t in enumerate(targets)}))
+        if any(t >= seq for t in values):
+            raise PipelineBuildError(f"{path}: rewind destinations must be strictly earlier than source")
+        edges[seq] = values
+    sources = raw.get("retry_all", [])
+    if not isinstance(sources, (list, tuple)) or ("retry_all" in raw and not sources):
+        raise PipelineBuildError("control.retry_all: expected a nonempty source list")
+    retry = tuple(sorted({resolve(t, f"control.retry_all[{i}]", source=True) for i, t in enumerate(sources)}))
+    if not edges and not retry:
+        raise PipelineBuildError("control: max_handoffs requires backward operations")
+    return ControlPlan(names, forward.edges, edges, retry, raw.get("max_handoffs"))

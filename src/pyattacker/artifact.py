@@ -127,7 +127,10 @@ class CodecRegistry:
     """Registry mapping types → codecs; also responsible for restoring JSON payloads back into user types."""
 
     def __init__(self) -> None:
-        self._codecs: dict[str, Codec] = {"json": JsonCodec(), "bytes": BytesCodec()}
+        from .history import HistoryArtifact, HistoryCodec
+
+        self._codecs: dict[str, Codec] = {"history-v1": HistoryCodec(), "json": JsonCodec(), "bytes": BytesCodec()}
+        self._history_type = HistoryArtifact
         self._by_type: dict[type, str] = {
             bytes: "bytes",
             bytearray: "bytes",
@@ -191,6 +194,15 @@ class CodecRegistry:
         """Decode + best-effort restore of the user type (a registered dataclass)."""
         value = self.load_raw(encoded)
         cls = self._rebuild.get(encoded.type_name)
+        if isinstance(value, self._history_type):
+            if cls is None and encoded.type_name != "HistoryArtifact":
+                raise ArtifactCodecError(f"unregistered history payload subclass: {encoded.type_name}")
+            if cls is not None:
+                if not issubclass(cls, self._history_type):
+                    raise ArtifactCodecError("history payload type is not a HistoryArtifact subclass")
+                return cls(value.state, history=list(value.history), selected=value.selected,
+                           next_snapshot=value._next_snapshot)
+            return value
         if cls is None:
             return value
         if dataclasses.is_dataclass(cls) and isinstance(value, dict):
@@ -228,6 +240,7 @@ class Artifact:
     is_final: bool = False
     blob_ref: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
+    visit: int = 0
 
     @property
     def available(self) -> bool:

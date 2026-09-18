@@ -364,6 +364,11 @@ into a crash.
 
 ### 4.8 Advanced: Handoffs —— Declared Forward Jumps (Opt-In, Experimental)
 
+The forward-only contract below remains the v1 path. Backward-enabled declarations use the visit-aware
+contract in §4.8.8 and [the backward guide](backward.md); forward-only traversal still uses its existing
+ledger/cursor recovery without new identity or budget requirements.
+
+
 Everything above describes an ordinary pipeline: a chain walked one task at a time, each task returning the
 artifact the next one consumes. This section describes the one feature that changes the *traversal* of that
 chain: a step that can tell the rest of the chain no longer needs to run — the answer is good enough, the
@@ -569,6 +574,24 @@ the way they are, and it is the reason the model below is specified now rather t
 | Runtime-invented targets | Edges are declared, so a typed or misspelled target fails loudly instead of silently reshaping the pipeline. |
 | Handoffs from `fanout` branches | A group is one step in the record (`fanout` runs its children inside one task), so a control transfer cannot be attributed to one of N concurrent branches. A returned directive fails the group with a clear `FatalError` instead of travelling inside a collected payload. |
 | Payload type checking | See §4.8.6: it has no sound definition without a declared payload contract of its own. |
+
+#### 4.8.8 Advanced v2: rewind, retry-all and optional payload history
+
+Implemented as a separate opt-in capability: `control.rewind` declares strictly earlier destinations,
+`control.retry_all` declares sources, and `control.max_handoffs` bounds traversal. Rewind requires explicit
+author-selected entry state; retry-all decodes the original seed captured at binding. History-bearing
+payloads are optional and never drive scheduling. The [backward guide](backward.md) describes the interface.
+
+A persisted traversal record owns per-seq counters, effective slot-to-visit mappings and pending entry,
+including its exact input occurrence. Every fresh entry allocates a visit; resume reuses the pending visit.
+Success commits output/task/attempt/effective mapping/cursor together. A control transition also commits
+suffix invalidation, budget consumption and target entry allocation. Cursor comparisons and historic
+completion rows cannot decide whether a backward transition is consumed. Resume at seq 0 is a real entry.
+
+Visits preserve task/artifact identities for visit 0, qualify subsequent IDs, and participate in RNG.
+Rewind/retry-all retain historic records. Budget count survives resume and missing-payload fallback.
+Completion and finality use exact occurrence identity. Backward requeue releases the worker.
+Snapshot history is application-managed JSON state with a versioned codec, not the execution ledger.
 
 ---
 
@@ -871,7 +894,7 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
 10. **A pipeline is a linear chain**: the kernel is implemented in terms of "nodes + dependency edges", so
     adding `Parallel/Gather` is just syntactic sugar, but it is deliberately not exposed. Use `fanout(...)`
     inside a task instead: branches stay one step in the record, at the cost of group-level retry granularity.
-    The one qualification is the opt-in, forward-only handoff of §4.8: it changes the *traversal* of the chain
+    The one qualification is the opt-in handoff of §4.8: it changes the *traversal* of the chain
     along declared edges, never its topology — there is still no join and no second entry point.
 11. **A `null` backend costs you recovery granularity**: dropping payloads means intermediate artifacts
     cannot be reused, so `resume` reruns the whole pipeline — the same tradeoff as `journal=summary`.
@@ -900,13 +923,13 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
     `asyncio` cannot send `CTRL_BREAK_EVENT` to a child's group), so only the direct child is terminated
     there and a descendant may outlive the task. The offline tests verify the descendant guarantee on POSIX
     and skip those two cases elsewhere with that reason stated.
-16. **Handoffs are opt-in, forward-only and fenced off** (§4.8). A pipeline that declares `control` trades
+16. **Handoffs are opt-in and fenced off** (§4.8). A pipeline that declares `control` trades
     one guarantee for another: its cursor becomes a *position* rather than a progress count (skipped slots
     have no task rows, and `n_tasks_done / n_tasks_total` is not a completion percentage for such a
     pipeline), and its recovery depends on the `handoffs` ledger being readable — which is why a store
     without the atomic `commit_handoff` capability is refused up front instead of being downgraded to a
     non-durable jump. The feature is marked experimental until 1.0: the guarantees above are the stable
-    part, the spelling may still change. Backward handoffs, joins and cross-pipeline transfers are not
+    part, the spelling may still change. The forward-only path has no revisits; joins and cross-pipeline transfers are not
     included; a pipeline that is mostly handoffs is a sign the problem wants a graph engine, which this is
     not.
 
@@ -1047,7 +1070,7 @@ entry-point plugins, external artifact backends, a fan-out helper, and a read-on
 
 * No HTTP client / provider SDK adapter layer (you write the tasks yourself; this is deliberate design, not a missing feature)
 * No DAG / multi-turn agent orchestration (pipelines stay linear; fan-out is implemented inside a task, and
-  the one exception is the opt-in, forward-only handoff of §4.8 — no declared graph, no joins, no
+  the one exception is the opt-in handoff of §4.8 — no declared graph, no joins, no
   cross-pipeline orchestration)
 * No semantic reduction (accuracy / pass@k / any cross-pipeline aggregation)
 * No service-ification / gateway / proxy

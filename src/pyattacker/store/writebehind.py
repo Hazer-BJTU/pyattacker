@@ -324,6 +324,38 @@ class WriteBehindStore:
         self.flush()
         self.inner.reset_pipeline(record)
 
+    def repair_visit_terminal(self, *args: Any, **kwargs: Any) -> Any:
+        self.flush()
+        return self.inner.repair_visit_terminal(*args, **kwargs)
+
+    def reset_visits(self, *args: Any, **kwargs: Any) -> Any:
+        self.flush()
+        return self.inner.reset_visits(*args, **kwargs)
+
+    def commit_entry(self, *args: Any, **kwargs: Any) -> Any:
+        self.flush()
+        return self.inner.commit_entry(*args, **kwargs)
+
+    def commit_visit_attempt(self, *args: Any, **kwargs: Any) -> Any:
+        self.flush()
+        return self.inner.commit_visit_attempt(*args, **kwargs)
+
+    def commit_visit_success(self, *args: Any, **kwargs: Any) -> Any:
+        self.flush()
+        return self.inner.commit_visit_success(*args, **kwargs)
+
+    def commit_control_transition(self, *args: Any, **kwargs: Any) -> Any:
+        self.flush()
+        return self.inner.commit_control_transition(*args, **kwargs)
+
+    def visit_state(self, *args: Any, **kwargs: Any) -> Any:
+        self.flush()
+        return self.inner.visit_state(*args, **kwargs)
+
+    def get_artifact_by_id(self, *args: Any, **kwargs: Any) -> Any:
+        self.flush()
+        return self.inner.get_artifact_by_id(*args, **kwargs)
+
     def __getattr__(self, name: str) -> Any:
         """Anything not delegated explicitly (store-specific extras) passes through."""
         return getattr(self.inner, name)

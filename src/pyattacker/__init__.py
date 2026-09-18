@@ -72,6 +72,7 @@ from .errors import (
 )
 from .export import FORMATS, ROW_KINDS, export_store, export_stores, iter_rows
 from .handoff import Handoff
+from .history import HistoryArtifact
 from .merge import MergedReport, merge_reports
 from .pipeline import Chain, PipelineSpec, PipelineTemplate, compute_spec_digest, pipeline, with_retry
 from .plugins import PLUGINS, PluginRegistry, list_plugins
@@ -130,6 +131,7 @@ __all__ = [
     "compute_spec_digest",
     "with_retry",
     "Handoff",
+    "HistoryArtifact",
     "Artifact",
     "Codec",
     "CodecRegistry",

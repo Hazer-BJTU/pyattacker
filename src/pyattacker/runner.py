@@ -72,6 +72,7 @@ from .store import (
     open_store,
     supports_handoff,
 )
+from .store.visits import supports_visits
 from .task import UNSET, TaskContext, TaskSpec
 
 __all__ = ["Runner", "RunConfig", "RunReport"]
@@ -164,6 +165,7 @@ class RunConfig:
     # (or {"kind": "file", "root": ..., "min_bytes": ...}) spills large ones to disk.
     artifact_backend: Any = None
     meta: dict[str, Any] = field(default_factory=dict)
+    max_handoffs: int = 1000
 
 
 @dataclass
@@ -334,6 +336,7 @@ class _HandoffPlan:
     entry_value: Any  # the payload value the target enters with (UNSET when reused)
     payload: Encoded | None  # the encoded payload, written by the commit
     attempt: AttemptRecord  # the handed-off attempt row, written by the commit
+    operation: str = "forward"
 
 
 @dataclass
@@ -1212,6 +1215,9 @@ class Runner:
             self._emit("pipeline.skipped", pipeline_id=spec.pipeline_id, data={"reason": "succeeded"})
             return None
 
+        if spec.control is not None and spec.control.backward_enabled:
+            return self._open_backward_pipeline(spec, record, run_id)
+
         # A cursor at (or past) the end of the chain must never reach the resume rule below, which
         # would index spec.tasks[cursor] and raise IndexError -- forever, on every later run. Handle
         # the two shapes explicitly before the ordinary checkpoint branch.
@@ -1364,6 +1370,70 @@ class Runner:
             start_index=start_index,
         )
         self._begin_task(state)
+        return state
+
+    def _open_backward_pipeline(self, spec: PipelineSpec, record: PipelineRecord | None,
+                                run_id: str) -> _RunState | None:
+        """Open exact visit checkpoints, including a pending author-selected entry at seq 0."""
+        if not supports_visits(self.store):
+            raise ConfigError(f"store {type(getattr(self.store, 'inner', self.store)).__name__} lacks visit-aware control capability")
+        ceiling = self.config.max_handoffs
+        if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling <= 0:
+            raise ConfigError("RunConfig.max_handoffs must be a positive finite integer")
+        problem = self._pool_problem(spec)
+        if problem is not None:
+            raise problem
+        previous = record.run_id if record is not None else None
+        fresh = record is None or record.state == "succeeded"
+        record = record or PipelineRecord(pipeline_id=spec.pipeline_id, run_id=run_id, name=spec.name,
+                                         key=spec.key, tags=dict(spec.template.tags), n_tasks_total=spec.n_tasks,
+                                         seed_digest=spec.seed_digest, spec_digest=spec.spec_digest)
+        traversal = self.store.visit_state(spec.pipeline_id)
+        if not fresh and traversal is None:
+            raise PyAttackerError("corrupt visit checkpoint: missing traversal state")
+        record = dataclasses.replace(record, run_id=run_id, state="running", finished_at=None,
+                                     started_at=record.started_at or time.time(), resume_of=previous,
+                                     error_type=None, error_message=None, traceback=None, failed_task=None)
+        original_seed = self.registry.load(spec.seed_encoded or self.registry.dump(spec.seed))
+        seed = self.store.get_artifact_by_id(Artifact.build_id(spec.pipeline_id, SEED_SEQ))
+        if seed is None or not seed.available:
+            seed = self._store_artifact(spec, SEED_TASK, SEED_SEQ, original_seed)
+        if fresh:
+            record = self.store.reset_visits(record, seed, fresh_budget=True)
+            traversal = self.store.visit_state(spec.pipeline_id)
+        if traversal["terminal"] is not None:
+            terminal = self.store.get_artifact_by_id(traversal["terminal"])
+            if terminal is not None:
+                # Finality and terminal state were committed together; this only repairs an
+                # externally interrupted/failed row without replaying the producing task.
+                self.store.repair_visit_terminal(record)
+                self._counters["pipelines_succeeded"] += 1
+                self._counters["pipelines_done"] += 1
+                self._check_all_done()
+                return None
+            raise PyAttackerError("corrupt visit checkpoint: terminal occurrence is missing")
+        seq = traversal["cursor"]
+        if isinstance(seq, bool) or not isinstance(seq, int) or not 0 <= seq < spec.n_tasks:
+            raise PyAttackerError(f"corrupt visit checkpoint: invalid cursor {seq!r}")
+        entry = self.store.get_artifact_by_id(traversal["input"])
+        try:
+            if entry is None or not entry.available:
+                raise PyAttackerError("visit entry payload is unavailable")
+            value = self.registry.load(entry.encoded())
+        except Exception as exc:
+            self._emit("pipeline.checkpoint_missing", pipeline_id=spec.pipeline_id,
+                       data={"reason": str(exc), "via": "visits", "budget_preserved": True})
+            record = self.store.reset_visits(record, seed)
+            seq, entry = 0, seed
+            value = original_seed if not seed.available else self.registry.load(seed.encoded())
+        record.n_tasks_done = seq
+        self.store.upsert_pipeline(record)
+        state = _RunState(spec=spec, record=record, run_id=run_id, seq=seq, value=value, artifact=entry,
+                          task_spec=spec.tasks[seq], task_record=None, start_index=seq)
+        self._begin_task(state)
+        if not fresh:
+            self._emit("pipeline.resumed", pipeline_id=spec.pipeline_id,
+                       data={"from_seq": seq, "visit": state.task_record.visit, "via": "visits", "resume_of": previous})
         return state
 
     def _latest_handoff(self, pipeline_id: str) -> HandoffRecord | None:
@@ -1641,7 +1711,11 @@ class Runner:
             started_at=time.time(),
             input_artifact_id=state.artifact.id if state.artifact else None,
         )
-        self.store.record_task(state.task_record)
+        if state.spec.control is not None and state.spec.control.backward_enabled:
+            state.task_record = self.store.commit_entry(state.task_record)
+            state.attempts_used = state.task_record.attempts_used
+        else:
+            self.store.record_task(state.task_record)
 
     async def _drive(self, state: _RunState) -> None:
         """Run one pipeline until it finishes, fails, or parks itself for a retry backoff."""
@@ -1671,6 +1745,9 @@ class Runner:
                 # row, the handed-off attempt, the entry artifact, the ledger row and the cursor.
                 if self._commit_handoff(state, result.handoff):
                     return  # END: the pipeline finished here
+                if state.spec.control.backward_enabled and result.handoff.operation in ("rewind", "retry_all"):
+                    self._delays.push(state, 0.0)
+                    return  # requeue through the timer pump, releasing this worker
                 continue  # forward: the target is already open, run it next
 
             outcome = result.outcome or _Outcome(
@@ -1701,6 +1778,20 @@ class Runner:
                     },
                 )
                 return
+
+            if state.spec.control is not None and state.spec.control.backward_enabled:
+                state.record.n_tasks_done = state.seq + 1
+                if state.seq + 1 >= state.spec.n_tasks:
+                    self._counters["pipelines_succeeded"] += 1
+                    self._counters["pipelines_done"] += 1
+                    self._check_all_done()
+                    self._emit("pipeline.succeeded", pipeline_id=state.pipeline_id,
+                               data={"tasks": state.spec.n_tasks, "resumed_from": state.start_index})
+                    return
+                state.value, state.artifact = outcome.value, outcome.artifact
+                state.seq += 1
+                self._begin_task(state)
+                continue
 
             # ★ task-level checkpoint: the artifact is already durable, now advance the cursor
             state.record.n_tasks_done = state.seq + 1
@@ -1756,15 +1847,25 @@ class Runner:
             entry_seq=hop.entry_seq,
             entry_reused=hop.reused,
             reason=hop.reason,
+            operation=hop.operation,
+            from_visit=state.task_record.visit,
         )
-        stored = self.store.commit_handoff(
-            record,
-            task=state.task_record,
-            attempt=hop.attempt,
-            payload=hop.payload,
-            cursor=spec.n_tasks if hop.target is None else hop.target,
-            final=hop.target is None,
-        )
+        if spec.control.backward_enabled:
+            target_task = None if hop.target is None else TaskRecord(
+                task_run_id="", pipeline_id=state.pipeline_id, run_id=state.run_id,
+                name=hop.to_task, seq=hop.target, state="running", started_at=time.time())
+            entry_id = state.artifact.id if hop.reused and state.artifact is not None else None
+            if hop.operation == "retry_all":
+                entry_id = Artifact.build_id(state.pipeline_id, SEED_SEQ)
+            stored = self.store.commit_control_transition(
+                record, pipeline=state.record, task=state.task_record, attempt=hop.attempt,
+                payload=hop.payload, entry_id=entry_id, target_task=target_task,
+                limit=min(spec.control.max_handoffs, self.config.max_handoffs))
+        else:
+            stored = self.store.commit_handoff(
+                record, task=state.task_record, attempt=hop.attempt, payload=hop.payload,
+                cursor=spec.n_tasks if hop.target is None else hop.target, final=hop.target is None,
+            )
         self._emit(
             "pipeline.handoff",
             pipeline_id=state.pipeline_id,
@@ -1778,6 +1879,10 @@ class Runner:
                 "handoff_id": record.handoff_id,
                 "entry_artifact_id": record.entry_artifact_id,
                 "entry_reused": hop.reused,
+                "operation": hop.operation,
+                "from_visit": state.task_record.visit,
+                **({"to_visit": record.to_visit, "transition_version": record.transition_version}
+                   if spec.control.backward_enabled else {}),
             },
         )
         if hop.target is None:
@@ -1795,7 +1900,14 @@ class Runner:
         # never ran, and their task rows deliberately do not exist.
         state.record.n_tasks_done = hop.target
         state.seq = hop.target
-        if not hop.reused:
+        if spec.control.backward_enabled:
+            state.artifact = stored
+            if hop.operation == "retry_all":
+                state.value = self.registry.load(spec.seed_encoded or self.registry.dump(spec.seed))
+            elif hop.payload is not None:
+                state.value = hop.entry_value
+            # A reused input keeps the decoded state even in summary journal mode.
+        elif not hop.reused:
             state.value = hop.entry_value
             state.artifact = stored
         # A reused entry keeps value/artifact exactly as they were: the target enters with the same
@@ -1833,12 +1945,16 @@ class Runner:
         # sits in the delay queue waiting out a retry backoff must not lose the attempt count
         # that already durably happened. Pipeline state writes are synchronous by convention
         # (see store/base.py), so one extra write per attempt is the correct trade, not batched.
-        self.store.upsert_pipeline(state.record)
+        if spec.control is not None and spec.control.backward_enabled:
+            self.store.commit_visit_attempt(state.record, record)
+        else:
+            self.store.upsert_pipeline(state.record)
         # Deterministic seed, not the shared `random` module: re-running the same pipeline/seq/attempt
         # (e.g. replaying a resumed run against the same checkpoint) must reproduce the same backoff
         # jitter and the same ctx.seed, or two "identical" runs would silently diverge. Do not switch
         # this to random.Random() without a good reason.
-        rng = random.Random(int(digest_of(f"{spec.pipeline_id}|{seq}|{attempts_used}")[:16], 16))
+        seed_key = f"{spec.pipeline_id}|{seq}|{attempts_used}" if record.visit == 0 else f"{spec.pipeline_id}|{seq}|{record.visit}|{attempts_used}"
+        rng = random.Random(int(digest_of(seed_key)[:16], 16))
         ctx = TaskContext(
             run_id=state.run_id,
             pipeline_id=spec.pipeline_id,
@@ -1847,6 +1963,7 @@ class Runner:
             task_name=task_spec.name,
             seq=seq,
             attempt=attempts_used,
+            visit=record.visit,
             clock=self.clock,
             pools=self.pools,
             bus=self.bus,
@@ -1889,7 +2006,7 @@ class Runner:
         if cancelled:
             self._record_attempt(
                 spec, task_spec, task_run_id, attempts_used, attempt_started, attempt_ms,
-                "cancelled", error, ctx.lease_log(), {},
+                "cancelled", error, ctx.lease_log(), {}, seq, record.visit,
             )
             record.state = "interrupted"
             record.ended_at = time.time()
@@ -1920,22 +2037,29 @@ class Runner:
                 return _TaskResult(handoff=hop, attempts=attempts_used)
 
         if error is None:
-            artifact = self._store_artifact(spec, task_spec.name, seq, out_value)
+            backward = spec.control is not None and spec.control.backward_enabled
+            artifact = self._store_artifact(spec, task_spec.name, seq, out_value,
+                                            visit=record.visit, persist=not backward)
             record.state = "succeeded"
             record.ended_at = time.time()
             record.duration_ms = attempt_ms
             record.output_artifact_id = artifact.id
             record.error_class = record.error_type = record.error_message = None
-            self.store.record_task(record)
-            self._record_attempt(
+            attempt = self._attempt_record(
                 spec, task_spec, task_run_id, attempts_used, attempt_started, attempt_ms,
-                "succeeded", None, ctx.lease_log(), {"decision": {"retry": False, "reason": "ok"}},
+                "succeeded", None, ctx.lease_log(), {"decision": {"retry": False, "reason": "ok"}}, seq, record.visit,
             )
+            if backward:
+                artifact = self.store.commit_visit_success(state.record, record, attempt, artifact,
+                                                          final=seq + 1 == spec.n_tasks)
+            else:
+                self.store.record_task(record)
+                self.store.record_attempt(attempt)
             self._emit(
                 "task.succeeded",
                 pipeline_id=spec.pipeline_id,
                 task_run_id=task_run_id,
-                data={"task": task_spec.name, "seq": seq, "attempt": attempts_used,
+                data={"task": task_spec.name, "seq": seq, "visit": record.visit, "attempt": attempts_used,
                       "duration_ms": round(attempt_ms, 3), "artifact": artifact.id,
                       "digest": artifact.digest},
             )
@@ -1956,7 +2080,7 @@ class Runner:
         self._record_attempt(
             spec, task_spec, task_run_id, attempts_used, attempt_started, attempt_ms,
             "timeout" if error_class == "timeout" else "failed", error, ctx.lease_log(),
-            {"decision": decision},
+            {"decision": decision}, seq, record.visit,
         )
         self._emit(
             "task.failed",
@@ -1965,6 +2089,7 @@ class Runner:
             data={
                 "task": task_spec.name,
                 "seq": seq,
+                "visit": record.visit,
                 "attempt": attempts_used,
                 "error_class": error_class,
                 "error": f"{type(error).__name__}: {error}",
@@ -2020,7 +2145,12 @@ class Runner:
                 f"task {name!r} returned a Handoff, but pipeline {spec.name!r} declares no control block; "
                 "declare control={'edges': {...}} on the pipeline to allow a handoff (see docs/design.md §4.8)"
             )
-        target = plan.allows(state.seq, directive.target)
+        target = plan.allows(state.seq, directive.target, directive.operation)
+        if plan.backward_enabled and target is not None:
+            count = self.store.visit_state(spec.pipeline_id)["handoffs"]
+            limit = min(plan.max_handoffs, self.config.max_handoffs)
+            if count >= limit:
+                raise FatalError(f"control budget exhausted: consumed {count}, allowed {limit}")
         reused = directive.reuses_input
         if reused and state.artifact is None:  # pragma: no cover - defensive: a task always has an input
             raise FatalError(
@@ -2040,8 +2170,9 @@ class Runner:
             payload=payload,
             attempt=self._attempt_record(
                 spec, state.task_spec, task_run_id, attempts_used, attempt_started, attempt_ms,
-                "handed_off", None, ctx.lease_log(), {},
+                "handed_off", None, ctx.lease_log(), {}, state.seq, state.task_record.visit,
             ),
+            operation=directive.operation,
         )
 
     def _attempt_record(
@@ -2056,6 +2187,8 @@ class Runner:
         error: BaseException | None,
         leases: Sequence[Any],
         extra: Mapping[str, Any],
+        seq: int,
+        visit: int,
     ) -> AttemptRecord:
         """Build one attempt row without writing it.
 
@@ -2069,7 +2202,8 @@ class Runner:
             run_id=self._run_id or "",
             task_run_id=task_run_id,
             task_name=task_spec.name,
-            seq=int(task_run_id.rsplit(":", 1)[1]),
+            seq=seq,
+            visit=visit,
             attempt_no=attempt_no,
             started_at=time.time() - duration_ms / 1000.0,
             ended_at=time.time(),
@@ -2100,18 +2234,21 @@ class Runner:
         error: BaseException | None,
         leases: Sequence[Any],
         extra: Mapping[str, Any],
+        seq: int,
+        visit: int,
     ) -> AttemptRecord:
         record = self._attempt_record(
-            spec, task_spec, task_run_id, attempt_no, started, duration_ms, outcome, error, leases, extra
+            spec, task_spec, task_run_id, attempt_no, started, duration_ms, outcome, error, leases, extra, seq, visit
         )
         return self.store.record_attempt(record)
 
     def _store_artifact(
-        self, spec: PipelineSpec, task_name: str, seq: int, value: Any, *, is_final: bool = False
+        self, spec: PipelineSpec, task_name: str, seq: int, value: Any, *, is_final: bool = False,
+        visit: int = 0, persist: bool = True
     ) -> Artifact:
         encoded = self.registry.dump(value)
         artifact = Artifact(
-            id=Artifact.build_id(spec.pipeline_id, seq),
+            id=Artifact.build_id(spec.pipeline_id, seq) + (f"#{visit}" if visit else ""),
             pipeline_id=spec.pipeline_id,
             task_name=task_name,
             seq=seq,
@@ -2122,8 +2259,9 @@ class Runner:
             payload=encoded.data,
             created_at=time.time(),
             is_final=is_final,
+            visit=visit,
         )
-        return self.store.put_artifact(artifact)
+        return self.store.put_artifact(artifact) if persist else artifact
 
     def _emit(
         self,

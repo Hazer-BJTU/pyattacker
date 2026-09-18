@@ -20,7 +20,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .artifact import DEFAULT_REGISTRY, CodecRegistry, canonical_json, digest_of
+from .artifact import DEFAULT_REGISTRY, CodecRegistry, Encoded, canonical_json, digest_of
 from .errors import PipelineBuildError
 from .handoff import ControlPlan, Handoff, build_control
 from .task import TaskSpec
@@ -179,6 +179,7 @@ class PipelineTemplate:
             seed_digest=encoded.digest,
             repeat=repeat,
             spec_digest=self.spec_digest,
+            seed_encoded=encoded,
         )
 
     def map(
@@ -210,6 +211,7 @@ class PipelineSpec:
     seed_digest: str
     repeat: int = 0
     spec_digest: str = ""
+    seed_encoded: Encoded | None = field(default=None, compare=False, repr=False)
 
     @property
     def name(self) -> str:

@@ -1706,7 +1706,7 @@ What is worth knowing before you use it:
   on the way out. A cancelled or timed-out attempt never reaches the return, so nothing is half-transferred.
 * **The edges are declared, so a mistake is loud.** Returning a `Handoff` from a pipeline with no `control`
   block, or along an edge that was not declared *from that task*, is a `FatalError` — never retried, never a
-  silent jump. Destinations must be strictly later than their source (this version is forward-only), a name
+  silent jump. Destinations must be strictly later than their source (the `edges` operation is forward-only), a name
   that appears twice in the chain must be given as a seq, and `end` from the last task is refused because it
   would do nothing.
 * **A handoff is a checkpoint, so resume continues at the target.** If the process dies after the jump, the
@@ -1723,8 +1723,8 @@ What is worth knowing before you use it:
   `fanout`, and iterating a dataset is still `map`. A pipeline that is mostly handoffs is a sign the problem
   wants a graph engine, which this is not.
 * **Advanced tier.** It is opt-in, it changes the execution model, and it is experimental until 1.0: the
-  guarantees above are stable, the spelling may still change. Backward handoffs (send a bad model output
-  *back* to the generator) are a planned follow-up with their own record model, not part of this version.
+  guarantees above are stable, the spelling may still change. Separately declared backward operations
+  use visits and finite budgets; see [rewind, retry-all and payload history](backward.md).
   Both built-in stores can commit a handoff; a custom store that cannot is refused up front with a
   `ConfigError` rather than writing a jump that would not survive a crash.
 
@@ -1813,3 +1813,11 @@ near the top.
 | [`examples/sharded.py`](../examples/sharded.py) | one dataset across N stores, then a merged report |
 | [`examples/plugin_package/`](../examples/plugin_package/README.md) | an installable plugin: tasks, an algorithm, a codec |
 | [`examples/qa_eval.yaml`](../examples/qa_eval.yaml) | the declarative path, end to end |
+
+
+## Step 16 — advanced: regenerating with rewind and retry-all
+
+Follow the executable dictionary and `HistoryArtifact` examples in [the backward guide](backward.md).
+Use explicit caller-selected state for rewind; use retry-all when preparation must restart from the bound
+seed. Inspect `ctx.visit` and the exported effective lineage to distinguish historical visits from current
+results. A finite `max_handoffs` stops regeneration even across crashes and resume.

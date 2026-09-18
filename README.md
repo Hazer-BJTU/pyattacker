@@ -248,7 +248,7 @@ with Runner(store=":memory:", concurrency=4) as runner:
         print(f"{record.state}  ran={ran}  skipped={len(template.tasks) - len(ran)}  handoffs={len(hops)}")
 ```
 
-* **Declared, forward-only edges.** A `Handoff` along an undeclared edge, or from a pipeline with no
+* **Declared forward edges.** A `Handoff` along an undeclared edge, or from a pipeline with no
   `control` block, is a fatal configuration error — never retried, never a silent jump. Destinations must be
   strictly later than their source; `end` from the last task is refused because it would do nothing.
 * **A handoff is a disposition, not a failure.** It is a return value, so the retry policy never sees it and
@@ -263,13 +263,12 @@ with Runner(store=":memory:", concurrency=4) as runner:
   exports include ledger identity and the watermark to distinguish the scopes.
 * **Opt-in and inert.** Without the `control` block nothing changes — not one row, not one counter, and not a
   byte of `spec_digest`.
-* **Only forward, for now.** The case that motivates the capability runs the other way: a validator finds a
-  model's structured output invalid and sends the work *back* to the generator for another sample
-  (`ask(temperature=0.2) → validate → revoke → ask(temperature=0.7) → …`). A task-internal loop would collapse
-  generation and validation into one record and make "how many regenerations did this row need" invisible, so
-  that direction is a planned follow-up with its own visit model (visit identity, a durable entry counter,
-  visit-aware randomness and a loop budget) — written down now so this version does not foreclose it. Joins,
-  DAGs and cross-pipeline jumps stay out of scope.
+* **Backward traversal is separately declared.** `Handoff.rewind(target, value)` sends author-selected
+  state to an earlier task; `Handoff.retry_all()` restarts from the original bound seed. Declare
+  `control.rewind` / `control.retry_all` and a finite `control.max_handoffs`. Optional `HistoryArtifact`
+  payloads provide explicit snapshots and restoration; ordinary dictionaries remain author-controlled.
+  Visits and exact artifact occurrences retain history and make recovery safe. See the
+  [backward traversal guide](docs/backward.md) for APIs, budgets and recovery boundaries.
 
 The API is one class ([`Handoff`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md#advanced-handoffs-opt-in)),
 one declaration (`control={"edges": {...}}`) and one optional store capability; a custom store that cannot
@@ -476,7 +475,7 @@ These are design decisions, not missing features:
 * **Semantic reduction** — accuracy, pass@k, F1 and any cross-pipeline aggregation. Export the artifacts and
   compute it outside, or write a sink pipeline out of the primitives.
 * **DAG orchestration** — a pipeline is a linear chain; branch inside a task with `fanout`. The one
-  qualification is the opt-in, forward-only [handoff](#advanced-handoffs-opt-in): it changes the traversal of
+  qualification is the opt-in [handoff](#advanced-handoffs-opt-in): it changes the traversal of
   the chain along declared edges, never its topology (no joins, no second entry point, no cross-pipeline
   jumps).
 * **A serving gateway** — the only HTTP surface is the read-only debug endpoint above.
@@ -491,7 +490,7 @@ every known tradeoff with its reason.
 [hand off](#advanced-handoffs-opt-in): return a `Handoff` to skip declared stations or finish the pipeline
 early, recorded in a durable ledger that recovery resumes from. It is opt-in and inert — a pipeline without a
 `control` block writes no new rows and keeps a byte-identical `spec_digest` — and marked experimental until
-1.0. Backward/revoke handoffs are the planned follow-up, not part of it.
+1.0. Backward traversal now adds declared rewind and retry-all with visits and optional payload history.
 
 **0.2.0 — a benchmark, stricter identity, and three correctness fixes.** New: `pyattacker bench`, a
 simulated provider world that compares the acquire algorithms on a vector of metrics instead of a weighted
