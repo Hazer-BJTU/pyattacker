@@ -19,8 +19,9 @@ At <https://pypi.org/manage/project/pyattacker/settings/publishing/>, add a GitH
 | Workflow name | `release.yml` |
 | Environment name | `pypi` |
 
-Repeat at <https://test.pypi.org/manage/account/publishing/> with environment `testpypi` if you want the
-TestPyPI rehearsal path (recommended, and free of consequences).
+Repeat at <https://test.pypi.org/manage/account/publishing/> with environment `testpypi`. This second one is
+not optional: every tag publishes to TestPyPI first and installs the files back from it before PyPI is
+touched, so a release cannot start without it. TestPyPI is scratch, so the extra copy costs nothing.
 
 The environment name is not optional. PyPI matches it against the workflow's `environment:`, and a mismatch
 fails the upload with a confusing 403 rather than a clear error.
@@ -53,10 +54,12 @@ uv sync                     # refresh uv.lock
 uv run pytest               # tests/test_packaging.py asserts the two agree
 ```
 
-**3. Rehearse, if you want to** (optional; the TestPyPI copy is scratch, and no PyPI version is spent):
+**3. Rehearse the commit you are going to tag** (optional — the tag runs the same stage itself, so this is
+about finding problems while the version is still yours to change):
 
-Actions → Release → **Run workflow**, with *Publish to TestPyPI* checked. This runs the full verification and
-uploads to TestPyPI. Then check the result:
+Actions → Release → **Run workflow**, with *Publish to TestPyPI* checked. This runs the full verification,
+uploads to TestPyPI, and installs the files back from there — the same three things the tag does. Then check
+the result yourself:
 
 ```bash
 uv venv /tmp/verify --python 3.11
@@ -78,6 +81,11 @@ is in play `pyattacker` itself resolves from PyPI — where the last release liv
 install succeeds and happily reports the *older* version, verifying nothing, which is why the pin, the strategy
 flag and the `--version` assertion belong together.
 
+The rehearsal publishes under the real version number, so **commit before rehearsing, not after**: a filename
+that any index has seen can never be uploaded again, not even for different content and not even after
+deleting it ([PyPI's rule](https://pypi.org/help/#file-name-reuse) applies to TestPyPI too). A fix after a
+rehearsal means a new version number, which is exactly what the tag stage would tell you.
+
 **4. Tag and push.** This is the step that publishes:
 
 ```bash
@@ -86,8 +94,10 @@ git tag -a vX.Y.Z -m "pyattacker X.Y.Z"
 git push origin vX.Y.Z
 ```
 
-The workflow then runs the suite on 3.11 and 3.12, builds, checks the artifacts, publishes to PyPI, and
-creates the GitHub release with the changelog section and the files attached.
+The workflow then runs the suite on 3.11 and 3.12, builds and checks the artifacts, publishes them to
+TestPyPI, installs them back from TestPyPI and runs the CLI there, publishes to PyPI, and creates the GitHub
+release with the changelog section and the files attached. The `pypi` environment's required reviewer is the
+pause in front of the one step that cannot be taken back.
 
 **5. Confirm:**
 
@@ -113,6 +123,7 @@ than trusting that it did:
 | sdist stays under 1 MiB | `assets/` put 883 KB of logo PNG into a 1.26 MB tarball, which 0.2.0 published |
 | sdist alone rebuilds and passes its tests | an sdist that cannot rebuild the package is not a source distribution |
 | wheel installs and `pyattacker demo` runs | catches a broken entry point or a missing module |
+| the released files install from TestPyPI by name and report `__version__` | the published metadata has to resolve the way a user resolves it, and a rehearsal nobody runs proves nothing |
 
 ## If something goes wrong
 
@@ -124,11 +135,17 @@ number. If a bad artifact reaches PyPI, yank it and publish a patch release — 
 once PyPI has the version, move to a new version number instead.
 
 **A re-run says the files already exist.** That is `--check-url` doing its job: a file already on the index
-*with the same hash* is skipped, so a publish that died halfway can simply be re-run. The comparison is by
-hash, not by filename, so this only holds while the commit is unchanged. Re-run a *TestPyPI rehearsal* after
-further commits and the rebuilt sdist — which ships `docs/` — no longer matches, and the step fails with
-`Local file and index file do not match`. That is the check refusing to mix two builds; delete the TestPyPI
-release before rehearsing again, or accept the first attempt as the one that proved the upload.
+*with the same hash* is skipped, so a publish that died halfway can simply be re-run — fix the cause and use
+`gh run rerun <run-id> --failed`, no new tag needed. The comparison is by hash, not by filename, so this only
+holds while the commit is unchanged.
+
+**`Local file and index file do not match`, or `Filename has been previously used`.** TestPyPI holds this
+version from different bytes: a rehearsal followed by a further commit rebuilds the sdist — which ships
+`docs/` — and changes its hash. Deleting the release does not help, because neither index ever allows a
+filename to be reused ([not even after deletion](https://pypi.org/help/#file-name-reuse)). The remedy is a new
+version number: bump `pyproject.toml` and `src/pyattacker/__init__.py`, add the changelog section, rehearse
+that, and tag it. The alternative is to treat the rehearsed commit as the release and move the tag onto it
+(delete and re-push the tag), which is safe while nothing has reached PyPI.
 
 **403 from PyPI.** Almost always the publisher configuration: check that the owner, repository, workflow
 filename (`release.yml`) and environment name match exactly what the job declares.

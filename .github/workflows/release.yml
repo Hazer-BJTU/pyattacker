@@ -1,17 +1,22 @@
 name: Release
 
 # Publishing is driven by a tag, so the artifact is always traceable to an exact commit.
-# Pushing v0.2.0 builds, verifies and publishes to PyPI, then attaches the files to a GitHub
-# Release. `workflow_dispatch` runs everything except the PyPI upload, which is how you rehearse
-# a release without spending a version number: PyPI refuses a re-upload, and a version, once
-# published, can be deleted but never reused.
+# Pushing v0.2.0 verifies and builds the files, publishes them to TestPyPI, installs them back from
+# TestPyPI by name, and only then uploads them to PyPI and attaches them to a GitHub Release. The
+# scratch index is a stage rather than an optional rehearsal because it is the one place the
+# published metadata is exercised the way a user exercises it — `pip install pyattacker==X.Y.Z` —
+# and being scratch it costs nothing, while PyPI refuses a re-upload and a version, once published,
+# can be deleted but never reused.
+#
+# `workflow_dispatch` stops before both uploads unless *Publish to TestPyPI* is checked, which is
+# how you rehearse a release before spending a version number.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       publish_to_testpypi:
-        description: "Publish to TestPyPI (a dry run needs no version number)"
+        description: "Also upload to TestPyPI and install from it (otherwise the run only verifies and builds)"
         type: boolean
         default: false
 
@@ -199,10 +204,13 @@ jobs:
           if-no-files-found: error
 
   # Publishing lives in its own job so the OIDC token is scoped to it alone: no test or build step
-  # ever holds a credential that can upload a release.
+  # ever holds a credential that can upload a release. That is also why the index is verified by the
+  # job below rather than by a step in this one.
   testpypi:
     name: publish to TestPyPI
-    if: github.event_name == 'workflow_dispatch' && inputs.publish_to_testpypi
+    # On a tag this is a stage of the release. On a dispatch it runs only when the input asks for it,
+    # so that a dry run stays a dry run.
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_to_testpypi
     needs: build
     runs-on: ubuntu-latest
     environment: testpypi
@@ -221,7 +229,10 @@ jobs:
           # caching here can only ever warn that the cache will never get invalidated.
           enable-cache: false
 
-      # --check-url lets a re-run skip files already uploaded instead of failing the job.
+      # --check-url lets a re-run skip files already uploaded instead of failing the job, which also
+      # makes a re-run of a rehearsed release idempotent: identical bytes are skipped and still
+      # verified below. Different bytes for a version TestPyPI already holds fail here on purpose —
+      # publishing those to PyPI would ship files no index has ever resolved.
       - name: Publish
         run: |
           uv publish \
@@ -230,10 +241,63 @@ jobs:
             --check-url https://test.pypi.org/simple/ \
             dist/*
 
+  # The check the rehearsal used to leave to a human, and the reason TestPyPI is a stage at all:
+  # the files are installed the way a user installs them, by name from an index, with no credential
+  # in reach. `--index-url` is what makes the install come from TestPyPI rather than PyPI, and the
+  # version being released cannot be on PyPI yet — the upload that would put it there needs this job
+  # to pass — so the `--version` assertion proves the TestPyPI files are the ones that got installed.
+  # One index is enough because the base package declares no dependencies — `tests/test_packaging.py`
+  # enforces that — while TestPyPI's own PyYAML is frozen at 3.11, so a release that grew a runtime
+  # dependency fails here rather than publishing metadata no index could resolve. The wider
+  # `--extra-index-url` form, for the `yaml` extra and for that case, is in `docs/releasing.md`.
+  testpypi_check:
+    name: install from TestPyPI
+    needs: [build, testpypi]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          # No checkout in this job, so no lockfile to key a cache on — see the note in `testpypi`.
+          enable-cache: false
+
+      - name: Install the published files by name
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          uv venv /tmp/index-check --python 3.11
+          # The simple index is a cached listing per CDN point of presence, so a file that was just
+          # uploaded can take a minute to show up in the one this job resolves through — measured at
+          # ~30-70s while this was written, on an upload uv itself had already resolved. A release
+          # waits that out rather than failing: ten attempts, 15 seconds apart.
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if uv pip install --python /tmp/index-check/bin/python \
+                 --index-url https://test.pypi.org/simple/ \
+                 "pyattacker==$VERSION"; then
+              break
+            fi
+            if [ "$attempt" = 10 ]; then
+              echo "::error::pyattacker $VERSION is not installable from TestPyPI"
+              exit 1
+            fi
+            echo "attempt $attempt could not resolve pyattacker==$VERSION; retrying in 15s"
+            sleep 15
+          done
+
+      - name: The index copy is the version being released, and it runs
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          /tmp/index-check/bin/pyattacker --version | grep -qx "pyattacker $VERSION"
+          /tmp/index-check/bin/pyattacker demo --pipelines 10 --store /tmp/index-check/demo.db
+          echo "TestPyPI serves pyattacker $VERSION and the installed CLI runs"
+
   pypi:
     name: publish to PyPI
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    # Gated on the index check, not just on the build: the files are published for real only after
+    # TestPyPI has served them to a clean environment and the CLI there reported this version.
+    needs: [build, testpypi_check]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
