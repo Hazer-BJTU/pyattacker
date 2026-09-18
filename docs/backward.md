@@ -84,12 +84,13 @@ assert registry.load(registry.dump(next_state)).state == next_state.state
 Pass the registry to both `pipeline(..., registry=registry)` and `Runner(..., registry=registry)`.
 Return `Handoff.rewind("generate", next_state)` to schedule the selected state.
 
-- `checkpoint(label, metadata=None)` returns a new value with a detached snapshot of application state.
+- `checkpoint(label, *, metadata=None)` returns a new value with a detached snapshot of application state.
   Labels are unique; `snapshot:` is reserved for stable IDs such as `snapshot:0`.
 - `with_state(value)` replaces current state without appending a snapshot.
 - `snapshot(id_or_label)` returns a detached snapshot record; `history` returns detached records.
 - `restore(id_or_label)` replaces current state, retains the whole history, and exposes `selected`.
-- `prune(*selectors)` explicitly removes snapshots, except the selected one. IDs are not reused.
+- `prune(*selectors)` explicitly removes snapshots and **raises** `ValueError` when a selector names the
+  selected snapshot. IDs are not reused.
 
 Nested mutable values never alias retained snapshots through these interfaces. Application state and
 metadata must be JSON serializable; encoding rejects clients, leases and other runtime objects.
@@ -120,20 +121,29 @@ it cannot guarantee exactly-once external side effects.
 
 Both built-in stores provide atomic `reset_visits`, `commit_entry`, `commit_visit_attempt`,
 `commit_visit_success`, `commit_control_transition` and `repair_visit_terminal`, plus `visit_state`
-and exact artifact lookup. Write-behind flushes before delegating these operations synchronously.
-A control transfer commits its source visit/attempt, entry occurrence, ledger, active-suffix invalidation,
-control count and allocated target entry together. Ordinary success commits its output, completed visit,
-effective mapping and next cursor together. SQLite serializes capability transactions with `BEGIN IMMEDIATE`;
+and exact artifact lookup. `supports_visits` probes the capability, and a store offering exactly those
+eight names is refused: a control transfer also needs the v1 ledger capability
+(`commit_handoff`, `reset_pipeline`, `handoffs`), because the transition's ledger row and source task row
+land through it. Write-behind flushes before delegating these operations synchronously.
+A control transfer commits its source visit/attempt, entry occurrence, ledger, control count and allocated
+target entry together, and additionally invalidates the active suffix for `rewind`/`retry_all` (a forward
+transfer in such a pipeline consumes budget without moving the cursor backwards).
+Ordinary success commits its output, completed visit, effective mapping and next cursor together. SQLite
+serializes capability transactions with `BEGIN IMMEDIATE`;
 MemoryStore restores its state on failed capability writes. A failed blob write cannot publish its reference;
 a rolled-back database transaction can leave an unreferenced blob.
 
-Require positive finite `control.max_handoffs` when declaring backward operations. The runtime ceiling
+Require a positive integer `control.max_handoffs` when declaring backward operations (`3.0`, `True`, `"3"`
+and `0` are all rejected). The runtime ceiling
 `RunConfig.max_handoffs` (default 1000, also accepted as `run.max_handoffs` in config) can lower that cap.
 The minimum is effective. Every nonterminal handoff in such a pipeline counts, including forward transfers;
 `END` can finish at the limit without consuming another transfer. Budget N permits exactly N transfers.
 The next fails before publishing a transition or invalidating results. Resume, retry-all and automatic
-missing-payload seed fallback retain the count. Only an explicit fresh execution of a succeeded pipeline
-(`retry_succeeded=True`) starts a new budget lifecycle; visit counters and audit records still survive.
+missing-payload seed fallback retain the count. Only an explicit fresh execution (`retry_succeeded=True`)
+starts a new budget lifecycle; visit counters and audit records still survive. On a backward-enabled
+pipeline that flag is also the way out of a spent budget: a pipeline that failed *because* it consumed
+its budget has no progress left to resume, so without `retry_succeeded=True` every later run replays
+the same fatal error. Plain `resume=True` keeps the consumed budget and continues the current traversal.
 
 A missing/unavailable pending payload emits `pipeline.checkpoint_missing` and establishes a seed replay,
 preserving budget and counters. Summary journals and null backends can run loops in-process, but cannot
@@ -147,8 +157,10 @@ Pipeline exports add a `control` traversal record only for backward-enabled pipe
 exact current `input` and `terminal` reference. Nested task/artifact rows include IDs, visits and
 `active` markers. Individual task/attempt/artifact exports include visit; attempts include task-run ID.
 The existing closed top-level export row kinds are unchanged. The HTTP `/pipelines` view includes
-traversal state and `cursor_kind="position"`. Reports count pipeline rows once and retain historic visit
-and attempt totals; those totals are workload, not completion percentages.
+traversal state and `cursor_kind="position"` for backward-enabled rows (a forward-only row gets neither).
+A report is scoped to the run it covers and counts that run's repeated visits and attempts, so after a
+resume it shows the new run's workload while the store and the export retain every earlier row. Those
+totals are workload, not completion percentages.
 
 SQLite upgrades older stores with visit columns defaulting to 0 and a traversal-state table. This is
 an additive upgrade for forward-only work. **Do not open a store containing revisits with an older writer**:

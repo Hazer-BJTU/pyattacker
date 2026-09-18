@@ -43,6 +43,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+* Backward-traversal follow-up: `retry_succeeded=True` now resets a backward pipeline's control budget as
+  well as its visit counters, so a pipeline that failed *because* it spent its budget can be restarted
+  instead of replaying the same fatal error forever; the forward capability check is applied to
+  backward-enabled pipelines too, and `supports_visits` requires the v1 `commit_handoff`/`reset_pipeline`
+  ledger capability the transition actually uses; `MemoryStore.stats()["attempts_total"]` counts attempt
+  rows for the run like `SqliteStore`, instead of double-counting a resumed visit's consumed attempts.
+
 * Review follow-up: freeze resolved control topology; atomically reset current task/chain artifact state
   on control-enabled seed replays while retaining history; expose handoff identity/watermark and active
   versus historical API counts; treat unencodable handoff payloads as fatal; correct return-only

@@ -41,6 +41,7 @@ Read the steps in order the first time. Afterwards, use this table.
 | store custom types or large payloads, ship a plugin | [Step 14](#step-14--your-own-types-blobs-plugins) | [Codecs](reference.md#codecregistry), [Backends](reference.md#artifact-backends), [Plugins](reference.md#plugins) |
 | monitor a run in progress | [Step 14](#step-14--your-own-types-blobs-plugins) | [Monitoring](reference.md#monitoring) |
 | skip the rest of a chain from inside a task (advanced) | [Step 15](#step-15--advanced-skipping-stations-handoffs) | [Handoffs](reference.md#advanced-handoffs-opt-in) |
+| send work back to an earlier station (advanced) | [Step 16](#step-16--advanced-regenerating-with-rewind-and-retry-all) | [Backward traversal](backward.md) |
 
 ---
 
@@ -1814,10 +1815,117 @@ near the top.
 | [`examples/plugin_package/`](../examples/plugin_package/README.md) | an installable plugin: tasks, an algorithm, a codec |
 | [`examples/qa_eval.yaml`](../examples/qa_eval.yaml) | the declarative path, end to end |
 
-
 ## Step 16 — advanced: regenerating with rewind and retry-all
 
-Follow the executable dictionary and `HistoryArtifact` examples in [the backward guide](backward.md).
-Use explicit caller-selected state for rewind; use retry-all when preparation must restart from the bound
-seed. Inspect `ctx.visit` and the exported effective lineage to distinguish historical visits from current
-results. A finite `max_handoffs` stops regeneration even across crashes and resume.
+**Like Step 15, this is an advanced, opt-in feature, experimental until 1.0.** It changes the traversal of
+the chain: a validator can send the work *back* to an earlier station instead of failing the row or looping
+inside one task. Read it when a step decides that an earlier step should run again with different state.
+
+The situation: `validate` rejects a structured answer, and the fix is another generation with the same
+prompt plus the error feedback. Folding that loop into one task would collapse generation and validation
+into one record — "how many regenerations did this row need" would be invisible exactly where it is the
+measurement. A **rewind** keeps both generations as separate visits with their own task, attempt and
+artifact rows.
+
+```python
+# tutorial/step_16_backward.py
+"""Step 16 (advanced) - a validator rewinds to the generator; state is what the author chose."""
+
+from pyattacker import Handoff, Runner, pipeline, task
+
+
+@task("prepare")
+def prepare(seed: dict) -> dict:
+    return {"prompt": seed["prompt"], "temperature": 0.2}
+
+
+@task("generate")
+def generate(state: dict, ctx) -> dict:
+    # <- your model call: a revisit is a genuinely new sample
+    return {**state, "answer": f"sample-{ctx.visit}", "valid": ctx.visit >= 1}
+
+
+@task("validate")
+def validate(row: dict, ctx) -> Handoff | dict:
+    if not row["valid"]:
+        # Explicit state: the author decides what the generator gets, the framework guesses nothing.
+        return Handoff.rewind(
+            "generate",
+            {"prompt": row["prompt"], "temperature": 0.7, "feedback": "answer did not parse"},
+            reason="invalid structured output",
+        )
+    return {**row, "validated": True}
+
+
+@task("report")
+def report(row: dict, ctx) -> dict:
+    # ctx.visit is 1 when this row was regenerated once, 0 when the first sample passed
+    return {"answer": row["answer"], "regenerations": ctx.visit, "temperature": row["temperature"]}
+
+
+# `rewind` is declared from validate to the strictly earlier generate; max_handoffs is required and is
+# the loop budget: transfer N+1 fails before it can invalidate anything.
+template = pipeline(
+    "regenerate",
+    prepare | generate | validate | report,
+    control={"rewind": {"validate": ["generate"]}, "max_handoffs": 3},
+)
+
+with Runner(store="runs/backward.db", max_handoffs=10) as runner:   # 10 is a ceiling, not a floor
+    report_obj = runner.run(template.map([{"prompt": "Return JSON with one field"}]))
+    print(report_obj.summary())
+    store = runner.store
+    for record in store.pipelines():
+        print(f"\n{record.pipeline_id[:8]}  state={record.state}  position={record.n_tasks_done}")
+        for row in store.tasks(record.pipeline_id):
+            print(f"   seq={row.seq} visit={row.visit} {row.name:9s} {row.state}")
+        for hop in store.handoffs(pipeline_id=record.pipeline_id):
+            print(f"   {hop.operation}: {hop.from_task} -> {hop.to_task}  (visit {hop.from_visit} -> {hop.to_visit})")
+    state = store.visit_state(record.pipeline_id)
+    print("\nbudget consumed:", state["handoffs"], " visits per station:", state["counters"])
+    print("effective outputs:", {s: store.get_artifact(record.pipeline_id, s).visit for s in range(4)})
+    # Every occurrence is still there by exact id, including the superseded first generation.
+    print("first generation kept:", store.get_artifact_by_id(f"{record.pipeline_id}:1").payload)
+```
+
+The row is generated twice, and the record shows both visits instead of hiding the retry:
+
+```text
+succeeded  position=4
+   seq=0 visit=0 prepare   succeeded
+   seq=1 visit=0 generate  succeeded
+   seq=1 visit=1 generate  succeeded
+   seq=2 visit=0 validate  handed_off
+   seq=2 visit=1 validate  succeeded
+   seq=3 visit=0 report    succeeded
+   rewind: validate -> generate  (visit 0 -> 1)
+
+budget consumed: 1  visits per station: {'0': 0, '1': 1, '2': 1, '3': 0}
+effective outputs: {0: 0, 1: 1, 2: 1, 3: 0}
+```
+
+What is worth knowing before you use it:
+
+* **You choose the state; the framework does not roll back dictionaries.** `Handoff.rewind(target, value)`
+  requires an explicit value (`None` is a real value), and the target must be a declared, strictly earlier
+  task. Results before the target stay effective; the target and everything after it become historical and
+  run again with new visits.
+* **`Handoff.retry_all()` restarts from the original bound seed**, freshly decoded from the bytes captured
+  at binding — mutating `spec.seed` or a task's input afterwards does not change it. Use
+  `Handoff.rewind(0, chosen_state)` when the restart should begin with different state.
+* **Loops are bounded, so termination is not structural.** `control.max_handoffs` is required for a
+  backward plan, and `RunConfig.max_handoffs` (default 1000, `run.max_handoffs` in a config) can lower it:
+  the effective limit is the minimum. `END` never consumes a transfer. The failing transition is refused
+  *before* anything is invalidated, so the record still describes exactly what committed.
+* **A crash cannot lose the lineage.** Entry, visit allocation, effective slots and the pending input commit
+  atomically, so a resume continues the same visit with its chosen payload rather than replaying the whole
+  pipeline. What the framework does not give you is exactly-once external side effects — include `ctx.visit`
+  in an idempotency key when each regeneration should be a new external operation.
+* **Visit 0 is unchanged.** A pipeline that never rewinds keeps `pipeline_id:seq` ids, the same random
+  stream and the same `spec_digest`, so adding the declaration is what opts a pipeline into the new
+  addresses — not upgrading the package.
+* **Ordinary dictionaries stay ordinary.** `HistoryArtifact` is an optional payload base class for
+  snapshot/restore bookkeeping; nothing in the runner reads it to decide where to go next.
+
+The full interface — the visit/occurrence model, the budget lifecycle, the store capability and the
+`HistoryArtifact` codec — is in [the backward guide](backward.md).

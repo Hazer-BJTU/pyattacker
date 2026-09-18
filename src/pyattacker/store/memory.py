@@ -138,14 +138,26 @@ class MemoryStore(VisitStore):
         return self._pipelines.get(pipeline_id)
 
     def reset_pipeline(self, record: PipelineRecord) -> None:
-        """Reset current slots, retaining append-only history and high-band payloads."""
+        """Reset current slots, retaining append-only history and high-band payloads.
+
+        Visit occurrences follow the same seq rule as the artifact slots, so this mirrors
+        ``SqliteStore.reset_pipeline``'s ``DELETE ... WHERE seq>=0 AND seq<n_tasks_total``: a store that
+        dropped the rows for one collection but not the other would answer ``artifacts()`` differently
+        depending on which backend produced it.
+        """
         self._tasks = {key: task for key, task in self._tasks.items()
                        if task.pipeline_id != record.pipeline_id}
         self._artifacts = {key: artifact for key, artifact in self._artifacts.items()
                            if key[0] != record.pipeline_id or not 0 <= key[1] < record.n_tasks_total}
+        self._occurrences = {key: artifact for key, artifact in self._occurrences.items()
+                             if artifact.pipeline_id != record.pipeline_id
+                             or not 0 <= artifact.seq < record.n_tasks_total}
         for key, artifact in list(self._artifacts.items()):
             if key[0] == record.pipeline_id:
                 self._artifacts[key] = dataclasses.replace(artifact, is_final=False)
+        for key, artifact in list(self._occurrences.items()):
+            if artifact.pipeline_id == record.pipeline_id:
+                self._occurrences[key] = dataclasses.replace(artifact, is_final=False)
         self.upsert_pipeline(record)
 
     def upsert_pipeline(self, record: PipelineRecord) -> None:
@@ -224,9 +236,15 @@ class MemoryStore(VisitStore):
         return None if artifact is None else _hydrate(artifact, self.backend)
 
     def mark_final(self, pipeline_id: str, seq: int) -> None:
+        # Both collections, because `artifacts()`/`get_artifact_by_id` merge them: SqliteStore's single
+        # `UPDATE artifacts SET is_final=(artifact_id=?)` covers visit occurrences too, so leaving
+        # `_occurrences` untouched here would leave a second artifact flagged final in memory only.
         for key, artifact in list(self._artifacts.items()):
             if key[0] == pipeline_id:
                 self._artifacts[key] = dataclasses.replace(artifact, is_final=key[1] == seq)
+        for key, artifact in list(self._occurrences.items()):
+            if artifact.pipeline_id == pipeline_id:
+                self._occurrences[key] = dataclasses.replace(artifact, is_final=artifact.seq == seq)
 
     def artifacts(self, pipeline_id: str) -> list[Artifact]:
         items = {a.id: a for (pid, _), a in self._artifacts.items() if pid == pipeline_id}
@@ -516,7 +534,13 @@ class MemoryStore(VisitStore):
                 "duration_ms": {"p50": pct(0.5), "p95": pct(0.95), "max": pct(1.0)},
             },
             "tasks": {"by_name": task_counts, "attempts_by_name": attempts_by_task},
-            "attempts_total": sum(t.attempts_used for t in relevant),
+            # Counted from the attempt rows, exactly like SqliteStore's `SELECT COUNT(*) FROM
+            # attempts`: summing `TaskRecord.attempts_used` instead would double-count a pending
+            # visit that a resume rebinds to the new run (the row keeps its consumed numbering),
+            # so the two built-in stores would report different totals for the same history.
+            "attempts_total": sum(
+                1 for a in self._attempts if run_id is None or a.run_id == run_id
+            ),
             "handoffs_total": sum(
                 1 for h in self._handoffs if run_id is None or h.run_id == run_id
             ),

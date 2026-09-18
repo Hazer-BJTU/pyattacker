@@ -21,6 +21,11 @@ class VisitStore:
 
     Backend hooks are private; third-party stores can implement the public capability directly.
     An input/output occurrence is always referenced by exact ID, independently of task seq.
+
+    The capability is deliberately more than the visit methods alone: a backward control transition
+    also lands its ledger row, source task and attempt through the v1 ``commit_handoff``
+    (see :meth:`commit_control_transition`), so a store that exposes the visit methods without that
+    commit would accept a rewind and then fail halfway through it.
     """
 
     def reset_visits(
@@ -233,6 +238,8 @@ def supports_visits(store: Any) -> bool:
             "commit_visit_success",
             "commit_control_transition",
             "get_artifact_by_id",
+            "reset_pipeline",
+            "commit_handoff",
             "repair_visit_terminal",
             "handoffs",
         )

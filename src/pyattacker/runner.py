@@ -1377,6 +1377,14 @@ class Runner:
         """Open exact visit checkpoints, including a pending author-selected entry at seq 0."""
         if not supports_visits(self.store):
             raise ConfigError(f"store {type(getattr(self.store, 'inner', self.store)).__name__} lacks visit-aware control capability")
+        # `supports_visits` covers the visit methods, but a backward transition also lands its ledger
+        # row, source task and attempt through `commit_handoff` and clears a previous execution through
+        # `reset_pipeline`. That is what `_control_problem` probed for the forward path, and it must be
+        # probed here too: without it the first rewind would die with an AttributeError instead of the
+        # configuration error that names the missing capability.
+        problem = self._control_problem(spec)
+        if problem is not None:
+            raise problem
         ceiling = self.config.max_handoffs
         if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling <= 0:
             raise ConfigError("RunConfig.max_handoffs must be a positive finite integer")
@@ -1384,20 +1392,44 @@ class Runner:
         if problem is not None:
             raise problem
         previous = record.run_id if record is not None else None
-        fresh = record is None or record.state == "succeeded"
+        traversal = self.store.visit_state(spec.pipeline_id)
+        # A missing traversal is only "corrupt" when something durable was actually written: an open
+        # that failed before its first transaction -- a bad runtime ceiling, a missing pool, a store
+        # that lacks the capability, an undecodable seed -- leaves a `failed` row with nothing to
+        # resume, and insisting on a traversal there poisons the pipeline id forever (every later run,
+        # `resume=True` included, would report the same corruption). The forward path never has this
+        # shape because it writes its row before its checks, so a fresh start is the matching recovery.
+        #
+        # An explicit fresh execution -- `retry_succeeded=True`, the operator's one documented
+        # "start this pipeline over" switch -- must also reset the visit counters and the control
+        # budget, because a *failed* backward pipeline is otherwise unresumable by construction:
+        # its durable traversal still holds the consumed budget, so every later open replays the
+        # same "budget exhausted" fatal error and the pipeline can never make progress again.
+        # This is the same rule the forward path already applies to a succeeded row, and the same
+        # rule the backward guide documents ("only an explicit fresh execution ... starts a new
+        # budget lifecycle"). Plain resume is unaffected: it keeps counters and budget.
+        fresh = (
+            record is None
+            or (traversal is None and not self._visit_progress_written(spec))
+            or record.state == "succeeded"
+            or (self.config.retry_succeeded and traversal is not None)
+        )
         record = record or PipelineRecord(pipeline_id=spec.pipeline_id, run_id=run_id, name=spec.name,
                                          key=spec.key, tags=dict(spec.template.tags), n_tasks_total=spec.n_tasks,
                                          seed_digest=spec.seed_digest, spec_digest=spec.spec_digest)
-        traversal = self.store.visit_state(spec.pipeline_id)
         if not fresh and traversal is None:
             raise PyAttackerError("corrupt visit checkpoint: missing traversal state")
         record = dataclasses.replace(record, run_id=run_id, state="running", finished_at=None,
                                      started_at=record.started_at or time.time(), resume_of=previous,
                                      error_type=None, error_message=None, traceback=None, failed_task=None)
-        original_seed = self.registry.load(spec.seed_encoded or self.registry.dump(spec.seed))
         seed = self.store.get_artifact_by_id(Artifact.build_id(spec.pipeline_id, SEED_SEQ))
         if seed is None or not seed.available:
-            seed = self._store_artifact(spec, SEED_TASK, SEED_SEQ, original_seed)
+            # Decoded only when it is actually needed. Eager decoding would make an unrelated registry
+            # mismatch fatal on open even for a run that is about to resume an existing checkpoint,
+            # and it would waste the decode on every resume of a pipeline whose seed is still readable.
+            seed = self._store_artifact(
+                spec, SEED_TASK, SEED_SEQ, self.registry.load(spec.seed_encoded or self.registry.dump(spec.seed))
+            )
         if fresh:
             record = self.store.reset_visits(record, seed, fresh_budget=True)
             traversal = self.store.visit_state(spec.pipeline_id)
@@ -1425,7 +1457,11 @@ class Runner:
                        data={"reason": str(exc), "via": "visits", "budget_preserved": True})
             record = self.store.reset_visits(record, seed)
             seq, entry = 0, seed
-            value = original_seed if not seed.available else self.registry.load(seed.encoded())
+            value = (
+                self.registry.load(spec.seed_encoded or self.registry.dump(spec.seed))
+                if not seed.available
+                else self.registry.load(seed.encoded())
+            )
         record.n_tasks_done = seq
         self.store.upsert_pipeline(record)
         state = _RunState(spec=spec, record=record, run_id=run_id, seq=seq, value=value, artifact=entry,
@@ -1486,6 +1522,29 @@ class Runner:
             )
             return None
         return handoff.to_seq, entry, value
+
+    def _visit_progress_written(self, spec: PipelineSpec) -> bool:
+        """Whether a backward pipeline with no traversal record still left durable progress behind.
+
+        Used only to tell two shapes apart when ``visit_state`` is ``None``:
+
+        * a **failed open** — a configuration or capability check refused before any transaction, so
+          there is no task row, no ledger row and no chain artifact. Nothing can be lost by starting
+          over, and the row must not stay permanently unopenable.
+        * an **externally damaged checkpoint** — rows exist but the traversal that owns them is gone.
+          That is the corruption :meth:`_open_backward_pipeline` reports, because guessing here could
+          re-run committed work or reuse a stale artifact.
+
+        A method rather than an inline expression so both built-in stores and third-party visit stores
+        are asked through their public API only.
+        """
+        if self.store.tasks(spec.pipeline_id):
+            return True
+        if self.store.handoffs(pipeline_id=spec.pipeline_id, limit=1):
+            return True
+        return any(
+            artifact.seq >= 0 for artifact in self.store.artifacts(spec.pipeline_id)
+        )
 
     def _control_problem(self, spec: PipelineSpec) -> ConfigError | None:
         """A control-enabled pipeline needs a store that can commit a handoff atomically.
@@ -1860,7 +1919,7 @@ class Runner:
             stored = self.store.commit_control_transition(
                 record, pipeline=state.record, task=state.task_record, attempt=hop.attempt,
                 payload=hop.payload, entry_id=entry_id, target_task=target_task,
-                limit=min(spec.control.max_handoffs, self.config.max_handoffs))
+                limit=self._control_budget_used(spec, spec.control)[1])
         else:
             stored = self.store.commit_handoff(
                 record, task=state.task_record, attempt=hop.attempt, payload=hop.payload,
@@ -2121,6 +2180,21 @@ class Runner:
         return _TaskResult(retry_after=delay, attempts=attempts_used)
 
     # ------------------------------------------------------------------ helpers
+    def _control_budget_used(self, spec: PipelineSpec, plan: ControlPlan) -> tuple[int, int]:
+        """``(consumed, allowed)`` nonterminal transfers for a backward-enabled pipeline.
+
+        The declared ``control.max_handoffs`` and the runtime ``RunConfig.max_handoffs`` ceiling are
+        both caps, so the lower one is the effective limit. Read defensively: a store that lost its
+        traversal state between opening the pipeline and returning a directive is a corrupt checkpoint,
+        and that must be reported as one instead of surfacing as a ``TypeError`` inside the attempt.
+        """
+        traversal = self.store.visit_state(spec.pipeline_id)
+        if traversal is None:
+            raise PyAttackerError(
+                "corrupt visit checkpoint: traversal state is missing for a backward-enabled pipeline"
+            )
+        return traversal["handoffs"], min(plan.max_handoffs, self.config.max_handoffs)
+
     def _handoff_plan(
         self,
         state: _RunState,
@@ -2147,8 +2221,10 @@ class Runner:
             )
         target = plan.allows(state.seq, directive.target, directive.operation)
         if plan.backward_enabled and target is not None:
-            count = self.store.visit_state(spec.pipeline_id)["handoffs"]
-            limit = min(plan.max_handoffs, self.config.max_handoffs)
+            # `target is None` is END, which consumes no transfer (store/visits.py counts only
+            # nonterminal handoffs), so it stays outside this check: a loop whose exit is
+            # `Handoff.end()` still finishes at the declared limit.
+            count, limit = self._control_budget_used(spec, plan)
             if count >= limit:
                 raise FatalError(f"control budget exhausted: consumed {count}, allowed {limit}")
         reused = directive.reuses_input

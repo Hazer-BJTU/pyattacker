@@ -14,6 +14,8 @@ from pyattacker import (
     Handoff,
     HistoryArtifact,
     PipelineBuildError,
+    Pool,
+    Resource,
     Runner,
     pipeline,
     task,
@@ -154,6 +156,162 @@ def test_budget_is_durable_and_cannot_be_reset_by_resume(store):
     assert store.visit_state(spec.pipeline_id)["handoffs"] == 2
     assert [(t.visit, t.attempts_used) for t in store.tasks()] == [(0, 1), (1, 1), (2, 2)]
     assert store.attempts()[-1].outcome == "failed"
+
+
+def test_explicit_fresh_execution_resets_an_exhausted_budget(store):
+    """A failed loop must not be unresumable: `retry_succeeded=True` starts a new budget lifecycle.
+
+    Without the reset, a pipeline that failed *because* it spent its budget replays the same fatal
+    error on every later open -- there is no durable checkpoint left that can make progress -- and
+    the operator has no documented way back short of abandoning the store.
+    """
+    visits = []
+
+    @task("a")
+    def a(value, ctx):
+        visits.append(("a", ctx.visit))
+        return value
+
+    @task("b")
+    def b(value, ctx):
+        visits.append(("b", ctx.visit))
+        # Spend the whole budget on the first pass, then overrun it: the first execution fails, and
+        # only a fresh execution (a new budget plus a new visit) can reach the ordinary return.
+        if ctx.visit in (0, 1):
+            return Handoff.rewind("a", {"x": ctx.visit})
+        return value
+
+    spec = pipeline("escape", a | b, control={"rewind": {"b": ["a"]}, "max_handoffs": 1}).bind({"x": -1})
+    first = run(store, spec)
+    assert first.stats["pipelines"]["by_state"] == {"failed": 1}
+    assert store.visit_state(spec.pipeline_id)["handoffs"] == 1
+    assert "control budget exhausted" in store.get_pipeline(spec.pipeline_id).error_message
+
+    # Plain resume deliberately keeps the consumed budget, so it still cannot progress.
+    assert run(store, spec, resume=True).stats["pipelines"]["by_state"] == {"failed": 1}
+    assert store.visit_state(spec.pipeline_id)["handoffs"] == 1
+
+    visits.clear()
+    fresh = run(store, spec, retry_succeeded=True)
+    assert fresh.stats["pipelines"]["by_state"] == {"succeeded": 1}
+    assert visits == [("a", 2), ("b", 2)]
+    # Counters and audit records survive the reset; only the budget starts a new lifecycle.
+    assert store.visit_state(spec.pipeline_id)["counters"] == {"0": 2, "1": 2}
+    assert store.visit_state(spec.pipeline_id)["handoffs"] == 0
+    assert len(store.handoffs(pipeline_id=spec.pipeline_id)) == 1
+
+
+def test_resumed_visit_run_stats_match_across_stores(store):
+    """`attempts_total` counts attempt rows for the run, in both backends.
+
+    A resumed pending entry is rebound to the new run while keeping the attempts it already consumed
+    (`store/visits.py`'s `commit_entry`), so summing `TaskRecord.attempts_used` over the run's task rows
+    double-counts the earlier run's attempt. MemoryStore used to do exactly that while SqliteStore
+    counted `attempts` rows, which made the same history report two different totals.
+    """
+    fail = {"on": True}
+
+    @task("t")
+    def t(value, ctx):
+        if fail["on"]:
+            raise RuntimeError("dead endpoint")
+        return value
+
+    spec = pipeline("stats", t, control={"retry_all": ["t"], "max_handoffs": 3}).bind({})
+    first = run(store, spec)
+    assert first.stats["pipelines"]["by_state"] == {"failed": 1}
+    fail["on"] = False
+    second = run(store, spec, resume=True)
+    assert second.stats["pipelines"]["by_state"] == {"succeeded": 1}
+
+    stats = store.stats(second.run_id)
+    attempt_rows = store.attempts(run_id=second.run_id)
+    assert stats["attempts_total"] == len(attempt_rows)
+    # The visit kept its consumed attempt numbering even though the row is owned by the new run.
+    assert [t.attempts_used for t in store.tasks(run_id=second.run_id)] == [2]
+
+
+@pytest.mark.parametrize(
+    "bad_open",
+    [
+        {"max_handoffs": 0},          # invalid runtime ceiling, checked before the row exists
+        {},                           # placeholder replaced below by the missing-pool variant
+    ],
+    ids=["bad-ceiling", "missing-pool"],
+)
+def test_failed_backward_open_does_not_poison_the_pipeline(store, bad_open):
+    """A backward pipeline that failed *before its first transaction* must stay runnable.
+
+    `_open_backward_pipeline` used to require a traversal record for any existing row, so an open that
+    failed at a configuration check wrote `state="failed"` with no traversal and every later run --
+    `resume=True` and `retry_succeeded=True` included -- died with "missing traversal state". There was
+    no durable progress to protect, so the row has to be treated as fresh instead of corrupt.
+    """
+    @task("a")
+    def a(value, ctx):
+        return value
+
+    @task("b")
+    def b(value, ctx):
+        return Handoff.rewind("a", {"x": 1}) if ctx.visit == 0 else value
+
+    spec = pipeline("poison", a | b, control={"rewind": {"b": ["a"]}, "max_handoffs": 1}).bind({"x": 0})
+    if bad_open == {}:
+        # A pool the pipeline references but the runner does not provide: the same pre-transaction
+        # failure shape as an invalid ceiling.
+        @task("b", resource="api")
+        def b(value, ctx):  # shadows the declaration above on purpose: this is the resource-bound one
+            return Handoff.rewind("a", {"x": 1}) if ctx.visit == 0 else value
+
+        spec = pipeline("poison", a | b, control={"rewind": {"b": ["a"]}, "max_handoffs": 1}).bind({"x": 0})
+        assert run(store, spec).stats["pipelines"]["by_state"] == {"failed": 1}
+        # Still a real failure while the pool is missing -- and still not reported as corruption.
+        assert run(store, spec).stats["pipelines"]["by_state"] == {"failed": 1}
+        assert "unknown resource pool" in store.get_pipeline(spec.pipeline_id).error_message
+        # Registering the pool is enough to recover: no re-keying, no new store.
+        assert run(store, spec, pools=[Pool("api", [Resource("api-1", capacity=1)])]).stats[
+            "pipelines"
+        ]["by_state"] == {"succeeded": 1}
+        return
+
+    assert run(store, spec, max_handoffs=0).stats["pipelines"]["by_state"] == {"failed": 1}
+    assert store.visit_state(spec.pipeline_id) is None
+    assert store.get_pipeline(spec.pipeline_id).n_tasks_done == 0
+
+    # Nothing durable was ever written, so the next open starts a real traversal instead of
+    # reporting corruption, and the loop runs to completion.
+    assert run(store, spec, max_handoffs=1).stats["pipelines"]["by_state"] == {"succeeded": 1}
+    assert store.visit_state(spec.pipeline_id)["handoffs"] == 1
+
+
+def test_memory_store_finality_and_reset_cover_visit_occurrences(store):
+    """`mark_final`/`reset_pipeline` must treat `_occurrences` exactly like the artifact slots.
+
+    SqliteStore keeps one table, so both operations see visit occurrences automatically; MemoryStore
+    keeps `_artifacts` and `_occurrences` apart, and a mismatch there would make `artifacts()` answer
+    differently per backend (two final artifacts, or removed occurrences that survive a reset).
+    """
+    @task("a")
+    def a(value, ctx):
+        return {"v": ctx.visit}
+
+    @task("b")
+    def b(value, ctx):
+        return Handoff.rewind("a", {"v": 9}) if ctx.visit == 0 else value
+
+    spec = pipeline("divergence", a | b, control={"rewind": {"b": ["a"]}, "max_handoffs": 1}).bind({})
+    assert run(store, spec).stats["pipelines"]["by_state"] == {"succeeded": 1}
+    assert len([art for art in store.artifacts(spec.pipeline_id) if art.is_final]) == 1
+
+    store.mark_final(spec.pipeline_id, -1)  # the seed slot: exactly one final, never two
+    assert [art.id for art in store.artifacts(spec.pipeline_id) if art.is_final] == [
+        f"{spec.pipeline_id}:-1"
+    ]
+
+    record = store.get_pipeline(spec.pipeline_id)
+    store.reset_pipeline(record)
+    remaining = {(art.seq, art.is_final) for art in store.artifacts(spec.pipeline_id)}
+    assert remaining == {(-1, False), (record.n_tasks_total, False)}
 
 
 @pytest.mark.parametrize("operation", ["rewind", "retry_all"])
@@ -704,8 +862,6 @@ def test_backward_guide_examples_execute():
 
 @pytest.mark.parametrize("strict", [False, True])
 def test_backward_transfer_obeys_lease_reclamation(store, strict):
-    from pyattacker import Pool, Resource
-
     pool = Pool("api", [Resource("api-1", capacity=1)])
 
     @task("a", resource="api")

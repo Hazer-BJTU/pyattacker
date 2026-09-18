@@ -271,7 +271,8 @@ with Runner(store=":memory:", concurrency=4) as runner:
   [backward traversal guide](docs/backward.md) for APIs, budgets and recovery boundaries.
 
 The API is one class ([`Handoff`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md#advanced-handoffs-opt-in)),
-one declaration (`control={"edges": {...}}`) and one optional store capability; a custom store that cannot
+one declaration — `control={"edges": {...}}` for forward jumps, `control.rewind` / `control.retry_all` /
+`control.max_handoffs` for backward traversal — and one optional store capability; a custom store that cannot
 commit a handoff atomically is refused up front instead of writing a jump that would not survive a crash.
 Walkthrough: [tutorial step 15](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md#step-15--advanced-skipping-stations-handoffs).
 Model and rules: [design §4.8](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/design.md#48-advanced-handoffs--declared-forward-jumps-opt-in-experimental).
@@ -442,10 +443,11 @@ what they do not say.
 
 | Document | What is in it |
 |---|---|
-| [`docs/tutorial.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md) | fourteen runnable steps, from "one task" to a sharded evaluation; each one executed by the test suite |
+| [`docs/tutorial.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md) | sixteen runnable steps, from "one task" to sharded evaluation and the advanced handoff/backward tiers; each one executed by the test suite |
 | [`docs/reference.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md) | every public class and function: signatures, parameters, examples |
 | [`docs/cli.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/cli.md) | every subcommand, every flag, exit codes, config reference |
 | [`docs/design.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/design.md) | conceptual model, the six invariants, the lease contract, data model, tradeoffs |
+| [`docs/backward.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/backward.md) | the advanced tier: rewinds, retry-all, visits, control budgets, optional payload history |
 | [`docs/benchmark.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/benchmark.md) | the algorithm benchmark: what the scenarios assume, what the metrics mean, how to read the table |
 | [`CHANGELOG.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/CHANGELOG.md) | what changed, release by release |
 | [`docs/releasing.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/releasing.md) | for maintainers: how a release is cut and published |

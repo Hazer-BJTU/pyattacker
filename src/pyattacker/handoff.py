@@ -438,7 +438,15 @@ def build_control(raw: Any, task_names: Sequence[str]) -> ControlPlan:
         return _build_forward(raw, task_names)
     unknown = set(raw) - {"edges", "rewind", "retry_all", "max_handoffs"}
     if unknown:
-        raise PipelineBuildError(f"control: unknown field(s) {sorted(map(str, unknown))}")
+        # Same shape as `_build_forward`'s message: a typo in a backward declaration deserves the same
+        # "available:" hint as a typo in a forward one, and `mode` stays called out because it is the
+        # field people reach for expecting the two directions to be selectable through it.
+        note = (
+            "; v1 has exactly one forward mode, so 'edges' is the only forward key"
+            if "mode" in unknown
+            else "; available: ['edges', 'rewind', 'retry_all', 'max_handoffs']"
+        )
+        raise PipelineBuildError(f"control: unknown field(s) {sorted(map(str, unknown))}{note}")
     names = tuple(task_names)
     forward = _build_forward({"edges": raw["edges"]}, names) if "edges" in raw else ControlPlan(names)
 

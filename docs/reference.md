@@ -385,7 +385,6 @@ control-free pipeline keeps the exact identity (and therefore the pipeline ids, 
 assignment) it had before handoffs existed. Declared edges are digested in their resolved form — seq
 destinations, sorted — so spelling a target as a name or as a seq is the same pipeline.
 
-
 ---
 
 ## Advanced: Handoffs (Opt-In)
@@ -395,7 +394,6 @@ For separately declared backward traversal, see [rewind, retry-all and HistoryAr
 replays the bound seed. `ctx.visit`, visit-qualified task/artifact IDs, exact-ID artifact lookup, finite
 control budgets and optional visit-aware store capabilities are specified there. The forward API below
 retains its v1 behavior and fingerprint.
-
 
 **Advanced tier: opt-in, changes the execution model, not needed for ordinary pipelines, experimental until
 1.0.** A task may *skip ahead* by returning a framework-owned directive instead of a value; the pipeline
@@ -453,7 +451,8 @@ Rules that are worth knowing before you use it:
   how many tasks ran, and skipped slots have no task rows. Do not render it as a completion percentage; the
   handoff count is exposed next to it instead.
 * **Stability.** The guarantees above are the stable part; the spelling (`Handoff`, `control`) may still
-  change before 1.0, and backward/revoke handoffs are a separate, not-yet-implemented feature.
+  change before 1.0. Backward traversal is a *separately declared* opt-in tier rather than part of this
+  forward model — see [rewind, retry-all and payload history](backward.md).
 
 ### What a hop records
 
@@ -539,6 +538,7 @@ Everything that shapes one run. Pass a `RunConfig`, or pass its fields as keywor
 | `write_batch` | `128` | batch size when write-behind is active |
 | `flush_interval` | `1.0` | seconds between flushes |
 | `artifact_backend` | `None` | where payloads live: `None`/`"inline"`, `"file:///path"`, `"null"`, or a spec dict |
+| `max_handoffs` | `1000` | runtime ceiling on nonterminal control transfers in backward-enabled pipelines; the effective limit is `min(control.max_handoffs, this)` (see [backward traversal](backward.md)) |
 | `notes`, `meta` | `""`, `{}` | free-form, recorded on the run |
 
 ```python
@@ -1279,6 +1279,22 @@ lose the original failure before the row was settled. `SqliteStore` and `MemoryS
 `WriteBehindStore` passes it through because it is a state write, not a batched fact. A store without it still
 works: the Runner falls back to `finish_pipeline` (state and cursor, atomically) followed by a cleanup
 `upsert_pipeline`, whose worst case is a settled row that still carries the old failure text.
+
+**`visit_state(pipeline_id)`**, **`reset_visits(record, seed, *, fresh_budget=False)`**,
+**`commit_entry(task)`**, **`commit_visit_attempt(pipeline, task)`**,
+**`commit_visit_success(pipeline, task, attempt, artifact, *, final)`**,
+**`commit_control_transition(record, *, pipeline, task, attempt, payload, entry_id, target_task, limit)`**,
+**`repair_visit_terminal(record)`** and **`get_artifact_by_id(artifact_id)`** are the optional capability
+behind [backward traversal](backward.md), again outside the protocol. `store/visits.py`'s `VisitStore` holds
+the shared transition semantics and both built-in backends derive from it, so a backend supplies one atomic
+write boundary plus its low-level row writes. Each operation is one commit: entry allocation advances the
+per-seq visit counter and records the pending input, ordinary success writes the output occurrence and the
+effective slot together, and a control transition additionally invalidates the active suffix, consumes one
+budget unit and allocates the target entry. `supports_visits(store)` is the probe; it unwraps
+`WriteBehindStore` (which flushes before delegating these operations synchronously) and requires the visit
+methods **plus** `commit_handoff`, `reset_pipeline` and `handoffs`, because a backward transition lands its
+ledger row and source task through that same commit. A store that fails the probe is refused with a
+`ConfigError` when a backward-enabled pipeline is opened, never downgraded to a non-durable loop.
 
 ---
 

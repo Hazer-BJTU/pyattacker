@@ -280,7 +280,7 @@ source: { kind: jsonl, path: data.jsonl, limit: 100, key_field: id, repeats: 1 }
 
 The `run:` block accepts exactly the fields the CLI maps onto `RunConfig`: `store`, `journal`,
 `concurrency`, `label`, `heartbeat_s`, `grace_s`, `stale_after_s`, `strict_leases`,
-`stop_after_failures`, `stop_after_s`, `retry_succeeded`, `seed`, `notes`, `write_behind`,
+`stop_after_failures`, `stop_after_s`, `max_handoffs`, `retry_succeeded`, `seed`, `notes`, `write_behind`,
 `write_batch`, `flush_interval`, `artifact_backend` and `meta`. Anything else is a config error, not a
 quietly ignored line. Precedence is explicit: a flag on the command line wins over the `run:` block,
 which wins over the built-in default.
@@ -331,7 +331,9 @@ A destination is a task name, a task's numeric seq, or `end`, and it must be str
 `end` from the *last* task is refused, because it would have no effect. Every problem is reported as a field
 path — `pipeline.control.edges['judge'][0]: destination 'fetch' (seq 0) is not later than the source
 'judge' (seq 2); v1 handoffs are forward-only` — under `validate` (exit 2) as well as `run`, because both go
-through the same validation entry. `edges` is the only key inside `control`; there is no `mode` in this version.
+through the same validation entry. Within an `edges` block there is no other key and no `mode` in this
+version; backward traversal declares its own `rewind` / `retry_all` / `max_handoffs` keys instead (see
+[Advanced backward control declarations](#advanced-backward-control-declarations)).
 
 Numeric source keys work across YAML, JSON and TOML: JSON/TOML spell seq 0 as the key `"0"`
 (e.g. `"edges": {"0": [2]}`). An exact task name takes precedence over a numeric string. Numeric
@@ -349,14 +351,6 @@ The declarative layer describes **composition and resources only**; the logic st
 Anything it cannot express is a reason to use the SDK, not a reason to add YAML — see
 [`docs/tutorial.md`](tutorial.md) step 11 for where the line falls.
 
-## See also
-
-* [`docs/tutorial.md`](tutorial.md) — the guided path, with runnable programs
-* [`docs/reference.md`](reference.md) — every class and function the SDK exposes
-* [`docs/design.md`](design.md) — why the CLI has these commands and no others
-* [`README.md`](../README.md) — the compact tour
-
-
 ### Advanced backward control declarations
 
 `pipeline.control` also accepts `rewind: {source: [earlier_targets]}`, `retry_all: [sources]` and
@@ -365,3 +359,10 @@ existing forward-only declarations stay unchanged. `run.max_handoffs` sets the r
 1000). Validation shares Python's name/seq resolution and reports configuration field paths. Rewind payloads
 are chosen by task code, not config. See [the backward guide](backward.md) for working Python examples,
 state-history interfaces, budget lifecycle and missing-payload recovery.
+
+## See also
+
+* [`docs/tutorial.md`](tutorial.md) — the guided path, with runnable programs
+* [`docs/reference.md`](reference.md) — every class and function the SDK exposes
+* [`docs/design.md`](design.md) — why the CLI has these commands and no others
+* [`README.md`](../README.md) — the compact tour

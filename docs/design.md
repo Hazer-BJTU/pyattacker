@@ -368,7 +368,6 @@ The forward-only contract below remains the v1 path. Backward-enabled declaratio
 contract in §4.8.8 and [the backward guide](backward.md); forward-only traversal still uses its existing
 ledger/cursor recovery without new identity or budget requirements.
 
-
 Everything above describes an ordinary pipeline: a chain walked one task at a time, each task returning the
 artifact the next one consumes. This section describes the one feature that changes the *traversal* of that
 chain: a step that can tell the rest of the chain no longer needs to run — the answer is good enough, the
@@ -381,9 +380,11 @@ lie). The feature is deliberately fenced off from the rest:
 * **advanced tier** — not because it is hard to call, but because it changes the execution model. It is
   documented under its own heading, released as a minor, and marked *experimental until 1.0*: the guarantees
   below are the stable part, while the spelling (`Handoff`, `control`) may still change;
-* **forward-only** — a handoff may only skip *ahead*. The motivating case for the capability is the opposite
-  one (a validator sends a bad model output **back** to the generator for another sample), and that model is
-  specified in §4.8.7 so that this first version does not foreclose it. It is not implemented here.
+* **forward-only in this model** — a handoff may only skip *ahead*: `control.edges` and `Handoff.to()` never
+  acquire implicit backward semantics. The motivating case for the capability is the opposite direction (a
+  validator sends a bad model output **back** to the generator for another sample). §4.8.7 specifies that
+  model and §4.8.8 implements it as a *separately declared* opt-in tier, so the forward contract described
+  in this section is unchanged rather than extended.
 
 #### 4.8.1 The transport is a return value, not a control-flow exception
 
@@ -529,7 +530,9 @@ silent jump, never a retry), and every declared edge is resolved and range-check
   seq (the error says which seqs matched);
 * a destination must be strictly later than its source (forward-only);
 * `"end"` is a valid destination, except from the last task, where it has no effect and is refused;
-* the block has no unknown keys — `mode` is deliberately absent, because this version has exactly one mode.
+* an `edges` block has no unknown keys — `mode` is deliberately absent, because there is exactly one forward
+  mode. Backward operations are separate keys (`rewind`, `retry_all`, `max_handoffs`), validated by the same
+  entry point and specified in §4.8.8.
 
 Validation is **structural only**. The handoff payload is an arbitrary argument, not the source's normal
 return type, so `source.returns -> target.accepts` is deliberately not checked: it would reject valid
@@ -568,7 +571,7 @@ the way they are, and it is the reason the model below is specified now rather t
 
 | Not included | Why, and what would be needed |
 |---|---|
-| Backward / revoke handoffs | The motivating case for the capability: a validator sends work **back** to the generator. It needs a visit model — `(seq, visit)` identity on tasks and attempts, a durable per-seq counter advanced in the same commit as the entry record, visit-aware RNG (`ctx.seed` is currently `digest(pipeline_id\|seq\|attempt)`, so a revisit would see identical randomness), a loop budget (termination is no longer structural), and progress reporting that does not present a visit count as completion. The record decisions here — the ledger, the entry-artifact address, the atomic commit, the position cursor — were chosen so that model can be added without changing them. |
+| Backward / revoke handoffs | The motivating case for the capability: a validator sends work **back** to the generator. It needs a visit model — `(seq, visit)` identity on tasks and attempts, a durable per-seq counter advanced in the same commit as the entry record, visit-aware RNG (`ctx.seed` is currently `digest(pipeline_id\|seq\|attempt)`, so a revisit would see identical randomness), a loop budget (termination is no longer structural), and progress reporting that does not present a visit count as completion. The record decisions here — the ledger, the entry-artifact address, the atomic commit, the position cursor — were chosen so that model can be added without changing them, and §4.8.8 adds it as a separately declared opt-in tier. |
 | Declared DAGs, joins, fan-in | The chain stays a chain. A handoff is a scheduling statement about one pipeline, not a graph edge. |
 | Cross-pipeline handoffs | Pipelines stay semantically independent; the only shared surface is still the resource pool. |
 | Runtime-invented targets | Edges are declared, so a typed or misspelled target fails loudly instead of silently reshaping the pipeline. |
