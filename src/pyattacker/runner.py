@@ -46,6 +46,7 @@ from .artifact import (
 )
 from .errors import (
     ConfigError,
+    CorruptCheckpoint,
     LeaseLeakError,
     PipelineIdentityConflict,
     PyAttackerError,
@@ -181,6 +182,12 @@ class RunReport:
             ``None`` when every admitted pipeline simply ran to completion.
         store: The store this run used; kept for post-run introspection, not part of the report's
             own data (two reports can legitimately share one store, e.g. across a resume).
+        repair_failures: Pipelines this run could not settle out of a torn terminal state, whose row is
+            deliberately still owned by the earlier run that created it (see
+            ``Runner._settle_terminal_cursor``). Such a row can never appear in ``stats``, which is scoped
+            by ``run_id``, so this run-local counter is what keeps the failure visible to callers — and to
+            the CLI's exit code. Appended after the pre-existing fields so positional construction by
+            callers keeps its meaning.
     """
 
     run_id: str
@@ -193,6 +200,9 @@ class RunReport:
     leases_leaked: int = 0
     stop_reason: str | None = None
     store: Any = None
+    # Appended after every pre-existing public field on purpose: adding it in the middle would silently
+    # reinterpret positional construction by callers (`skipped`, `leases_leaked`, then this).
+    repair_failures: int = 0
 
     # ------------------------------------------------------------------ views
     def to_dict(self) -> dict[str, Any]:
@@ -202,6 +212,7 @@ class RunReport:
             "duration_ms": round(self.duration_ms, 3),
             "skipped": self.skipped,
             "leases_leaked": self.leases_leaked,
+            "repair_failures": self.repair_failures,
             "stop_reason": self.stop_reason,
             **self.stats,
         }
@@ -224,6 +235,11 @@ class RunReport:
         by_name = tasks.get("by_name", {})
         if by_name:
             lines.append("  tasks: " + " ".join(f"{k}={v}" for k, v in sorted(by_name.items())))
+        if self.repair_failures:
+            lines.append(
+                f"  repair failures: {self.repair_failures} pipeline(s) could not be settled out of a "
+                "torn terminal state; their rows keep the original failure and owning run"
+            )
         failed = by_state.get("failed", 0)
         if failed and self.store is not None:
             lines.append(f"  errors ({failed}):")
@@ -600,6 +616,7 @@ class Runner:
             stats=stats,
             skipped=self._counters["skipped"],
             leases_leaked=self._counters["leases_leaked"],
+            repair_failures=self._counters["repair_failures"],
             stop_reason=self._stop_reason,
             store=self.store,
         )
@@ -861,8 +878,9 @@ class Runner:
     def _open_pipeline(self, spec: PipelineSpec, run_id: str) -> _RunState | None:
         """Resolve the checkpoint, register the pipeline row, and return its opening state.
 
-        Returns ``None`` when there is nothing to run: the pipeline already succeeded, or a
-        configuration problem was recorded as a pipeline failure.
+        Returns ``None`` when there is nothing to run: the pipeline already succeeded, a configuration
+        problem was recorded as a pipeline failure, or a torn finalization was settled by
+        :meth:`_settle_terminal_cursor`.
         """
         cfg = self.config
         record = self.store.get_pipeline(spec.pipeline_id)
@@ -884,6 +902,19 @@ class Runner:
             self._check_all_done()
             self._emit("pipeline.skipped", pipeline_id=spec.pipeline_id, data={"reason": "succeeded"})
             return None
+
+        # A cursor at (or past) the end of the chain must never reach the resume rule below, which
+        # would index spec.tasks[cursor] and raise IndexError -- forever, on every later run. Handle
+        # the two shapes explicitly before the ordinary checkpoint branch.
+        if (
+            record is not None
+            and record.state in ("failed", "interrupted")
+            and record.n_tasks_done >= spec.n_tasks
+            and self._settle_terminal_cursor(spec, record, run_id)
+        ):
+            return None
+            # (_settle_terminal_cursor returns False only when the terminal artifact was unusable, in
+            # which case it rewound the row and the ordinary restart-from-zero rule below applies.)
 
         start_index = 0
         value: Any = spec.seed
@@ -973,6 +1004,171 @@ class Runner:
         self._begin_task(state)
         return state
 
+    def _settle_terminal_cursor(
+        self, spec: PipelineSpec, record: PipelineRecord, run_id: str
+    ) -> bool:
+        """Settle a failed/interrupted row whose cursor already reached (or passed) the end.
+
+        Two shapes arrive here, and they are not the same thing:
+
+        * ``n_tasks_done == n_tasks`` — the torn finalization the success path can create: every task is
+          checkpointed, but the terminal write did not land (a store error, or a process killed between
+          the two writes). The artifacts are the truth, so the pipeline is repaired to ``succeeded``
+          rather than run again — and rather than indexing ``spec.tasks[n_tasks]``, which used to raise
+          ``IndexError`` into ``runner.internal_error`` on every later run. The terminal artifact has to
+          pass the same checks an ordinary resumed checkpoint passes: present, payload available, and
+          **decodable**.
+        * ``n_tasks_done > n_tasks`` — not a state the Runner can create. The row is reported as corrupt
+          and is never promoted to success; the cursor is deliberately left untouched as the evidence.
+
+        A repair that fails — in ``mark_final`` or in the terminal settle itself — must never replace the
+        failure that created the torn state: the row is left exactly as it was (state, cursor, owning run
+        and failure fields included) and ``pipeline.terminal_repair_failed`` records the attempt, so a
+        later repair still reports the original provenance. ``mark_final`` is skipped when the artifact is
+        already final, and the terminal transition happens after it, in one write when the store offers
+        ``settle_pipeline``.
+
+        Returns True when the pipeline was settled here (nothing left to run). When the terminal artifact
+        cannot serve as a checkpoint the row is rewound in memory and False is returned, so the ordinary
+        restart-from-zero rule applies with its usual event.
+        """
+        previous = {
+            "previous_state": record.state,
+            "previous_error_type": record.error_type,
+            "previous_error_message": record.error_message,
+            "previous_failed_task": record.failed_task,
+            "previous_run_id": record.run_id,
+            "n_tasks_done": record.n_tasks_done,
+            "n_tasks_total": spec.n_tasks,
+        }
+        if record.n_tasks_done > spec.n_tasks:
+            error = CorruptCheckpoint(
+                f"stored cursor n_tasks_done={record.n_tasks_done} exceeds the {spec.n_tasks} "
+                f"task(s) of pipeline {spec.name!r}; the row is left for inspection"
+            )
+            self._counters["pipelines_failed"] += 1
+            self._counters["pipelines_done"] += 1
+            # Rebind the owning run so the corruption shows up in *this* run's report and exit code,
+            # but keep the cursor: the corrupt value is the evidence. No n_tasks_done=... on purpose.
+            record.run_id = run_id
+            self.store.upsert_pipeline(record)
+            self.store.finish_pipeline(spec.pipeline_id, "failed", error=error)
+            self._check_all_done()
+            self._emit("pipeline.corrupt_cursor", pipeline_id=spec.pipeline_id, data=previous)
+            self._emit(
+                "pipeline.failed",
+                pipeline_id=spec.pipeline_id,
+                data={"error": str(error), "phase": "corrupt_cursor"},
+            )
+            return True
+
+        last = self.store.get_artifact(spec.pipeline_id, spec.n_tasks - 1)
+        if last is None or not last.available:
+            self._emit(
+                "pipeline.checkpoint_missing",
+                pipeline_id=spec.pipeline_id,
+                data={
+                    "reason": "the terminal artifact is gone or its payload was not kept; "
+                    "rerunning the whole pipeline",
+                    **previous,
+                },
+            )
+            record.n_tasks_done = 0  # the ordinary branch below restarts from the seed
+            return False
+        try:
+            self.registry.load(last.encoded())
+        except Exception as exc:
+            # `available` only means the bytes are there. A payload that no longer decodes is not a
+            # checkpoint: marking it final would hand consumers a value they cannot restore, so the
+            # pipeline restarts instead, with the cause kept distinct from a dropped payload.
+            self._emit(
+                "pipeline.checkpoint_unusable",
+                pipeline_id=spec.pipeline_id,
+                data={"error": str(exc), **previous},
+            )
+            record.n_tasks_done = 0
+            return False
+
+        # The whole finalization is one controlled recovery operation. A failure in *any* step of it has
+        # to stay here: the pipeline row is the only place the original failure is recorded, and letting
+        # the exception escape into the worker's internal-error path would rewrite that row with the
+        # repair's own error — destroying exactly what the repair exists to preserve. The row is left
+        # untouched (state, cursor, owning run and failure fields, all of them), and the failed attempt is
+        # recorded as an event instead. `mark_final` is skipped when the artifact is already final, and is
+        # documented as idempotent for the crash case where that cannot be observed.
+        phase = "mark_final"
+        try:
+            if not last.is_final:
+                self.store.mark_final(spec.pipeline_id, last.seq)
+            phase = "settle"
+            self._settle_succeeded(spec, run_id)
+        except Exception as exc:
+            # `pipelines_failed` keeps the run-level budgets honest; `repair_failures` is what makes the
+            # failure visible at the API/CLI boundary, because this row stays owned by the earlier run and
+            # therefore never appears in this run's run-scoped stats.
+            self._counters["pipelines_failed"] += 1
+            self._counters["repair_failures"] += 1
+            self._counters["pipelines_done"] += 1
+            self._check_all_done()
+            self._emit(
+                "pipeline.terminal_repair_failed",
+                pipeline_id=spec.pipeline_id,
+                data={**previous, "error": f"{type(exc).__name__}: {exc}", "phase": phase},
+            )
+            return True
+
+        self._counters["pipelines_succeeded"] += 1
+        self._counters["pipelines_done"] += 1
+        self._check_all_done()
+        self._emit(
+            "pipeline.terminal_repaired",
+            pipeline_id=spec.pipeline_id,
+            data={**previous, "artifact": last.id, "artifact_seq": last.seq},
+        )
+        self._emit(
+            "pipeline.succeeded",
+            pipeline_id=spec.pipeline_id,
+            data={"tasks": spec.n_tasks, "resumed_from": None, "repaired": True},
+        )
+        return True
+
+    def _settle_succeeded(self, spec: PipelineSpec, run_id: str) -> None:
+        """Make a repaired terminal state durable: one write when the store can, two ordered ones when not.
+
+        ``settle_pipeline`` is the optional capability documented in ``store/base.py``. Without it the
+        fallback writes the terminal transition first and the metadata cleanup second, and the two steps are
+        classified differently on purpose, because they leave the row in different states:
+
+        * a **terminal transition** failure propagates to the caller, which records a repair failure: the
+          row is still the repairable one and a later run can try again;
+        * a **cleanup** failure does not: the row is already durably ``succeeded``, so the pipeline *is*
+          repaired and only its failure metadata is stale. Because a succeeded row is skipped forever, no
+          later run can retry that cleanup — which is exactly why it must not be counted as a failed
+          repair. It is reported as ``pipeline.terminal_cleanup_failed`` instead, and the stale fields are
+          the documented degraded guarantee of a store without ``settle_pipeline``.
+        """
+        settle = getattr(self.store, "settle_pipeline", None)
+        if callable(settle):
+            settle(spec.pipeline_id, state="succeeded", n_tasks_done=spec.n_tasks, run_id=run_id)
+            return
+        self.store.finish_pipeline(spec.pipeline_id, "succeeded", n_tasks_done=spec.n_tasks)
+        try:
+            record = self.store.get_pipeline(spec.pipeline_id)
+            if record is not None:
+                record.run_id = run_id
+                record.error_type = record.error_message = record.traceback = record.failed_task = None
+                self.store.upsert_pipeline(record)
+        except Exception as exc:
+            self._emit(
+                "pipeline.terminal_cleanup_failed",
+                pipeline_id=spec.pipeline_id,
+                data={
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "note": "the pipeline is durably succeeded; only its failure metadata could not be "
+                    "cleared (a store without settle_pipeline does this in a second write)",
+                },
+            )
+
     def _begin_task(self, state: _RunState) -> None:
         """Open the state's current task: resolve its algorithm and record a ``running`` row.
 
@@ -1050,13 +1246,18 @@ class Runner:
 
             # ★ task-level checkpoint: the artifact is already durable, now advance the cursor
             state.record.n_tasks_done = state.seq + 1
-            self.store.upsert_pipeline(state.record)
             if state.seq + 1 >= state.spec.n_tasks:
+                # Finality first, terminal state second. The reverse order has a window in which a
+                # crash leaves a permanently `succeeded` row whose final artifact was never marked --
+                # and because a succeeded row is skipped forever, nothing would ever repair it. This
+                # order's worst case is the documented at-least-once boundary: the final task runs
+                # again. The cursor advance travels with finish_pipeline, so the row is never durably
+                # `running` with cursor == n_tasks either.
+                if outcome.artifact is not None:
+                    self.store.mark_final(state.pipeline_id, outcome.artifact.seq)
                 self.store.finish_pipeline(
                     state.pipeline_id, "succeeded", n_tasks_done=state.spec.n_tasks
                 )
-                if outcome.artifact is not None:
-                    self.store.mark_final(state.pipeline_id, outcome.artifact.seq)
                 self._counters["pipelines_succeeded"] += 1
                 self._counters["pipelines_done"] += 1
                 self._check_all_done()
@@ -1066,6 +1267,8 @@ class Runner:
                     data={"tasks": state.spec.n_tasks, "resumed_from": state.start_index},
                 )
                 return
+            # Intermediate checkpoint: written on its own so a crash mid-pipeline keeps the cursor.
+            self.store.upsert_pipeline(state.record)
             state.value = outcome.value
             state.artifact = outcome.artifact
             state.seq += 1

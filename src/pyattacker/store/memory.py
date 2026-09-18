@@ -94,6 +94,19 @@ class MemoryStore:
             record.traceback = traceback
             record.failed_task = failed_task
 
+    def settle_pipeline(
+        self, pipeline_id: str, *, state: str, n_tasks_done: int, run_id: str
+    ) -> None:
+        """Terminal settle in one step (see ``store/base.py``): no torn intermediate row."""
+        record = self._pipelines.get(pipeline_id)
+        if record is None:
+            return
+        record.state = state
+        record.n_tasks_done = n_tasks_done
+        record.run_id = run_id
+        record.finished_at = time.time()
+        record.error_type = record.error_message = record.traceback = record.failed_task = None
+
     def interrupt_stale(self, *, stale_after_s: float = 30.0, keep_run_id: str | None = None) -> int:
         now = time.time()
         count = 0

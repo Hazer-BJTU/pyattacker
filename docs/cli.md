@@ -13,11 +13,16 @@ Everything here is also reachable as `python -m pyattacker ...`. The commands sp
 | Code | Meaning |
 |---|---|
 | `0` | every pipeline succeeded (or was skipped as already done) |
-| `1` | the run finished but some pipelines failed |
+| `1` | the run finished but some pipelines failed, or this run could not repair one (`repair_failures`) |
 | `2` | configuration error — nothing ran |
 | `130` | interrupted (SIGINT); parked and in-flight pipelines are recorded as resumable |
 
 `2` means "fix the config"; `1` means "read the report". A `130` run is always safe to `resume`.
+
+The `1` case covers two different things, and the report says which: a pipeline that reached a failed
+terminal state during this run (counted in `pipelines.by_state`), and a pipeline this run could not settle
+out of a torn terminal state — `repair_failures` in the report (and in `--summary-format json`), because its
+row deliberately keeps the original failure and the run that produced it.
 
 ---
 

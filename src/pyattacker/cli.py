@@ -166,7 +166,11 @@ def _cmd_run(args: argparse.Namespace, *, resume: bool = False) -> int:
     if report.status == "interrupted":
         print("Re-run the same command with --resume to continue: unfinished tasks resume from their checkpoint", file=sys.stderr)
         return 130
-    return 1 if failed else 0
+    # `repair_failures` is run-local on purpose: a pipeline this run could not settle out of a torn
+    # terminal state keeps the row (and therefore the run_id) of the run that created it, so it can never
+    # appear in the run-scoped by_state above. Without this term the command would exit 0 after a failed
+    # repair, which is the silent-success shape this whole path exists to remove.
+    return 1 if failed or report.repair_failures else 0
 
 
 # ------------------------------------------------------------------- shards

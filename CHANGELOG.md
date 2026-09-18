@@ -6,6 +6,36 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+* **A pipeline whose cursor already reached the end can be resumed again.** The success path advanced the
+  checkpoint cursor and wrote the terminal state as two separate store calls, so a store failure in the
+  final write (or a kill between the two) could leave a `failed`/`interrupted` row with
+  `n_tasks_done == n_tasks_total`. Every later run then raised `IndexError: tuple index out of range` inside
+  `_open_pipeline`, surfaced only as `runner.internal_error`, while overwriting the row's original failure
+  with the framework's own crash. Such a row is now settled as completed: the last artifact is verified the
+  same way an ordinary resumed checkpoint is (present, payload kept, decodable), marked final, and the
+  pipeline is recorded `succeeded` without re-running a task, with `pipeline.terminal_repaired` carrying the
+  previous state, error and run. A cursor *past* the end is not a state the Runner can create: it is recorded
+  as `CorruptCheckpoint` and reported as `pipeline.corrupt_cursor` instead of being promoted to success, and
+  the stored value is left as the evidence; an artifact that is missing, payload-less or undecodable falls
+  back to the documented restart-from-zero rule (`pipeline.checkpoint_missing` /
+  `pipeline.checkpoint_unusable`). The repair never destroys the failure it is repairing before the outcome is
+  durable — `mark_final` runs first, the terminal transition (state, cursor, owning run, cleared failure
+  fields) is a single write where the store offers the optional `settle_pipeline` capability, and a repair
+  that fails in **either** step — marking the artifact final or settling the row — leaves the row untouched
+  (original failure and owning run included) and records `pipeline.terminal_repair_failed` with the phase,
+  so the next attempt still reports the original cause instead of the repair's own error. `mark_final` is
+  now contractually idempotent and is skipped when the artifact is already final. Because such a row keeps
+  its original owner, the failed repair is counted in the new `RunReport.repair_failures` (surfaced by
+  `summary()`, `to_dict()` and the CLI exit code) instead of silently leaving the run looking successful;
+  and on the two-write fallback for stores without `settle_pipeline`, a failed metadata cleanup after a
+  durable `succeeded` is reported as `pipeline.terminal_cleanup_failed` rather than as a failed repair. The final task now also marks its artifact final **before**
+  committing the terminal state and advances the cursor in that same call, so a crash in between re-runs the
+  final task (the documented at-least-once boundary) rather than leaving a `succeeded` pipeline whose final
+  artifact was never marked — a state no later run could repair, because a succeeded pipeline is skipped
+  forever.
+
 ## [0.2.0] — 2026-09-17
 
 ### Added

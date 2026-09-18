@@ -12,12 +12,14 @@ Coverage
 from __future__ import annotations
 
 import json
+import sqlite3
 import textwrap
 from pathlib import Path
 from typing import ClassVar
 
 import pytest
 
+from pyattacker import SqliteStore
 from pyattacker.cli import main
 
 # demo is deliberately given a failure probability: by the exit code convention demo is always 0 (it is only a demo),
@@ -783,3 +785,85 @@ def test_invalid_configs_are_refused_before_anything_runs(tmp_path, capsys, conf
     assert not db.exists()
     assert not (tmp_path / "invalid.shard0of2.db").exists()
 
+
+
+# ------------------------------------------------- terminal-repair failure visibility
+# JSON on purpose: this test must run in the bare install too, where the `yaml` extra is absent.
+REPAIR_CONFIG = json.dumps(
+    {
+        "pools": {
+            "apis": {
+                "kind": "llm",
+                "capacity": 2,
+                "algorithm": "backoff",
+                "resources": [{"id": "api-1", "options": {"model": "gpt-4o"}}],
+            }
+        },
+        "pipeline": {"name": "cli-repair", "resource": "apis", "tasks": [{"use": "echo"}]},
+        "run": {"concurrency": 2, "label": "cli-repair"},
+    }
+)
+
+
+class _FailingSettleStore(SqliteStore):
+    """A store whose terminal settle keeps failing, like a disk that stays full."""
+
+    def settle_pipeline(self, pipeline_id, *, state, n_tasks_done, run_id):  # type: ignore[override]
+        raise RuntimeError("injected store failure while settling the terminal row")
+
+
+def _failing_open_store(spec, **kwargs):
+    return _FailingSettleStore(
+        str(spec), journal=kwargs.get("journal", "full"), backend=kwargs.get("backend")
+    )
+
+
+def _poison_terminal_row(db: Path) -> str:
+    """Leave the `failed` + cursor == n_tasks row a failed final write creates, owned by an old run."""
+    store = SqliteStore(str(db))
+    pid = store.pipelines()[0].pipeline_id
+    total = store.get_pipeline(pid).n_tasks_total
+    store.close()
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE pipelines SET state='failed', n_tasks_done=?, run_id='run-original', "
+            "error_type='RuntimeError', error_message='original torn finalization', failed_task='mock.echo' "
+            "WHERE pipeline_id=?",
+            (total, pid),
+        )
+    return pid
+
+
+def test_a_failed_terminal_repair_is_visible_to_the_caller_and_exits_non_zero(
+    tmp_path, monkeypatch, capsys
+):
+    """The row keeps its original failure, but the run must not be able to look successful."""
+    db = tmp_path / "repair.db"
+    cfg = _write_config(tmp_path, "repair.json", REPAIR_CONFIG)
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 0
+    pid = _poison_terminal_row(db)
+
+    monkeypatch.setattr("pyattacker.runner.open_store", _failing_open_store)
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 1
+
+    out = capsys.readouterr().out
+    assert "repair failures: 1" in out
+    store = SqliteStore(str(db))
+    row = store.get_pipeline(pid)
+    # storage provenance is untouched: the row still describes the original failure and owning run
+    assert (row.state, row.error_type, row.failed_task, row.run_id) == (
+        "failed",
+        "RuntimeError",
+        "mock.echo",
+        "run-original",
+    )
+    assert row.error_message == "original torn finalization"
+    assert "pipeline.terminal_repair_failed" in [e.kind for e in store.events(pipeline_id=pid, limit=50)]
+    store.close()
+
+    # and the machine-readable summary carries the run-local count too
+    assert main(["run", "-c", str(cfg), "--store", str(db), "--summary-format", "json"]) == 1
+    # the JSON summary is the last line of stdout (the run may have warned before it)
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["repair_failures"] == 1
+    assert payload["pipelines"]["by_state"] == {}

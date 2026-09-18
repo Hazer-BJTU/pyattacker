@@ -279,7 +279,15 @@ class Store(Protocol):
     def put_artifact(self, artifact: Artifact) -> Artifact: ...
 
     def mark_final(self, pipeline_id: str, seq: int) -> None:
-        """Mark the last artifact of a pipeline as the final output."""
+        """Mark the last artifact of a pipeline as the final output.
+
+        **Idempotent by contract**: marking an artifact that is already final succeeds and performs no
+        further side effect. Crash recovery can re-enter this call — a terminal repair that marked the
+        artifact and died before settling the row, or a kill between the two final writes — so a store
+        whose implementation is not repeatable would turn a recoverable crash into a permanent
+        inconsistency. The built-ins satisfy it with a plain ``UPDATE``/replacement; a custom store needs
+        to as well.
+        """
         ...
 
     def get_artifact(self, pipeline_id: str, seq: int) -> Artifact | None: ...
@@ -312,6 +320,15 @@ class Store(Protocol):
     # ``open_store`` would then mistreat the live object as an unresolved path/URI spec. All
     # built-in backends (``MemoryStore``, ``SqliteStore``, ``WriteBehindStore``) implement it;
     # callers that want it should check with ``getattr(store, "resources", None)``.
+
+    # ``settle_pipeline(pipeline_id, *, state, n_tasks_done, run_id)`` is an optional capability in the
+    # same spirit: one write that moves a row to its terminal state, rebinds the owning run and clears
+    # the failure fields together, so the terminal-cursor repair (``Runner._settle_terminal_cursor``)
+    # cannot leave a torn row — one that has lost its original failure but is not yet settled. Both
+    # built-in backends implement it, and ``WriteBehindStore`` exposes it by passthrough because it is
+    # a state write, not a batched fact. A store without it still works: the Runner falls back to
+    # ``finish_pipeline`` (state + cursor, atomically) followed by a cleanup ``upsert_pipeline``, which
+    # can at worst leave a settled row with stale failure metadata, never a lost failure cause.
 
     def pipelines(
         self, *, run_id: str | None = None, state: str | None = None, limit: int | None = None

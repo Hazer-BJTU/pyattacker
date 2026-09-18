@@ -113,7 +113,15 @@ After each task succeeds, three things happen in order:
 
 1. `store.put_artifact(...)` — the artifact is persisted (content-addressed + deduplicated);
 2. `store.record_task(...)` — the task's final state along with duration, error, and leases used;
-3. `store.upsert_pipeline(record.n_tasks_done = seq + 1)` — **advances the checkpoint cursor**.
+3. the checkpoint cursor advances — `store.upsert_pipeline(record.n_tasks_done = seq + 1)` for an
+   intermediate task, or the terminal `store.finish_pipeline(..., n_tasks_done = n_tasks)` for the last one.
+
+For the last task the order is **finality, then terminal state**: `mark_final` runs before `finish_pipeline`,
+and the cursor advance travels *with* `finish_pipeline` rather than being written on its own. Both orderings
+matter, and each covers a torn write the other cannot repair: a crash after the terminal write but before
+`mark_final` would leave a permanently `succeeded` pipeline (skipped forever) whose final artifact was never
+marked, whereas a crash before the terminal write only costs a re-run of the final task — the documented
+at-least-once boundary.
 
 The recovery algorithm (`Runner._open_pipeline` / `Runner._drive`):
 
@@ -123,6 +131,17 @@ resume(spec):
     if rec exists and (rec.spec_digest != spec.spec_digest or rec.seed_digest != spec.seed_digest):
         → PipelineIdentityConflict; preserve existing pipeline and checkpoint
     if rec.state == succeeded and not retry_succeeded:  → skip (counted as skipped)
+    if rec.state in (failed, interrupted) and rec.n_tasks_done >= n_tasks:
+        if rec.n_tasks_done > n_tasks:    # not a state the Runner can create
+            → record CorruptCheckpoint, emit pipeline.corrupt_cursor, leave the cursor as evidence
+        elif artifact(n_tasks - 1) is available and decodes:
+            → mark_final first when the artifact is not already final (idempotent either way, and nothing
+              has been destroyed at this point), then settle the terminal row in one write — state=succeeded,
+              cursor=n_tasks, run_id=current, failure fields cleared — and emit pipeline.terminal_repaired
+              carrying the previous state/error/run. Nothing is rerun.
+        else:
+            → start = 0   # payload dropped (checkpoint_missing) or undecodable (checkpoint_unusable);
+                          # the ordinary restart rule below applies
     start = 0
     if rec.state in (failed, interrupted) and rec.n_tasks_done > 0:
         prev = store.get_artifact(pid, rec.n_tasks_done - 1)
@@ -130,6 +149,23 @@ resume(spec):
         else:               start = 0   # journal=summary stores no payload → the whole pipeline must be rerun (an event is left behind)
     for seq in range(start, n_tasks):  ...
 ```
+
+A failure in **either** step of that finalization — the finality mark or the terminal settle — is contained
+by the recovery path: the row is left exactly as it was (original failure, cursor, owning run), and
+`pipeline.terminal_repair_failed` records the attempt with its phase, so a later run still reports the
+original cause instead of the repair's own error. Letting such an exception escape into the worker's
+generic internal-error path would rewrite the row with that error and destroy the provenance the repair
+exists to preserve, which is why the whole finalization is one controlled operation. The same reasoning is
+why the terminal transition (state, cursor, owning run, failure fields) is a single store write when the
+store offers `settle_pipeline`, and why `mark_final` is skipped when the artifact is already final — and
+documented as idempotent for the crash case where that cannot be observed.
+
+Because that row keeps its original owner, the failure cannot appear in the repairing run's run-scoped
+statistics; it is counted in `RunReport.repair_failures`, which the CLI exit code and the summary both use,
+so a failed repair can never be reported as a clean run. The two-write fallback for stores without
+`settle_pipeline` classifies its steps separately: a failed terminal transition is a failed repair (above),
+while a failed metadata cleanup is not — the row is already durably `succeeded`, and the stale failure text
+is that store's documented degraded guarantee, reported as `pipeline.terminal_cleanup_failed`.
 
 The key payoff: **if task C fails, only task C needs to be rerun, and task B's request is not re-sent**; and
 because the seed artifact is persisted too, **recovery does not depend on the original dataset file**.
