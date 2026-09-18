@@ -7,6 +7,8 @@
 [![Python](https://img.shields.io/pypi/pyversions/pyattacker)](https://pypi.org/project/pyattacker/)
 [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/Hazer-BJTU/pyattacker/blob/main/LICENSE)
 
+**English** | [简体中文](README.zh-CN.md)
+
 > Run tens of thousands of independent tasks to completion — resumably, observably, and without
 > reimplementing endpoint pools, retries and "which rows already ran" for the fifth time.
 
@@ -451,6 +453,7 @@ what they do not say.
 | [`docs/benchmark.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/benchmark.md) | the algorithm benchmark: what the scenarios assume, what the metrics mean, how to read the table |
 | [`CHANGELOG.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/CHANGELOG.md) | what changed, release by release |
 | [`docs/releasing.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/releasing.md) | for maintainers: how a release is cut and published |
+| [`docs/zh-CN/`](https://github.com/Hazer-BJTU/pyattacker/tree/main/docs/zh-CN) | 简体中文: the same documents, with code blocks that `tests/test_docs_i18n.py` keeps byte-identical to these |
 
 ## Examples
 

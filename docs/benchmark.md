@@ -1,5 +1,7 @@
 # Benchmarking Acquire Algorithms
 
+**English** | [简体中文](zh-CN/benchmark.md)
+
 `pyattacker.benchmark` simulates an API provider and runs the library's real acquire algorithms
 against it. It answers one question: **which acquire algorithm should this workload use?** A scenario
 is the input, a metrics vector the output, and a result is reproducible from a scenario name, a seed

@@ -85,6 +85,10 @@ include = [
     "docs",
     "examples",
     "README.md",
+    # The Chinese README is part of the documentation set the tests verify: test_docs_i18n.py checks
+    # that every document in its PAIRS table has a Chinese counterpart, and an sdist that ships the
+    # tests but not this file would fail its own suite.
+    "README.zh-CN.md",
     "CHANGELOG.md",
     "LICENSE",
     "pyproject.toml",

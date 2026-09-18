@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+* **Simplified Chinese documentation, kept in sync by CI.** `README.zh-CN.md` and `docs/zh-CN/` mirror the
+  README, every document in `docs/` (tutorial, reference, design, CLI, benchmark, backward traversal,
+  releasing) and the two example READMEs, and each pair carries a language switcher. The translation is
+  structural: fenced code blocks are byte-identical to the English ones — so the tests that execute the
+  English tutorial, README and CLI examples cover the Chinese documents too — and
+  `tests/test_docs_i18n.py` fails when a code block, a heading level, a language switcher or a relative
+  link drifts out of sync. Prose quality stays a review question; the machine checks the parts that rot.
+
 * **Advanced backward traversal (opt-in, experimental):** `Handoff.rewind(target, value)` uses
   author-selected state; `Handoff.retry_all()` replays immutable bound seed bytes. Separate declarations
   require finite control budgets. Visit-aware atomic stores retain task/attempt/artifact occurrences,

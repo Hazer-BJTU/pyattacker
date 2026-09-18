@@ -1,5 +1,7 @@
 # Example plugin package
 
+**English** | [简体中文](README.zh-CN.md)
+
 A minimal, complete third-party plugin: two tasks (one plain, one factory), an acquisition
 algorithm and a codec — each published through a `pyattacker.*` entry-point group.
 

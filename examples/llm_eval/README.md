@@ -1,5 +1,7 @@
 # Example: an LLM evaluation, in two pipeline shapes
 
+**English** | [简体中文](README.zh-CN.md)
+
 A worked example of the thing these frameworks get rewritten for: score model answers with several
 judges, keep a usable record of every request, and survive failures without paying for them twice.
 

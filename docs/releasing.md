@@ -1,5 +1,7 @@
 # Releasing
 
+**English** | [简体中文](zh-CN/releasing.md)
+
 Written for maintainers with push access. Publishing is automated: you push a tag, and
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) does the rest.
 

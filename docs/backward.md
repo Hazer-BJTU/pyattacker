@@ -1,5 +1,7 @@
 # Advanced: backward traversal and payload history
 
+**English** | [简体中文](zh-CN/backward.md)
+
 Backward traversal is opt-in and experimental until 1.0. It keeps the same pipeline identity,
 resource pools and dataset row, but permits declared revisits. Ordinary pipelines and forward-only
 control declarations keep their previous IDs, digests and behavior.
@@ -169,7 +171,7 @@ and visit-qualified audit rows (tasks, attempts, artifacts, visits) are kept, so
 addressable, and a store whose traversal was lost has its counters rebuilt from those rows. It applies to
 forward pipelines too, where it means "ignore the checkpoint, run the chain again": there the append-only
 history survives as well, but task and chain-artifact addresses are reused by design rather than kept as
-separate occurrences (the [reference](reference.md#recovery) spells that difference out). Combine it with
+separate occurrences (the [reference](reference.md#tables-and-readers) spells that difference out). Combine it with
 `retry_succeeded=True` to restart a pipeline that already succeeded. A fresh start emits
 `pipeline.restarted` (with the discarded cursor), not `pipeline.checkpoint_missing`: nothing was lost.
 
