@@ -15,6 +15,15 @@ All notable changes to this project are documented here. The format follows
   `raw.githubusercontent.com` URL, so the PyPI description is unaffected; the tarball is back to 439 KB.
   Both `ci.yml` and `release.yml` now fail the build if the sdist grows past 1 MiB, and
   `tests/test_packaging.py` fails if a README image ever points into the checkout again.
+* **A release goes through TestPyPI before it reaches PyPI.** The scratch-index upload was a rehearsal a
+  maintainer had to opt into, and the `v0.2.0` tag skipped it — so the files PyPI received were the first copy
+  of that version any index had ever served. Every tag now publishes to TestPyPI, installs those files back by
+  name into a clean environment, asserts that the installed CLI reports the version being released, and only
+  then uploads to PyPI. The check is a job of its own with no OIDC token, so the job that holds a credential
+  that can publish does nothing else, and `pypi` now depends on it. A dispatched run still rehearses when
+  *Publish to TestPyPI* is checked and stops before both uploads otherwise. `docs/releasing.md` records the
+  consequence this makes load-bearing: a filename an index has seen can never be uploaded again, so a commit
+  after a rehearsal means a new version number, not a re-run.
 
 ### Fixed
 
