@@ -73,11 +73,16 @@ packages = ["src/pyattacker"]
 # An sdist should be able to rebuild and verify the package, so tests, docs and examples belong in
 # it. Local tooling state does not: .claude/ is untracked editor config, and shipping it in a
 # release leaks whatever a contributor happens to have configured locally.
+#
+# assets/ is deliberately absent. The README loads its banner over an absolute
+# raw.githubusercontent.com URL, so nothing that unpacks this sdist needs the images, and the two
+# logo files were 883 KB of pyattacker-0.2.0.tar.gz's 1.26 MB: PNG barely compresses, so most of a
+# file whose purpose is to be rebuilt and tested was branding. Both workflows cap the sdist at
+# 1 MiB, so putting a binary back in this list fails the build rather than a download.
 include = [
     "src/pyattacker",
     "tests",
     "docs",
-    "assets",
     "examples",
     "README.md",
     "CHANGELOG.md",

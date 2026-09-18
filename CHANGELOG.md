@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+* **The sdist no longer ships the branding images.** `assets/` was in the sdist include list, and PNG
+  barely compresses, so the two logo files were 883 KB of the 1.26 MB `pyattacker-0.2.0.tar.gz` that PyPI
+  serves — two thirds of the download for an archive whose purpose is to be rebuilt and tested. Nothing
+  that unpacks an sdist needs them, and the README loads its banner over an absolute
+  `raw.githubusercontent.com` URL, so the PyPI description is unaffected; the tarball is back to 439 KB.
+  Both `ci.yml` and `release.yml` now fail the build if the sdist grows past 1 MiB, and
+  `tests/test_packaging.py` fails if a README image ever points into the checkout again.
+
 ### Fixed
 
 * **A worker that dies outside its own handlers no longer hangs the run.** Run completion was tracked purely

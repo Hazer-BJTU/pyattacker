@@ -110,6 +110,7 @@ than trusting that it did:
 | tag matches `__version__` | a tag that disagrees produces a release nobody can find again |
 | `twine check --strict` | the README has to render on PyPI, where relative links do not resolve |
 | sdist carries no `.claude/`, `.venv/`, `.pyc` | this caught a leaked local config file in 0.1.0 |
+| sdist stays under 1 MiB | `assets/` put 883 KB of logo PNG into a 1.26 MB tarball, which 0.2.0 published |
 | sdist alone rebuilds and passes its tests | an sdist that cannot rebuild the package is not a source distribution |
 | wheel installs and `pyattacker demo` runs | catches a broken entry point or a missing module |
 
