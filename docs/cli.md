@@ -139,7 +139,9 @@ pyattacker report STORE [STORE ...] [--run-id ID] [--errors N] [--json] [--artif
 Several stores are merged into one coherent view: de-duplicated by `pipeline_id` (best state wins, latest
 finish breaks ties) with statistics recomputed from the merged rows, and it tells you how many rows it folded.
 `--errors N` prints the first N failures with their error class. `--json` gives you the same numbers as an
-object.
+object. A run that recorded handoffs says so in its summary line (`... attempts: total=12 handoffs=2`), and
+`--rows pipelines` on `export` carries the ledger itself (see
+[advanced: handoffs](reference.md#advanced-handoffs-opt-in)).
 
 ## `watch` — live monitoring
 
@@ -149,7 +151,9 @@ pyattacker watch STORE [--run-id ID] [--interval S] [--iterations N] [--no-clear
 
 A read-only connection to the same SQLite file, so it runs beside a live run (WAL allows one writer and many
 readers). Shows the pipeline state distribution, latency percentiles, per-pool `active/capacity`,
-`ready/degraded/dead`, how many pipelines are waiting or parked, and recent errors. `--iterations N` makes it
+`ready/degraded/dead`, how many pipelines are waiting or parked, and recent errors. A run with handoffs also
+shows `handoffs=N` (commits in the selected scope, all history without a run filter; a resume may reuse earlier active handoffs) on its attempts line — on a control-enabled pipeline the cursor is a position, not a
+progress count, so that number is what explains a short task list. `--iterations N` makes it
 exit on its own, which is what you want in a script.
 
 ## `export` — records out
@@ -302,6 +306,44 @@ the entry does not mention keeps whatever the target declares (its own `resource
 
 `${VAR}` is expanded from the environment (see `--strict-env`). `source.kind` is `jsonl` or `range`;
 `repeats: k` is pass@k — k independent pipelines per seed. CLI flags override the `run:` block.
+
+### `pipeline.control` — advanced, opt-in handoffs
+
+A config may also declare which task is allowed to **hand off** (skip ahead) by returning a
+[`Handoff`](reference.md#advanced-handoffs-opt-in), so the same pipeline can be expressed declaratively:
+
+```yaml
+pipeline:
+  name: qa_eval
+  control:
+    edges:
+      judge: [report, end]   # judge may continue at report, or finish the pipeline
+      ask: [report]
+  tasks:
+    - { use: pyattacker.tasks:echo, name: fetch }
+    - { use: my_pkg.tasks:ask_model, name: ask, resource: apis }
+    - { use: my_pkg.tasks:judge, name: judge }
+    - { use: my_pkg.tasks:report, name: report }
+```
+
+A destination is a task name, a task's numeric seq, or `end`, and it must be strictly later than its source
+(this version is forward-only). A name that appears twice in the chain must be given as a seq. Declaring
+`end` from the *last* task is refused, because it would have no effect. Every problem is reported as a field
+path — `pipeline.control.edges['judge'][0]: destination 'fetch' (seq 0) is not later than the source
+'judge' (seq 2); v1 handoffs are forward-only` — under `validate` (exit 2) as well as `run`, because both go
+through the same validation entry. `edges` is the only key inside `control`; there is no `mode` in this version.
+
+Numeric source keys work across YAML, JSON and TOML: JSON/TOML spell seq 0 as the key `"0"`
+(e.g. `"edges": {"0": [2]}`). An exact task name takes precedence over a numeric string. Numeric
+destinations remain integers. Declaring the same source twice through a name and a seq is an error,
+rather than silently replacing one list. Effective configuration uses numeric seqs for repeated or
+reserved (`end`) names instead of inventing a `name#N` syntax.
+
+The feature is **advanced**: it changes the execution model, so it is opt-in, marked experimental until 1.0,
+and needs a store that can commit a handoff atomically (both built-in backends can). Pipelines without the
+block are unaffected in every respect. See
+[reference → advanced: handoffs](reference.md#advanced-handoffs-opt-in) for the API and
+[design §4.8](design.md#48-advanced-handoffs--declared-forward-jumps-opt-in-experimental) for the model.
 
 The declarative layer describes **composition and resources only**; the logic stays in Python behind `use:`.
 Anything it cannot express is a reason to use the SDK, not a reason to add YAML — see

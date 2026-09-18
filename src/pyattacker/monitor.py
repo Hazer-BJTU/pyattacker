@@ -55,7 +55,10 @@ def render_snapshot(snapshot: Mapping[str, Any], *, width: int = 20) -> str:
             f"degraded={stats.get('degraded')} dead={stats.get('dead')} waiting={stats.get('waiting')}"
         )
     if snapshot.get("attempts_total") is not None:
-        lines.append(f"attempts    total={snapshot.get('attempts_total')} events={snapshot.get('events_total')}")
+        lines.append(
+            f"attempts    total={snapshot.get('attempts_total')} events={snapshot.get('events_total')}"
+            + (f" handoffs={snapshot['handoffs_total']}" if snapshot.get("handoffs_total") else "")
+        )
     leaked = snapshot.get("leases_leaked") or snapshot.get("counters", {}).get("leases_leaked")
     if leaked:
         lines.append(f"!! leaked leases: {leaked} (forcibly reclaimed, but it means a task did not return its resource)")

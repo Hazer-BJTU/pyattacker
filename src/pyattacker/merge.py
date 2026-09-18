@@ -36,6 +36,7 @@ class MergedReport:
     duplicates: int = 0
     events_total: int = 0
     attempts_total: int = 0
+    handoffs_total: int = 0
 
     # ----------------------------------------------------------------- views
     def stats(self) -> dict[str, Any]:
@@ -67,6 +68,7 @@ class MergedReport:
             },
             "tasks": {"by_name": task_counts},
             "attempts_total": self.attempts_total,
+            "handoffs_total": self.handoffs_total,
             "events_total": self.events_total,
             "duplicates_folded": self.duplicates,
         }
@@ -80,7 +82,8 @@ class MergedReport:
             f"merged {len(self.rows)} pipelines from {len(self.sources)} store(s)"
             + (f"  (folded {self.duplicates} duplicate rows)" if self.duplicates else ""),
             "  " + " ".join(f"{k}={v}" for k, v in sorted(by_state.items()))
-            + f"  attempts={stats['attempts_total']} events={stats['events_total']}",
+            + f"  attempts={stats['attempts_total']} events={stats['events_total']}"
+            + (f"  handoffs={stats['handoffs_total']}" if stats["handoffs_total"] else ""),
             f"  pipeline latency ms: p50={durations['p50']} p95={durations['p95']} max={durations['max']}",
         ]
         tasks = stats["tasks"]["by_name"]
@@ -143,6 +146,7 @@ def merge_reports(
     duplicates = 0
     events_total = 0
     attempts_total = 0
+    handoffs_total = 0
     paths: list[str] = []
     run_ids: list[str] = []
     for source in sources:
@@ -154,6 +158,7 @@ def merge_reports(
             counts = store.stats(run_id)
             events_total += int(counts.get("events_total") or 0)
             attempts_total += int(counts.get("attempts_total") or 0)
+            handoffs_total += int(counts.get("handoffs_total") or 0)
             for row in store.export_rows(run_id=run_id):
                 key = row["pipeline_id"]
                 run_ids.append(row["run_id"])
@@ -174,4 +179,5 @@ def merge_reports(
         duplicates=duplicates,
         events_total=events_total,
         attempts_total=attempts_total,
+        handoffs_total=handoffs_total,
     )

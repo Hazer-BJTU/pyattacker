@@ -13,8 +13,17 @@ import time
 from collections.abc import Iterator, Mapping
 from typing import Any
 
-from ..artifact import Artifact
-from .base import AttemptRecord, EventRecord, PipelineRecord, RunRecord, TaskRecord
+from ..artifact import Artifact, Encoded
+from ..errors import PyAttackerError
+from .base import (
+    AttemptRecord,
+    EventRecord,
+    HandoffRecord,
+    PipelineRecord,
+    RunRecord,
+    TaskRecord,
+    handoff_row,
+)
 
 __all__ = ["MemoryStore"]
 
@@ -41,6 +50,7 @@ class MemoryStore:
         self._tasks: dict[str, TaskRecord] = {}
         self._resources: dict[tuple[str, str], dict[str, Any]] = {}
         self._attempts: list[AttemptRecord] = []
+        self._handoffs: list[HandoffRecord] = []
         self._events: list[EventRecord] = []
         self._event_id = 0
 
@@ -67,6 +77,17 @@ class MemoryStore:
     # ------------------------------------------------------------- pipelines
     def get_pipeline(self, pipeline_id: str) -> PipelineRecord | None:
         return self._pipelines.get(pipeline_id)
+
+    def reset_pipeline(self, record: PipelineRecord) -> None:
+        """Reset current slots, retaining append-only history and high-band payloads."""
+        self._tasks = {key: task for key, task in self._tasks.items()
+                       if task.pipeline_id != record.pipeline_id}
+        self._artifacts = {key: artifact for key, artifact in self._artifacts.items()
+                           if key[0] != record.pipeline_id or not 0 <= key[1] < record.n_tasks_total}
+        for key, artifact in list(self._artifacts.items()):
+            if key[0] == record.pipeline_id:
+                self._artifacts[key] = dataclasses.replace(artifact, is_final=False)
+        self.upsert_pipeline(record)
 
     def upsert_pipeline(self, record: PipelineRecord) -> None:
         self._pipelines[record.pipeline_id] = record
@@ -140,10 +161,9 @@ class MemoryStore:
         return None if artifact is None else _hydrate(artifact, self.backend)
 
     def mark_final(self, pipeline_id: str, seq: int) -> None:
-        key = (pipeline_id, seq)
-        artifact = self._artifacts.get(key)
-        if artifact is not None:
-            self._artifacts[key] = dataclasses.replace(artifact, is_final=True)
+        for key, artifact in list(self._artifacts.items()):
+            if key[0] == pipeline_id:
+                self._artifacts[key] = dataclasses.replace(artifact, is_final=key[1] == seq)
 
     def artifacts(self, pipeline_id: str) -> list[Artifact]:
         items = [a for (pid, _), a in self._artifacts.items() if pid == pipeline_id]
@@ -168,6 +188,78 @@ class MemoryStore:
         record.attempt_id = len(self._attempts) + 1
         self._attempts.append(record)
         return record
+
+    # -------------------------------------------------------------- handoffs
+    def commit_handoff(
+        self,
+        record: HandoffRecord,
+        *,
+        task: TaskRecord,
+        attempt: AttemptRecord,
+        payload: Encoded | None = None,
+        cursor: int,
+        final: bool = False,
+    ) -> Artifact | None:
+        """One step, no torn state to reason about (see the capability contract in ``store/base.py``)."""
+        pipeline = self._pipelines.get(record.pipeline_id)
+        if pipeline is None:
+            raise PyAttackerError(
+                f"commit_handoff: no pipeline row for {record.pipeline_id!r}; the handoff has no pipeline "
+                "to advance (a handoff is only ever committed while its pipeline is open)"
+            )
+        stored: Artifact | None = None
+        if payload is not None:
+            recorded = sum(1 for row in self._handoffs if row.pipeline_id == record.pipeline_id)
+            seq = pipeline.n_tasks_total + recorded
+            stored = self.put_artifact(
+                Artifact(
+                    id=Artifact.build_id(record.pipeline_id, seq),
+                    pipeline_id=record.pipeline_id,
+                    task_name=task.name,
+                    seq=seq,
+                    type_name=payload.type_name,
+                    codec=payload.codec,
+                    digest=payload.digest,
+                    size=payload.size,
+                    payload=payload.data,
+                    created_at=time.time(),
+                    is_final=final,
+                )
+            )
+            record.entry_seq = seq
+        if record.entry_seq is None:
+            raise PyAttackerError(
+                "commit_handoff: entry_seq is required when a handoff reuses an artifact (only a payload "
+                "handoff lets the store allocate the entry address)"
+            )
+        record.entry_artifact_id = Artifact.build_id(record.pipeline_id, record.entry_seq)
+        self.record_task(task)
+        attempt.attempt_id = len(self._attempts) + 1
+        self._attempts.append(attempt)
+        record.handoff_id = len(self._handoffs) + 1
+        self._handoffs.append(record)
+        pipeline.n_tasks_done = cursor
+        pipeline.run_id = record.run_id
+        if final:
+            self.mark_final(record.pipeline_id, record.entry_seq)
+            pipeline.state = "succeeded"
+            pipeline.finished_at = time.time()
+            pipeline.error_type = pipeline.error_message = pipeline.traceback = pipeline.failed_task = None
+        else:
+            pipeline.state = "running"
+        return stored
+
+    def handoffs(
+        self, *, pipeline_id: str | None = None, run_id: str | None = None, limit: int | None = None
+    ) -> list[HandoffRecord]:
+        """The ledger, oldest first; ``limit`` keeps the newest N, oldest first (the ``events`` rule)."""
+        items = [
+            row
+            for row in self._handoffs
+            if (pipeline_id is None or row.pipeline_id == pipeline_id)
+            and (run_id is None or row.run_id == run_id)
+        ]
+        return items[-limit:] if limit else items
 
     def attempts(
         self,
@@ -357,6 +449,9 @@ class MemoryStore:
             },
             "tasks": {"by_name": task_counts, "attempts_by_name": attempts_by_task},
             "attempts_total": sum(t.attempts_used for t in relevant),
+            "handoffs_total": sum(
+                1 for h in self._handoffs if run_id is None or h.run_id == run_id
+            ),
             "events_total": sum(
                 1 for e in self._events if run_id is None or e.run_id == run_id
             ),
@@ -389,6 +484,7 @@ class MemoryStore:
                 "n_tasks_done": p.n_tasks_done,
                 "n_tasks_total": p.n_tasks_total,
                 "attempts_total": p.attempts_total,
+                "handoff_floor": p.handoff_floor,
                 "started_at": p.started_at,
                 "finished_at": p.finished_at,
                 "duration_ms": (
@@ -425,6 +521,8 @@ class MemoryStore:
                     }
                     for a in self.artifacts(p.pipeline_id)
                 ],
+                # Empty for an ordinary pipeline, and always present: one row shape for every pipeline.
+                "handoffs": [handoff_row(h) for h in self.handoffs(pipeline_id=p.pipeline_id)],
             }
 
     def close(self) -> None:

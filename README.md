@@ -66,7 +66,7 @@ Five concepts, and that is the whole vocabulary:
 | Concept | Meaning | In one line |
 |---|---|---|
 | **artifact** | the persisted state of a task | content-addressed, **persisted as soon as it is produced** → checkpoint granularity = task |
-| **task** | the smallest unit of scheduling | a unary `(artifact) -> artifact` function, sync or async |
+| **task** | the smallest unit of scheduling | a unary `(artifact) -> artifact` function, sync or async — or `-> artifact \| Handoff`, to skip ahead ([advanced](#advanced-handoffs-opt-in)) |
 | **pipeline** | the unit of completion | `fetch \| ask \| judge \| metrics` chained linearly, semantically independent of each other |
 | **resource** | a leasable external capability | one endpoint / one key; once pooled, it can be published and subscribed to concurrency-safely |
 | **algorithm** | the policy for acquiring resources | `wait`, `backoff`, `least_busy`, `failover`, `sticky`, `quota_aware`, `immediate` — orthogonal to "retry on failure" |
@@ -175,6 +175,8 @@ runner.run(template.map(rows), resume=True)   # or pyattacker resume -c config.y
 * Failed pipelines → continue from **the first task that produced no artifact**: **if task C died, only task C
   reruns when task B's checkpoint is durable**;
 * The seed artifact is persisted too → recovery **does not depend on the original dataset file**;
+* A pipeline that **handed off** ([advanced](#advanced-handoffs-opt-in)) resumes at the station it jumped to,
+  with the entry state the ledger recorded — the task that handed off is not re-run;
 * Changed a task's source code (`spec_digest` includes source digests) → treated as a new pipeline, so old
   results are not incorrectly reused. Factory parameters, fanout children, retry/algorithm policies and
   explicit task `config`/`version` are included too. Explicit keys reject changed definitions or inputs.
@@ -183,6 +185,103 @@ runner.run(template.map(rows), resume=True)   # or pyattacker resume -c config.y
 rerun and old explicit keys conflict. Finish old runs with the old package, then use a new store. See the
 [resume identity and idempotency reference](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md#resume-identity)
 for migration guidance, dynamic functions and external configuration.
+
+## Advanced: Handoffs (Opt-In)
+
+**Advanced tier: opt-in, changes the execution model, not needed for ordinary pipelines, experimental until
+1.0.** A task can decide that the rest of the chain no longer needs to run, and *say so* instead of inventing a
+failure or hiding the branch inside one step. It **returns** a directive — `Handoff.to(target, value)` to
+continue at a declared later station, `Handoff.end(value)` to finish the pipeline right there:
+
+```python
+# example/readme_handoff.py
+"""A gate that skips the stations it does not need, and records why."""
+
+from pyattacker import Handoff, Runner, pipeline, task
+
+
+@task("prepare")
+def prepare(seed: dict) -> dict:
+    return {"q": seed["q"], "confidence": seed["confidence"]}
+
+
+@task("ask")
+async def ask(row: dict, ctx) -> dict:
+    await ctx.clock.sleep(0.001)                       # <- your HTTP call
+    return {**row, "answer": f"answer-for:{row['q']}"}
+
+
+@task("judge")
+def judge(row: dict) -> Handoff | dict:
+    if row["confidence"] >= 0.9:
+        return Handoff.end({**row, "verdict": "confident"}, reason="already good enough")
+    if row["confidence"] >= 0.5:
+        return Handoff.to("report", {**row, "verdict": "ok"}, reason="metrics not needed")
+    return {**row, "verdict": "needs-metrics"}
+
+
+@task("metrics")
+def metrics(row: dict) -> dict:
+    return {**row, "score": round(row["confidence"] * 10, 1)}
+
+
+@task("report")
+def report(row: dict) -> dict:
+    return {**row, "reported": True}
+
+
+# Edges are declared, never derived: judge may continue at report, or end the pipeline.
+template = pipeline("qa", prepare | ask | judge | metrics | report,
+                    control={"edges": {"judge": ["report", "end"]}})
+
+with Runner(store=":memory:", concurrency=4) as runner:
+    report_obj = runner.run(template.map([
+        {"q": "2+2", "confidence": 0.95},                        # judge ends the pipeline here
+        {"q": "17*23", "confidence": 0.6},                       # judge skips metrics, continues at report
+        {"q": "prove sqrt(2) is irrational", "confidence": 0.2},  # no handoff: the whole chain runs
+    ]))
+    print(report_obj.summary())
+    store = runner.store
+    for record in store.pipelines():
+        ran = [t.name for t in store.tasks(record.pipeline_id)]
+        hops = store.handoffs(pipeline_id=record.pipeline_id)
+        print(f"{record.state}  ran={ran}  skipped={len(template.tasks) - len(ran)}  handoffs={len(hops)}")
+```
+
+* **Declared, forward-only edges.** A `Handoff` along an undeclared edge, or from a pipeline with no
+  `control` block, is a fatal configuration error — never retried, never a silent jump. Destinations must be
+  strictly later than their source; `end` from the last task is refused because it would do nothing.
+* **A handoff is a disposition, not a failure.** It is a return value, so the retry policy never sees it and
+  a task-side `except Exception:` cannot swallow it; leases are released exactly as on success, and a
+  cancelled or timed-out attempt never reaches the return.
+* **It is a durable checkpoint.** The jump is committed atomically (source task, attempt, entry artifact,
+  ledger row and cursor together), so a killed process resumes **at the target** with the recorded entry
+  state and does not re-run the source task. On a control-enabled pipeline `n_tasks_done` is a *position*,
+  not a progress count: skipped stations have no task rows. `report`/`watch` count commits in the selected
+  scope (one run when filtered, all history otherwise); `/pipelines.handoffs` counts active execution records and `handoffs_historical` counts all ledger
+  records. A resume can use an earlier run's active handoff while recording no new handoffs. Pipeline
+  exports include ledger identity and the watermark to distinguish the scopes.
+* **Opt-in and inert.** Without the `control` block nothing changes — not one row, not one counter, and not a
+  byte of `spec_digest`.
+* **Only forward, for now.** The case that motivates the capability runs the other way: a validator finds a
+  model's structured output invalid and sends the work *back* to the generator for another sample
+  (`ask(temperature=0.2) → validate → revoke → ask(temperature=0.7) → …`). A task-internal loop would collapse
+  generation and validation into one record and make "how many regenerations did this row need" invisible, so
+  that direction is a planned follow-up with its own visit model (visit identity, a durable entry counter,
+  visit-aware randomness and a loop budget) — written down now so this version does not foreclose it. Joins,
+  DAGs and cross-pipeline jumps stay out of scope.
+
+The API is one class ([`Handoff`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md#advanced-handoffs-opt-in)),
+one declaration (`control={"edges": {...}}`) and one optional store capability; a custom store that cannot
+commit a handoff atomically is refused up front instead of writing a jump that would not survive a crash.
+Walkthrough: [tutorial step 15](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md#step-15--advanced-skipping-stations-handoffs).
+Model and rules: [design §4.8](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/design.md#48-advanced-handoffs--declared-forward-jumps-opt-in-experimental).
+
+When a pipeline restarts from the seed, previous task rows and chain artifacts are reset atomically with the cursor/watermark;
+previous handoffs stay in its history but no longer act as
+checkpoints. A later resume follows only the current execution's handoffs, and completion selects one
+final artifact. Custom stores supporting handoffs must persist the durable `handoff_floor` watermark
+alongside the cursor and implement atomic `reset_pipeline(record)`; see the [recovery contract](docs/reference.md#tables-and-readers).
 
 ## Running It Across Processes (Sharding)
 
@@ -205,8 +304,8 @@ uv run pyattacker export runs/qa.shard*of4.db runs/all.jsonl
 uv run pyattacker export runs/qa.shard*of4.db runs/tasks.csv --rows tasks --format csv
 ```
 
-`--rows` picks the shape: `pipelines` (nested, default), `tasks`, `attempts` (including each retry `decision`),
-`events`, `artifacts`. `--format` picks `jsonl`, `json` or `csv`.
+`--rows` picks the shape: `pipelines` (nested, default — its tasks, artifacts and handoffs included), `tasks`,
+`attempts` (including each retry `decision`), `events`, `artifacts`. `--format` picks `jsonl`, `json` or `csv`.
 
 ## Declarative (Simple Tasks)
 
@@ -256,9 +355,10 @@ Every flag of every subcommand: [`docs/cli.md`](https://github.com/Hazer-BJTU/py
 
 ## Records and Monitoring
 
-The complete story of one pipeline = five tables queried by `pipeline_id`: state and checkpoint, the final
+The complete story of one pipeline = six tables queried by `pipeline_id`: state and checkpoint, the final
 state of each task, the full attempt history (including **every retry decision**
-`{retry, reason, delay_s, error_class}`), intermediate and final artifacts, and the structured event stream.
+`{retry, reason, delay_s, error_class}`), intermediate and final artifacts, the control-flow ledger
+(`handoffs`, empty for an ordinary pipeline), and the structured event stream.
 `pyattacker report/watch` consumes these facts directly.
 
 ## Extending It
@@ -375,7 +475,10 @@ These are design decisions, not missing features:
 * **Network requests** — you write the openai/anthropic protocols yourself. The kernel never opens a socket.
 * **Semantic reduction** — accuracy, pass@k, F1 and any cross-pipeline aggregation. Export the artifacts and
   compute it outside, or write a sink pipeline out of the primitives.
-* **DAG orchestration** — a pipeline is a linear chain; branch inside a task with `fanout`.
+* **DAG orchestration** — a pipeline is a linear chain; branch inside a task with `fanout`. The one
+  qualification is the opt-in, forward-only [handoff](#advanced-handoffs-opt-in): it changes the traversal of
+  the chain along declared edges, never its topology (no joins, no second entry point, no cross-pipeline
+  jumps).
 * **A serving gateway** — the only HTTP surface is the read-only debug endpoint above.
 * **Distributed scheduling** — scale out with `--shard`; multi-process is the ceiling.
 
@@ -383,6 +486,12 @@ Sections 1 and 11 of [`docs/design.md`](https://github.com/Hazer-BJTU/pyattacker
 every known tradeoff with its reason.
 
 ## Status
+
+**Unreleased — advanced control flow (opt-in).** Tasks can now
+[hand off](#advanced-handoffs-opt-in): return a `Handoff` to skip declared stations or finish the pipeline
+early, recorded in a durable ledger that recovery resumes from. It is opt-in and inert — a pipeline without a
+`control` block writes no new rows and keeps a byte-identical `spec_digest` — and marked experimental until
+1.0. Backward/revoke handoffs are the planned follow-up, not part of it.
 
 **0.2.0 — a benchmark, stricter identity, and three correctness fixes.** New: `pyattacker bench`, a
 simulated provider world that compares the acquire algorithms on a vector of metrics instead of a weighted

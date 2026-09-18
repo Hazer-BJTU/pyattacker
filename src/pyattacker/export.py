@@ -2,7 +2,7 @@
 
 The kernel records facts; this module decides how to lay them out for whoever consumes them:
 
-* ``pipelines`` (default) — one row per pipeline with its tasks and artifacts nested;
+* ``pipelines`` (default) — one row per pipeline with its tasks, artifacts and handoffs nested;
 * ``tasks`` / ``attempts`` — one row per unit, so retries and error classes are directly
   groupable (this is what you want in pandas);
 * ``events`` — the structured log;

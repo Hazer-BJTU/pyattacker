@@ -28,6 +28,7 @@ __all__ = [
     "TaskRecord",
     "AttemptRecord",
     "EventRecord",
+    "HandoffRecord",
     "Store",
     "PagedStore",
     "PIPELINE_STATES",
@@ -39,10 +40,11 @@ __all__ = [
     "iter_events",
     "iter_artifacts",
     "open_store",
+    "supports_handoff",
 ]
 
 PIPELINE_STATES = ("pending", "running", "succeeded", "failed", "interrupted", "canceled")
-TASK_STATES = ("pending", "running", "succeeded", "failed", "interrupted", "canceled")
+TASK_STATES = ("pending", "running", "succeeded", "failed", "interrupted", "canceled", "handed_off")
 
 # Rows a paged store may hold in Python at once. One batch is a fixed, small working set, which is
 # what keeps an export's memory independent of the table's row count.
@@ -111,6 +113,9 @@ class PipelineRecord:
         spec_digest: Digest of the task chain's fingerprint (see ``pipeline.compute_spec_digest``);
             differs from ``seed_digest`` in scope — this changes when the *code* changes, not the data.
         resume_of: The run_id this pipeline was last resumed from, when it was; ``None`` otherwise.
+        handoff_floor: Durable ledger watermark. Rows with ``handoff_id <= handoff_floor`` are
+            historical and must not drive recovery after a restart from the seed. Custom stores
+            supporting handoffs must preserve this field on pipeline writes and reads.
         attempts_total: Cumulative attempts across every task in this pipeline (not just the
             current one), persisted synchronously so a crash mid-backoff does not lose the count.
     """
@@ -134,6 +139,8 @@ class PipelineRecord:
     spec_digest: str = ""
     resume_of: str | None = None
     attempts_total: int = 0
+    # Ledger rows at/below this durable watermark belong to an abandoned execution.
+    handoff_floor: int = 0
 
 
 @dataclass
@@ -237,6 +244,51 @@ class EventRecord:
     event_id: int | None = None
 
 
+@dataclass
+class HandoffRecord:
+    """One recorded handoff —— the durable control-flow edge that made a pipeline skip positions.
+
+    **Advanced feature** (``docs/design.md`` §4.8): append-only, one row per task-initiated jump, and
+    the authoritative history of "why does this pipeline's task list skip stations". Rows are read by
+    recovery (the pipeline resumes at the target with the recorded entry state), by export (nested in
+    the pipeline row) and by ``report``/``watch`` counters.
+
+    Attributes:
+        pipeline_id / run_id: The pipeline that jumped, and the run that committed the jump.
+        from_seq / from_task: The position and task name that handed off.
+        to_seq: The position the pipeline continued at; ``None`` means ``END`` —— the pipeline finished
+            on the spot, with the entry artifact as its final output.
+        to_task: The destination task's name, ``None`` together with ``to_seq``. Recorded rather than
+            derived because the skipped slot has no task row of its own: without it, "which station did
+            this pipeline jump to" would need the pipeline definition to answer.
+        entry_seq: The entry artifact's position within the pipeline. That is the lookup key every
+            built-in store is keyed by (``(pipeline_id, seq)``), so recovery never has to parse an id.
+            ``None`` means "this handoff carries a new payload, so the store allocates the address" —
+            the store then fills it in (as ``n_tasks_total + k``) together with ``entry_artifact_id``.
+        entry_artifact_id: The entry artifact's id —— **always set, never null**. The caller names the
+            artifact through ``entry_seq``; the store fills the id in from it, which is what keeps the
+            "a handoff always has a durable entry reference" invariant in one place.
+        entry_reused: ``True`` when the entry state is the artifact the handing-off task itself
+            received (``Handoff.to(target)`` with no value), ``False`` for a new payload artifact.
+        reason: The author's reason string (``""`` when none was given).
+        ts: Wall-clock time of the commit.
+        handoff_id: Assigned by the store on insert; ``None`` until then. Insertion order.
+    """
+
+    pipeline_id: str
+    run_id: str
+    from_seq: int
+    from_task: str
+    to_seq: int | None
+    entry_seq: int | None = None
+    to_task: str | None = None
+    entry_artifact_id: str = ""  # filled by the store from entry_seq
+    entry_reused: bool = False
+    reason: str = ""
+    ts: float = field(default_factory=_now)
+    handoff_id: int | None = None
+
+
 @runtime_checkable
 class Store(Protocol):
     """The required store interface: writes plus point/list queries.
@@ -280,6 +332,8 @@ class Store(Protocol):
 
     def mark_final(self, pipeline_id: str, seq: int) -> None:
         """Mark the last artifact of a pipeline as the final output.
+
+        Select this artifact as the sole final output, clearing prior final flags for the pipeline.
 
         **Idempotent by contract**: marking an artifact that is already final succeeds and performs no
         further side effect. Crash recovery can re-enter this call — a terminal repair that marked the
@@ -329,6 +383,33 @@ class Store(Protocol):
     # a state write, not a batched fact. A store without it still works: the Runner falls back to
     # ``finish_pipeline`` (state + cursor, atomically) followed by a cleanup ``upsert_pipeline``, which
     # can at worst leave a settled row with stale failure metadata, never a lost failure cause.
+    #
+    # ``commit_handoff(record, *, task, attempt, payload=None, cursor, final=False)`` and
+    # ``handoffs(*, pipeline_id=None, run_id=None, limit=None)`` are the optional capability behind the
+    # **advanced** handoff feature (``docs/design.md`` §4.8), again in the ``resources()`` spirit:
+    #
+    # * ``commit_handoff`` is **one atomic commit**: finalize the source task row
+    #   (``state="handed_off"``), insert the handed-off attempt (``outcome="handed_off"``), persist the
+    #   payload artifact when the handoff carries a new value (its ``seq`` is allocated inside the commit
+    #   as ``n_tasks_total + k``, ``k`` = the handoffs already recorded for that pipeline, so it can
+    #   never overwrite a task slot), append the ledger row, and move the cursor — for ``END`` it also
+    #   marks the entry artifact final and settles the pipeline ``succeeded`` in that same commit. It
+    #   fills ``record.entry_artifact_id`` from ``record.entry_seq`` and returns the stored payload
+    #   artifact (or ``None`` when the entry state is a reused artifact). Atomicity is a *requirement*
+    #   of the capability rather than a bonus, because there is deliberately no second recovery
+    #   protocol: a store that cannot do it atomically must not expose the method.
+    # * ``reset_pipeline(record)`` atomically deletes current task rows and chain artifacts
+    #   (0 <= seq < n_tasks_total), clears remaining final flags, and persists the reset cursor
+    #   and handoff_floor. Preserve seed, high-band payloads, attempts, events and ledger history.
+    #   WriteBehindStore flushes buffered facts before forwarding this synchronous reset.
+    # * ``handoffs(...)`` reads the ledger oldest first, and ``limit`` keeps the newest N, oldest first
+    #   (the ``events``/``attempts`` rule), so recovery can ask for the latest row alone.
+    #
+    # ``WriteBehindStore`` forwards the capability with a flush of buffered attempts/events first, and
+    # writes the *current* handed-off attempt through the commit itself — never through the buffered
+    # ``record_attempt`` path. Probe it with :func:`supports_handoff`; the Runner fails fast when a
+    # pipeline declares ``control`` on a store that lacks it, so a handoff is never silently
+    # non-durable.
 
     def pipelines(
         self, *, run_id: str | None = None, state: str | None = None, limit: int | None = None
@@ -387,6 +468,40 @@ class PagedStore(Protocol):
     ) -> Iterator[EventRecord]: ...
 
     def iter_artifacts(self, *, pipeline_id: str) -> Iterator[Artifact]: ...
+
+
+def handoff_row(record: HandoffRecord) -> dict[str, Any]:
+    """One ledger row as the export nests it under a pipeline (its shape is pinned by tests).
+
+    Shared by both built-in stores rather than written twice, so "the exported handoff row" has exactly
+    one definition and cannot drift between backends.
+    """
+    return {
+        "handoff_id": record.handoff_id,
+        "run_id": record.run_id,
+        "from_task": record.from_task,
+        "from_seq": record.from_seq,
+        "to_task": record.to_task,
+        "to_seq": record.to_seq,
+        "reason": record.reason,
+        "entry_artifact_id": record.entry_artifact_id,
+        "entry_seq": record.entry_seq,
+        "entry_reused": record.entry_reused,
+        "ts": record.ts,
+    }
+
+
+def supports_handoff(store: Store) -> bool:
+    """Whether ``store`` can commit a handoff atomically —— the optional commit/reset/read capability.
+
+    ``WriteBehindStore`` is unwrapped first: it forwards the capability (with a flush) only when the
+    store underneath actually implements it, so the batching wrapper can never make a store without
+    durable handoff support look capable.
+    """
+    target = getattr(store, "inner", store)
+    return callable(getattr(target, "reset_pipeline", None)) and callable(getattr(target, "commit_handoff", None)) and callable(
+        getattr(target, "handoffs", None)
+    )
 
 
 def iter_pipelines(

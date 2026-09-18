@@ -23,6 +23,7 @@ shaped this way.
 |---|---|
 | [Tasks](#tasks) | `task`, `build_task_spec`, `TaskSpec`, `Retrying`, `TaskContext`, `with_retry` |
 | [Pipelines](#pipelines) | `pipeline`, `PipelineTemplate`, `PipelineSpec`, `Chain`, `compute_spec_digest` |
+| [Advanced: handoffs](#advanced-handoffs-opt-in) | `Handoff`, the `control=` declaration, `HandoffRecord` |
 | [Running](#running) | `Runner`, `RunConfig`, `RunReport`, worker liveness |
 | [Resources](#resources) | `Resource`, `Pool`, `Lease`, `PoolStats`, `Bus`, `ResourceState`, `ResourceEvent` |
 | [Acquire algorithms](#acquire-algorithms) | `Wait`, `Backoff`, `LeastBusy`, `Failover`, `Sticky`, `QuotaAware`, `Immediate`, `resolve_algorithm` |
@@ -264,7 +265,7 @@ give it seeds; `map()` turns each seed into an independent `PipelineSpec`.
 ### `pipeline`
 
 ```python
-pipeline(name, *tasks_or_chain, tags=None, include_code=True, registry=None) -> PipelineTemplate
+pipeline(name, *tasks_or_chain, tags=None, include_code=True, registry=None, control=None) -> PipelineTemplate
 ```
 
 | Parameter | Meaning |
@@ -274,6 +275,7 @@ pipeline(name, *tasks_or_chain, tags=None, include_code=True, registry=None) -> 
 | `tags` | free-form dict stored with each pipeline, for filtering later |
 | `include_code` | when `True` (default), each task's source digest is part of the pipeline's identity |
 | `registry` | a custom `CodecRegistry` for non-JSON artifact types |
+| `control` | **advanced** (see [handoffs](#advanced-handoffs-opt-in)): which task may hand off where; `None` (the default) keeps the pipeline an ordinary linear chain |
 
 ```python
 from pyattacker import pipeline
@@ -285,7 +287,9 @@ template = pipeline("qa", ask)                          # a single task is a val
 
 The chain is validated **here**, not mid-run: if `prepare` returns `dict` and the next task requires `int`,
 this raises `PipelineBuildError` immediately. Checking uses annotations — subclasses are accepted, `Any` or
-a missing annotation is permissive, and a bare container accepts its parameterised form.
+a missing annotation is permissive, and a bare container accepts its parameterised form. A `Handoff` member
+in a `returns` annotation is an escape: `-> Handoff | Report` is checked as `Report`, and `-> Handoff` alone
+chains with anything (a task on that path produces no artifact at all).
 
 `include_code=False` is for the case where you deliberately want a task's body to change without abandoning
 existing checkpoints. The default is the safe direction: edited code means a new pipeline.
@@ -297,7 +301,8 @@ existing checkpoints. The default is the safe direction: edited code means a new
 | `name`, `tags`, `tasks`, `spec_digest` | the declaration |
 | `n_tasks` | how many tasks in the chain |
 | `task_names` | their names in order |
-| `describe()` | a JSON-ready summary (what `validate` prints) |
+| `describe()` | a JSON-ready summary (what `validate` prints), including the resolved `control` block when there is one |
+| `control` | the resolved edge plan (**advanced**), or `None` |
 | `bind(seed, *, key=None, repeat=0)` | one `PipelineSpec` from one seed |
 | `map(seeds, *, repeats=1, key_of=None)` | a lazy iterator of `PipelineSpec` |
 
@@ -339,6 +344,7 @@ content-addressed identity that makes resume and sharding work.
 | `seed` | the dataset row |
 | `repeat` | which sample of pass@k this is |
 | `name`, `tasks`, `n_tasks`, `tags` | inherited from the template |
+| `control` | the resolved edge plan (**advanced**), or `None` |
 
 ### `Chain`
 
@@ -357,7 +363,7 @@ template = pipeline("qa", steps)
 ### `compute_spec_digest`
 
 ```python
-compute_spec_digest(tasks, *, include_code=True) -> str
+compute_spec_digest(tasks, *, include_code=True, control=None) -> str
 ```
 
 The task-chain fingerprint (`v2:` followed by a 32-character hex digest). Useful for checking whether a code change would invalidate existing checkpoints
@@ -373,6 +379,88 @@ if compute_spec_digest(new_chain.tasks) != stored_digest:
 The digest covers each task's name, resource, `timeout_s`, source digest, and the five retry fields that
 change how long a step takes (`max_attempts`, `base`, `factor`, `cap`, `jitter`). It deliberately excludes
 `on`, `retry_unknown` and `max_total_s`.
+
+A `control` block is folded in **only when it is present**, so this feature changed no existing digest: a
+control-free pipeline keeps the exact identity (and therefore the pipeline ids, checkpoints and shard
+assignment) it had before handoffs existed. Declared edges are digested in their resolved form — seq
+destinations, sorted — so spelling a target as a name or as a seq is the same pipeline.
+
+
+---
+
+## Advanced: Handoffs (Opt-In)
+
+**Advanced tier: opt-in, changes the execution model, not needed for ordinary pipelines, experimental until
+1.0.** A task may *skip ahead* by returning a framework-owned directive instead of a value; the pipeline
+continues at a declared later position (or finishes on the spot) and the framework records the jump durably.
+A pipeline that declares nothing here is completely unaffected — see the design document
+[§4.8](design.md#48-advanced-handoffs--declared-forward-jumps-opt-in-experimental) for the full reasoning.
+
+### `Handoff`
+
+```python
+Handoff.to(target, value=UNSET, *, reason="") -> Handoff
+Handoff.end(value=UNSET, *, reason="") -> Handoff
+```
+
+| Field / method | Meaning |
+|---|---|
+| `target` | a task name, a task's seq, or `None` for `END` |
+| `value` | the target's entry state. `UNSET` (the default) means "reuse the artifact this task received"; `None` is a real payload |
+| `reason` | free-form string, recorded in the ledger and the `pipeline.handoff` event |
+| `is_end` | whether this directive finishes the pipeline |
+| `reuses_input` | whether the target enters with this task's own input artifact |
+
+```python
+from pyattacker import Handoff, TaskContext, task
+
+@task("judge")
+async def judge(value: Verdict, ctx: TaskContext) -> Handoff | Report:
+    if value.good_enough:
+        return Handoff.end(value.as_report(), reason="already good enough")
+    if not value.needs_metrics:
+        return Handoff.to("report", value.as_report(), reason="metrics not needed")
+    return await write_report(value)
+
+template = pipeline("qa", retrieve | ask | judge | report,
+                    control={"edges": {"judge": ["report", "end"], "ask": ["report"]}})
+```
+
+Rules that are worth knowing before you use it:
+
+* **A handoff is a return, never a failure.** The retry policy is not consulted (no `decision` reason is
+  added, and `retry.on=(Exception,)` / `retry_unknown=True` cannot turn it into a retry), `async with
+  ctx.acquire(...)` has already released its leases, and a cancelled or timed-out attempt never reaches the
+  return. Under `strict_leases=True` a leaked lease fails the task, and the handoff is not honoured.
+* **Edges are declared, not derived.** Returning a `Handoff` with no `control` block, or along an edge that
+  was not declared from *that* task, is a `FatalError` (never retried, never a silent jump).
+* **Forward only.** A destination must be strictly later than its source. `"end"` is a valid destination
+  except from the last task, where it has no effect and is refused.
+* **Repeated task names need a seq.** "ask" appearing twice is refused as ambiguous; target seq `2` instead.
+* **The payload is not type-checked.** A handoff argument is an arbitrary value, not the source's normal
+  return type, and it is encoded with the pipeline's `CodecRegistry` like any artifact.
+* **A handoff never comes from one of N branches.** `fanout` rejects a directive returned by a branch,
+  because a group is one step in the record and a control transfer cannot be attributed to one of several
+  concurrent branches.
+* **The cursor becomes a position.** On a control-enabled pipeline `n_tasks_done` is where execution is, not
+  how many tasks ran, and skipped slots have no task rows. Do not render it as a completion percentage; the
+  handoff count is exposed next to it instead.
+* **Stability.** The guarantees above are the stable part; the spelling (`Handoff`, `control`) may still
+  change before 1.0, and backward/revoke handoffs are a separate, not-yet-implemented feature.
+
+### What a hop records
+
+| Where | What it says |
+|---|---|
+| `tasks.state = "handed_off"` | the source task ended cleanly and produced no artifact |
+| `attempts.outcome = "handed_off"` | the attempt that jumped, with an empty `decision` |
+| `artifacts` | the entry state: the reused artifact, or a new payload at `seq = n_tasks + k` |
+| `handoffs` | the ledger row: from/to, `entry_artifact_id`, `entry_reused`, `reason` |
+| `pipeline.handoff` event | the audit trail (a hard kill can lose it; the ledger is authoritative) |
+
+`HandoffRecord` (exported from `pyattacker`) is that ledger row: `handoff_id`, `pipeline_id`, `run_id`,
+`from_seq`, `from_task`, `to_seq`/`to_task` (`None` for `END`), `entry_seq`, `entry_artifact_id`,
+`entry_reused`, `reason`, `ts`.
 
 ---
 
@@ -898,7 +986,7 @@ checkpoint granularity a task rather than a pipeline.
 
 | Field | Meaning |
 |---|---|
-| `pipeline_id`, `seq` | its identity; `seq=-1` is the pipeline's seed |
+| `pipeline_id`, `seq` | its identity; `seq=-1` is the pipeline's seed. On a control-enabled pipeline a handoff payload lives at `seq >= n_tasks` (see [handoffs](#advanced-handoffs-opt-in)), so `seq` is a task position only for the chain |
 | `task_name` | which task produced it |
 | `type_name`, `codec` | how to restore it |
 | `digest`, `size` | `blake2b` of the payload, and its length |
@@ -998,16 +1086,17 @@ Reading a live store while a run writes to it is supported — WAL allows one wr
 | `runs` | run | `store.get_run(id)` |
 | `pipelines` | pipeline: state, checkpoint cursor, digests, tags | `store.pipelines(...)`, `store.export_rows()` |
 | `tasks` | task: final state, attempts used, duration, error | `store.tasks(...)` |
-| `attempts` | attempt: outcome, error class, **retry decision**, leases, duration | `store.attempts(...)` |
+| `attempts` | attempt: outcome (`succeeded`/`failed`/`timeout`/`cancelled`/`handed_off`), error class, **retry decision**, leases, duration | `store.attempts(...)` |
 | `artifacts` | artifact | `store.artifacts(pid)`, `store.get_artifact(pid, seq)` |
+| `handoffs` | handoff: from/to position, entry artifact, whether it was reused, reason | `store.handoffs(...)` (**optional capability**), nested in `export_rows()` |
 | `events` | structured event | `store.events(...)` |
 | `resources` | resource: spec (secrets masked) and health stats | included in `stats()` |
 
 | Method | Returns |
 |---|---|
-| `stats(run_id=None)` | counts, state distribution, latency percentiles |
+| `stats(run_id=None)` | counts, state distribution, latency percentiles; `handoffs_total` counts recorded jumps (0 for ordinary runs) |
 | `errors(*, run_id=None, limit=20)` | failures with task name, error type and message |
-| `export_rows(*, run_id=None)` | nested pipeline rows: tasks and artifacts included |
+| `export_rows(*, run_id=None)` | nested pipeline rows: tasks, artifacts and handoffs included |
 | `attempts(*, pipeline_id=None, ...)` | attempt history |
 | `events(*, pipeline_id=None, limit=...)` | the event stream |
 | `close()` | close the connection |
@@ -1022,8 +1111,8 @@ for attempt in store.attempts(pipeline_id=pid):
 print([event.kind for event in store.events(pipeline_id=pid)])
 ```
 
-Record types with typed fields: `PipelineRecord`, `AttemptRecord` and `EventRecord` are exported;
-`TaskRecord`, `RunRecord` and the `Store` protocol live in `pyattacker.store.base`. `SqliteStore` and
+Record types with typed fields: `PipelineRecord`, `AttemptRecord`, `EventRecord` and `HandoffRecord` are
+exported; `TaskRecord`, `RunRecord` and the `Store` protocol live in `pyattacker.store.base`. `SqliteStore` and
 `MemoryStore` are the implementations, and `open_store` is how you get one.
 
 `journal="summary"` keeps digests and metadata but no payloads. It saves space and costs you task-level
@@ -1052,6 +1141,32 @@ that a later run tried to repair such a pipeline and failed: the row still descr
 and the repair attempt lives in the event stream (`pipeline.terminal_repair_failed`). Treat that command's
 output as the state of the pipelines, not as the history of every attempt; the live `run` exit code is the
 authoritative signal for the attempt it just made.
+A control-enabled pipeline adds one branch, consulted **before** those rules
+([handoffs](#advanced-handoffs-opt-in)): if the newest active ledger row's target is at or ahead of the cursor, the
+run resumes *at that target* with the recorded entry artifact and never re-runs the source task, and a
+durable `END` row is settled from its own entry artifact. A row whose target is behind the cursor has been
+consumed by later forward progress, so the ordinary `artifact(cursor - 1)` rule applies instead. If the
+entry payload is gone (`journal=summary`, a null backend, a deleted blob) the pipeline restarts from the seed
+with `pipeline.checkpoint_missing`, exactly like a lost linear checkpoint.
+
+A restart from seq 0 (including `retry_succeeded` and an unusable checkpoint) durably advances
+`PipelineRecord.handoff_floor` to the latest ledger ID before task execution. Rows at or below that
+watermark remain in the append-only history and export, but cannot drive recovery for the new execution.
+For control-enabled pipelines, `reset_pipeline(record)` commits that cursor/watermark together with
+deleting previous current task rows and chain artifacts (`0 <= seq < n_tasks`). Seed and high-band
+payload artifacts and append-only attempts/events/handoffs remain; retained artifacts have final flags
+cleared. Thus `tasks()` and chain artifact exports describe the current execution, including skipped
+stations having no rows. Historical reused-entry addresses may reference deleted/replaced chain slots;
+the ledger preserves provenance, not immutable snapshots of those slots.
+
+The watermark survives subsequent resumes and process restarts; filtering by the current `run_id` would
+incorrectly discard a valid handoff after a second interrupted resume. Custom stores offering handoffs
+must persist this field on pipeline reads and writes and provide the atomic reset capability. Writable SQLite opens migrate older databases with
+a default of zero; read-only tools treat a missing column as zero without migrating.
+
+Successful completion selects exactly one `is_final` artifact per pipeline, clearing old final flags
+from earlier executions. Historical payloads and ledger rows remain available for inspection.
+
 `mark_final` is therefore contractually idempotent, and it is skipped outright when the artifact is already
 final.
 
@@ -1123,6 +1238,31 @@ plugin layer is public API, and existing plugins were written against the list m
   with the memory profile of its list API. Implementing the five methods is what upgrades it;
 * `Store` remains the only protocol `open_store()` checks, so adding the extension breaks nothing.
   `WriteBehindStore` implements it and flushes before every paged read, like its other read views.
+
+**`commit_handoff(record, *, task, attempt, payload=None, cursor, final=False)`**,
+**`handoffs(*, pipeline_id=None, run_id=None, limit=None)`** and **`reset_pipeline(record)`** are the optional capability behind the advanced
+handoff feature, in the same "not part of the protocol" spirit as `resources()`. The commit is **one atomic
+write**: finalize the source task as `handed_off`, insert the handed-off attempt, persist the payload
+allocating its address above the chain, append the ledger row and move the cursor — and for `END` also mark
+the entry artifact final and settle the pipeline `succeeded`. Atomicity is a requirement of the capability,
+not a bonus: there is deliberately no second recovery protocol, so a store that cannot do it as one unit must
+not expose the method, and opening a pipeline that declares `control` on such a store fails fast with a
+`ConfigError` naming the commit/reset capability rather than writing a non-durable jump. `handoffs()` reads the ledger
+oldest first, and `limit` keeps the newest N (oldest first), like `events`/`attempts`. `supports_handoff(store)`
+is the probe: it unwraps `WriteBehindStore`, which forwards the capability with a flush of buffered
+attempts/events first, and writes the handed-off attempt through the commit rather than through its buffer.
+Failures must roll back database writes before any later event or cleanup write. An external blob backend
+may retain an unreferenced blob after failure; it must not make a partially committed checkpoint visible.
+Handoff-capable stores must also preserve `PipelineRecord.handoff_floor` across writes and reads (see the
+restart rule above).
+Both built-in backends implement it; a third-party store that does not simply cannot run control-enabled
+pipelines, while ordinary pipelines on it are untouched.
+
+**`reset_pipeline(record)`** must atomically delete previous current task rows and chain artifact slots,
+clear remaining artifact final flags, and persist the reset pipeline row including cursor and watermark.
+Preserve the seed, high-band payloads and append-only history. It runs only on control-enabled seed starts;
+resuming at a target leaves the current state intact. `WriteBehindStore` flushes before reset. A store
+missing this method cannot advertise handoff support; ordinary control-free pipelines remain supported.
 
 **`settle_pipeline(pipeline_id, *, state, n_tasks_done, run_id)`** is the other optional capability, in the
 same "not part of the protocol" spirit as `resources()`: one write that moves a row to its terminal state,
@@ -1298,7 +1438,11 @@ payloads and unusable checkpoints can also require replay of earlier tasks.
 
 If your provider supports idempotency keys, derive one from the stable pipeline and task identity,
 for example `f"{ctx.pipeline_id}:{ctx.seq}"`, and reuse it across retries rather than including the
-attempt number. Respect the provider's retention window and API contract. For file sinks, upsert
+attempt number. Two caveats: on a **control-enabled** pipeline a station can in principle be visited more
+than once once backward handoffs exist (they do not in this version, and a forward-only handoff cannot
+revisit a slot), so a key that must survive that should include the visit — which the planned v2 visit model
+will expose on `ctx`; and a handoff payload is *not* a task identity, so never key external work off an
+artifact address. Respect the provider's retention window and API contract. For file sinks, upsert
 by the same identity or write one atomically replaced file per pipeline/task; a plain append-only
 `write_jsonl` task can create duplicate lines on replay. Resource lease safety does not make those
 external side effects idempotent.
@@ -1325,7 +1469,7 @@ One row per kind, in the order `limit` truncates:
 
 | `kind` | One row per | Order |
 |---|---|---|
-| `pipelines` (default) | pipeline, nested — tasks and artifacts included | `created_at`, then `pipeline_id` |
+| `pipelines` (default) | pipeline, nested — tasks, artifacts and handoffs included | `created_at`, then `pipeline_id` |
 | `tasks` | task: final state, duration, error, leases used | `pipeline_id`, `seq`, then `task_run_id` |
 | `attempts` | attempt, including each retry `decision` | `attempt_id` (write order) |
 | `events` | structured event | `event_id` (write order, oldest first) |
@@ -1357,7 +1501,15 @@ print(f"accuracy: {correct / total:.1%}")
 export_store(store, "attempts.csv", kind="attempts", fmt="csv")
 ```
 
-`pipelines` rows are nested — tasks and artifacts included — which is why it is the default. CSV takes its
+`pipelines` rows are nested — tasks, artifacts and handoffs included — which is why it is the default. The
+`handoffs` list includes `handoff_id` and committing `run_id`; the pipeline row includes
+`handoff_floor`. IDs above the floor belong to the active execution history; IDs at or below it are
+historical records excluded from recovery. `store.handoffs(pipeline_id=...)` includes all records.
+`stats(run_id)["handoffs_total"]` counts only commits by that run, so a resume can use an active handoff
+from a previous run while reporting zero new handoffs. The
+`handoffs` list is `[]` for an ordinary pipeline and has one object per recorded jump otherwise (see
+[handoffs](#advanced-handoffs-opt-in)); it is nested rather than a row kind of its own, so `ROW_KINDS` is
+unchanged. CSV takes its
 header from the first rows and folds later keys into an `extra` column, so memory stays flat and no field is
 dropped silently.
 
@@ -1640,6 +1792,12 @@ with StatsServer("runs/qa.db", port=8787) as server:
 |---|---|
 | `/` | a small auto-refreshing dashboard |
 | `/stats`, `/events`, `/pipelines`, `/resources`, `/errors` | JSON |
+
+`/stats` carries `handoffs_total` (commits by the selected run, or all commits without a run filter), and each `/pipelines` row carries a
+`handoffs` count of active-execution records, `handoffs_historical` count of all records and
+`handoff_floor`, next to `n_tasks_done`/`n_tasks_total` — on a control-enabled pipeline those two are a
+**position** in the chain, not a count of tasks that ran, so a non-zero `handoffs` is what says "this
+pipeline skipped stations".
 
 **It has no authentication and it serves your artifact payloads.** It binds to loopback for that reason. Put
 your own proxy in front before exposing it anywhere else. `pyattacker serve` is the same thing from the

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import ConfigError, FatalError, RetryableError
+from ..handoff import Handoff
 from ..task import Retrying, TaskSpec, build_task_spec, task
 
 __all__ = [
@@ -190,6 +191,11 @@ def fanout(
 
     ``on_error="raise"`` (default) fails the task if any branch fails, like any other exception.
     ``on_error="collect"`` never raises and returns ``{child_name: {"ok": bool, ...}}`` instead.
+
+    A branch may not **hand off**: the group is one step in the record, so a control transfer cannot be
+    attributed to one of N concurrent branches. A returned :class:`~pyattacker.handoff.Handoff` fails the
+    group with a clear :class:`~pyattacker.errors.FatalError` instead of travelling inside the collected
+    payload (see ``docs/design.md`` §4.8).
     """
     if not specs:
         raise ValueError("fanout needs at least one task")
@@ -208,6 +214,16 @@ def fanout(
                 return exc
 
         results = await asyncio.gather(*(_one(spec) for spec in specs))
+        for spec, result in zip(specs, results, strict=True):
+            if isinstance(result, Handoff):
+                # Before the failures dict and before `on_error="collect"`: a directive must never be
+                # mistaken for a value (or hidden inside a collected payload).
+                ctx.emit("fanout.handoff_rejected", branch=spec.name)
+                raise FatalError(
+                    f"branch {spec.name!r} of this fan-out returned a Handoff; a handoff is a pipeline "
+                    "control transfer, so it cannot come from one of several concurrent branches "
+                    "(docs/design.md §4.8)"
+                )
         failures = {
             spec.name: result
             for spec, result in zip(specs, results, strict=True)

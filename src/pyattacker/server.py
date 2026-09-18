@@ -190,25 +190,38 @@ class StatsServer:
 
         if path == "/pipelines":
             state = (query.get("state") or [None])[0]
-            rows = self._read(
-                lambda store: [
-                    {
-                        "pipeline_id": record.pipeline_id,
-                        "name": record.name,
-                        "state": record.state,
-                        "run_id": record.run_id,
-                        "n_tasks_done": record.n_tasks_done,
-                        "n_tasks_total": record.n_tasks_total,
-                        "attempts_total": record.attempts_total,
-                        "failed_task": record.failed_task,
-                        "error_type": record.error_type,
-                        "error_message": record.error_message,
-                        "started_at": record.started_at,
-                        "finished_at": record.finished_at,
-                    }
-                    for record in store.pipelines(run_id=run_id, state=state, limit=limit)
-                ]
-            )
+
+            def _pipelines(store: Any) -> Any:
+                rows = []
+                for record in store.pipelines(run_id=run_id, state=state, limit=limit):
+                    # `handoffs` costs one small indexed read per returned row, and is how this view says
+                    # "the cursor below is a position, not progress": a pipeline with handoffs skipped
+                    # stations, so n_tasks_done is where it is, not how many tasks ran.
+                    count = getattr(store, "handoffs", None)
+                    history = count(pipeline_id=record.pipeline_id) if callable(count) else []
+                    handoffs = sum((hop.handoff_id or 0) > record.handoff_floor for hop in history)
+                    rows.append(
+                        {
+                            "pipeline_id": record.pipeline_id,
+                            "name": record.name,
+                            "state": record.state,
+                            "run_id": record.run_id,
+                            "n_tasks_done": record.n_tasks_done,
+                            "n_tasks_total": record.n_tasks_total,
+                            "handoffs": handoffs,
+                            "handoffs_historical": len(history),
+                            "handoff_floor": record.handoff_floor,
+                            "attempts_total": record.attempts_total,
+                            "failed_task": record.failed_task,
+                            "error_type": record.error_type,
+                            "error_message": record.error_message,
+                            "started_at": record.started_at,
+                            "finished_at": record.finished_at,
+                        }
+                    )
+                return rows
+
+            rows = self._read(_pipelines)
             return 200, {"rows": rows, "limit": limit}
 
         if path == "/resources":

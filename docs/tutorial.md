@@ -40,6 +40,7 @@ Read the steps in order the first time. Afterwards, use this table.
 | branch inside a step | [Step 13](#step-13--capstone-a-small-model-evaluation) | [`fanout`](reference.md#fanout) |
 | store custom types or large payloads, ship a plugin | [Step 14](#step-14--your-own-types-blobs-plugins) | [Codecs](reference.md#codecregistry), [Backends](reference.md#artifact-backends), [Plugins](reference.md#plugins) |
 | monitor a run in progress | [Step 14](#step-14--your-own-types-blobs-plugins) | [Monitoring](reference.md#monitoring) |
+| skip the rest of a chain from inside a task (advanced) | [Step 15](#step-15--advanced-skipping-stations-handoffs) | [Handoffs](reference.md#advanced-handoffs-opt-in) |
 
 ---
 
@@ -1597,6 +1598,145 @@ endpoint has no authentication and serves your payloads — keep it on loopback.
 
 ---
 
+## Step 15 — advanced: skipping stations (handoffs)
+
+**This step is the one advanced feature in the framework: it is opt-in, it changes the execution model, and
+it is marked experimental until 1.0.** Everything before this step works without it, and a pipeline that does
+not declare it behaves exactly as it did before the feature existed. Read this step when you have a step that
+decides *the rest of the chain no longer needs to run*.
+
+The situation: `judge` can tell that an answer is already good enough, or that the `metrics` step is
+unnecessary for this row. The old options were to run the remaining tasks anyway, to fold everything into one
+task with `fanout` (losing per-step records), or to raise — which records the pipeline as **failed**, which is
+a lie. A **handoff** says what actually happened: this row skipped stations 3–5 and continued at station 6, or
+finished right here.
+
+```python
+# tutorial/step_15_handoff.py
+"""Step 15 (advanced) - a task hands off: skip stations, or finish the pipeline, and nothing lies about it."""
+
+import json
+from contextlib import closing
+
+from pyattacker import Handoff, Runner, open_store, pipeline, task
+
+
+@task("prepare")
+def prepare(seed: dict) -> dict:
+    return {"q": seed["q"], "confidence": seed["confidence"]}
+
+
+@task("ask")
+async def ask(row: dict, ctx) -> dict:
+    # <- your HTTP call: the model answers, and reports how sure it is
+    await ctx.clock.sleep(0.001)
+    return {**row, "answer": f"answer-for:{row['q']}"}
+
+
+@task("judge")
+def judge(row: dict) -> Handoff | dict:
+    """Three outcomes: finish here, skip metrics, or carry on down the chain."""
+    if row["confidence"] >= 0.9:
+        # already good enough: end the pipeline with this as its final artifact
+        return Handoff.end({"q": row["q"], "answer": row["answer"], "verdict": "confident"},
+                           reason="already good enough")
+    if row["confidence"] >= 0.5:
+        # not worth the metrics call, but the report is still wanted: continue at "report"
+        return Handoff.to("report", {"q": row["q"], "answer": row["answer"], "verdict": "ok"},
+                          reason="metrics not needed")
+    return {**row, "verdict": "needs-metrics"}
+
+
+@task("metrics")
+def metrics(row: dict) -> dict:
+    return {**row, "score": round(row["confidence"] * 10, 1)}
+
+
+@task("report")
+def report(row: dict) -> dict:
+    return {**row, "reported": True}
+
+
+# The edges are declared, not derived: "report" is what judge may jump to, and END finishes the pipeline.
+template = pipeline(
+    "qa",
+    prepare | ask | judge | metrics | report,
+    control={"edges": {"judge": ["report", "end"]}},
+)
+
+rows = [
+    {"q": "capital of France", "confidence": 0.95},   # judge ends the pipeline (metrics and report skipped)
+    {"q": "17 * 23", "confidence": 0.6},              # judge skips metrics, continues at report
+    {"q": "prove sqrt(2) is irrational", "confidence": 0.2},  # judge hands nothing off: the full chain runs
+]
+
+with Runner(store="runs/handoff.db", concurrency=4) as runner:
+    report_obj = runner.run(template.map(rows))
+    print(report_obj.summary())
+    store = runner.store
+    for record in store.pipelines():
+        ran = [t.name for t in store.tasks(record.pipeline_id)]
+        skipped = [t.name for t in template.tasks if t.name not in ran]
+        print(f"\n{record.pipeline_id[:8]}  state={record.state}  ran={ran}  skipped={skipped}")
+        for hop in store.handoffs(pipeline_id=record.pipeline_id):
+            where = "END" if hop.to_seq is None else hop.to_task
+            print(f"   jumped: {hop.from_task} -> {where}  ({hop.reason})  entry={hop.entry_artifact_id}")
+
+# The record is a plain store: reopen it whenever, and read the same ledger back.
+with closing(open_store("runs/handoff.db")) as reopened:
+    print("\nhandoffs recorded:", reopened.stats()["handoffs_total"])
+    row = next(iter(reopened.export_rows()))
+    print("first exported pipeline's ledger:", json.dumps(row["handoffs"], ensure_ascii=False))
+```
+
+The three rows take three different paths, and the record says so without any of them having failed:
+
+```text
+ec5fc1e5  state=succeeded  ran=['prepare', 'ask', 'judge']  skipped=['metrics', 'report']
+   jumped: judge -> END  (already good enough)  entry=ec5fc1e5dff6a260512e579a276d11e0:5
+cdce72ca  state=succeeded  ran=['prepare', 'ask', 'judge', 'report']  skipped=['metrics']
+   jumped: judge -> report  (metrics not needed)  entry=cdce72cae311e870d87d85e9dbcaa280:5
+260cf635  state=succeeded  ran=['prepare', 'ask', 'judge', 'metrics', 'report']  skipped=[]
+```
+
+What is worth knowing before you use it:
+
+* **It is a return value, not an exception.** The retry policy never sees it, a task-side
+  `except Exception:` cannot swallow it, and `async with ctx.acquire(...)` has already returned its leases
+  on the way out. A cancelled or timed-out attempt never reaches the return, so nothing is half-transferred.
+* **The edges are declared, so a mistake is loud.** Returning a `Handoff` from a pipeline with no `control`
+  block, or along an edge that was not declared *from that task*, is a `FatalError` — never retried, never a
+  silent jump. Destinations must be strictly later than their source (this version is forward-only), a name
+  that appears twice in the chain must be given as a seq, and `end` from the last task is refused because it
+  would do nothing.
+* **A handoff is a checkpoint, so resume continues at the target.** If the process dies after the jump, the
+  next `resume=True` run starts at the destination with the recorded entry state and does **not** re-run the
+  source task. The `handoffs` row is what makes that possible: it names the destination and the entry
+  artifact, which is either the artifact the source task received (`Handoff.to(target)` with no value) or a
+  new payload stored at its own address above the chain (`seq >= n_tasks`).
+* **`n_tasks_done` becomes a position.** The skipped slots have no task rows, so on a control-enabled
+  pipeline `n_tasks_done / n_tasks_total` is not a completion percentage — `store.handoffs()` and
+  `stats()["handoffs_total"]` are how you see what actually happened. `report`, `watch`, `/pipelines` and
+  every export show the handoff count next to it.
+* **Do not reach for it first.** A handoff is a *scheduling statement* about the current pipeline: "this row
+  should continue over there". Conditions still belong in task code, branching inside a step is still
+  `fanout`, and iterating a dataset is still `map`. A pipeline that is mostly handoffs is a sign the problem
+  wants a graph engine, which this is not.
+* **Advanced tier.** It is opt-in, it changes the execution model, and it is experimental until 1.0: the
+  guarantees above are stable, the spelling may still change. Backward handoffs (send a bad model output
+  *back* to the generator) are a planned follow-up with their own record model, not part of this version.
+  Both built-in stores can commit a handoff; a custom store that cannot is refused up front with a
+  `ConfigError` rather than writing a jump that would not survive a crash.
+
+A whole-pipeline restart (for example `retry_succeeded=True` or a lost entry payload) keeps previous
+handoffs, attempts and events as history, but atomically clears current task/chain artifact state
+with the durable ledger watermark before restarting at seq 0. A later failure
+therefore cannot resume an old jump or recover an old END result. Subsequent target resumes preserve the
+current watermark, so repeated interruptions still use the active handoff. Completion leaves one final
+artifact. See the [store recovery contract](reference.md#tables-and-readers) when implementing a backend.
+
+---
+
 ## Cheat sheet
 
 | I want to… | Do this |
@@ -1616,6 +1756,7 @@ endpoint has no authentication and serves your payloads — keep it on loopback.
 | store big payloads out of the DB | `--artifact-backend file:///data/blobs` |
 | use four processes | `--shards 4 --jobs 4`, then `report`/`export` over the shard files |
 | branch inside a step | `fanout(task_a, task_b)` |
+| skip ahead / finish early, on the record | `return Handoff.to("report", v)` / `Handoff.end(v)` on a pipeline declared with `control={"edges": {...}}` |
 | make my code usable from YAML | no plugin: `use: my_pkg.tasks:my_task`; with an entry point in `pyattacker.tasks`: `use: my_task` |
 
 Every class and function, with signatures and parameter tables: [`docs/reference.md`](reference.md).

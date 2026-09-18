@@ -6,6 +6,46 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+* **Advanced feature: handoffs — a task can skip ahead, on the record (opt-in, experimental).** A task may
+  return `Handoff.to(target, value)` to continue at a declared later station, or `Handoff.end(value)` to
+  finish the pipeline immediately. Until now the alternatives were to run the remaining stations anyway, to
+  fold the branch into one task with `fanout` (losing per-step records), or to raise — which records the
+  pipeline as *failed*, which is a lie. A handoff says what actually happened: this row skipped stations 3–5 and
+  continued at station 6, or finished here. It is also a **durable checkpoint**: the source task lands
+  `handed_off`, its attempt keeps `outcome="handed_off"`, the entry artifact is referenced or stored, a
+  `handoffs` ledger row records from/to and why, and the cursor moves — all in **one atomic commit**, so a
+  killed process resumes *at the target* with the entry state and never re-runs the source task.
+  `Observable changes:` a new append-only `handoffs` table (`store.handoffs(...)`, nested in the `pipelines`
+  export row, counted by `stats()["handoffs_total"]`, shown by `report`/`watch`/`/pipelines`); the attempt
+  outcome `handed_off`; handoff payload artifacts at `seq >= n_tasks`, so a payload can never overwrite a
+  task slot; the `pipeline.handoff` event; `Handoff` and `HandoffRecord` in the public API; and
+  `control={"edges": {...}}` on `pipeline(...)` plus the declarative `pipeline.control`. Edges are declared
+  rather than derived, so an undeclared or backward target is a fatal error instead of a silent jump, and
+  `fanout` rejects a directive returned by one of its branches. **A pipeline without a `control` block is
+  untouched**: no new rows, no counter changes, and a byte-identical `spec_digest` (pinned by a literal test),
+  so no stored checkpoint, pipeline id or shard assignment is invalidated. Handoffs need a store that can
+  commit them atomically; both built-in backends can, and a store that cannot is refused up front with a
+  `ConfigError` rather than silently writing a non-durable jump. Marked *experimental until 1.0*;
+  backward/revoke handoffs, joins and cross-pipeline jumps are not included. See
+  [`docs/design.md` §4.8](docs/design.md#48-advanced-handoffs--declared-forward-jumps-opt-in-experimental),
+  the [API reference](docs/reference.md#advanced-handoffs-opt-in) and
+  [tutorial step 15](docs/tutorial.md#step-15--advanced-skipping-stations-handoffs).
+
+### Fixed
+
+* Review follow-up: freeze resolved control topology; atomically reset current task/chain artifact state
+  on control-enabled seed replays while retaining history; expose handoff identity/watermark and active
+  versus historical API counts; treat unencodable handoff payloads as fatal; correct return-only
+  annotation documentation. Handoff-capable custom stores must also provide `reset_pipeline(record)`.
+
+* Handoff follow-up: isolate historical ledger rows on whole-pipeline restarts with a durable
+  `handoff_floor` watermark (including old-store migration and read-only compatibility); roll back failed
+  SQLite handoff commits; select a single final artifact after reruns; reject duplicate source aliases;
+  preserve numeric source disambiguation in JSON/TOML/YAML and effective config; restrict the annotation
+  escape to return unions containing `Handoff`.
+
 ### Changed
 
 * **The sdist no longer ships the branding images.** `assets/` was in the sdist include list, and PNG

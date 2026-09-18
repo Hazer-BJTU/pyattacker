@@ -43,11 +43,13 @@ from .artifact import (
     SEED_TASK,
     Artifact,
     CodecRegistry,
+    Encoded,
     digest_of,
 )
 from .errors import (
     ConfigError,
     CorruptCheckpoint,
+    FatalError,
     LeaseLeakError,
     PipelineIdentityConflict,
     PyAttackerError,
@@ -55,19 +57,22 @@ from .errors import (
     WorkerCrashed,
     error_class_of,
 )
+from .handoff import ControlPlan, Handoff
 from .pipeline import PipelineSpec
 from .resource import Bus, Pool, ResourceEvent
 from .scheduler import DelayQueue
 from .store import (
     AttemptRecord,
     EventRecord,
+    HandoffRecord,
     PipelineRecord,
     RunRecord,
     Store,
     TaskRecord,
     open_store,
+    supports_handoff,
 )
-from .task import TaskContext, TaskSpec
+from .task import UNSET, TaskContext, TaskSpec
 
 __all__ = ["Runner", "RunConfig", "RunReport"]
 
@@ -232,7 +237,12 @@ class RunReport:
             + (f" skipped={self.skipped}" if self.skipped else ""),
             f"  pipeline latency ms: p50={durations.get('p50')} p95={durations.get('p95')} max={durations.get('max')}",
             f"  attempts: total={self.stats.get('attempts_total', 0)}"
-            + (f"  leases_leaked={self.leases_leaked}" if self.leases_leaked else ""),
+            + (f"  leases_leaked={self.leases_leaked}" if self.leases_leaked else "")
+            + (
+                f"  handoffs={self.stats['handoffs_total']}"
+                if self.stats.get("handoffs_total")
+                else ""
+            ),
         ]
         by_name = tasks.get("by_name", {})
         if by_name:
@@ -291,15 +301,39 @@ class _TaskResult:
 
     ``retry_after`` is not ``None`` when the attempt failed but the policy wants another
     try: the caller then parks the pipeline instead of sleeping in the worker.
+
+    ``handoff`` is not ``None`` when the attempt returned a :class:`~pyattacker.handoff.Handoff`
+    instead of a value. A handoff is a *return*, so it is neither a success nor a failure: the attempt
+    is committed by :meth:`Runner._commit_handoff`, which is the caller's job because the commit spans
+    the source task, the ledger and the cursor.
     """
 
     outcome: _Outcome | None = None
     retry_after: float | None = None
     attempts: int = 0
+    handoff: "_HandoffPlan | None" = None
 
     @property
     def retrying(self) -> bool:
         return self.retry_after is not None
+
+
+@dataclass
+class _HandoffPlan:
+    """One resolved, validated handoff —— everything :meth:`Runner._commit_handoff` needs.
+
+    Resolved inside the attempt (so an undeclared edge fails the attempt like any other authoring
+    error) and committed by ``_drive``, which owns the cursor.
+    """
+
+    target: int | None  # the destination seq; None means END
+    to_task: str | None  # the destination task's name; None together with target
+    reason: str
+    reused: bool  # the entry state is the artifact this task received
+    entry_seq: int | None  # that artifact's seq when reused; None lets the store allocate a payload address
+    entry_value: Any  # the payload value the target enters with (UNSET when reused)
+    payload: Encoded | None  # the encoded payload, written by the commit
+    attempt: AttemptRecord  # the handed-off attempt row, written by the commit
 
 
 @dataclass
@@ -1181,6 +1215,26 @@ class Runner:
         # A cursor at (or past) the end of the chain must never reach the resume rule below, which
         # would index spec.tasks[cursor] and raise IndexError -- forever, on every later run. Handle
         # the two shapes explicitly before the ordinary checkpoint branch.
+        #
+        # A recorded handoff is consulted *before* those rules: with an early END the chain has no
+        # artifact at n_tasks - 1 at all, so the linear terminal repair cannot decide the case, and a
+        # durable END ledger row must finalize its own entry artifact instead.
+        resumable = record is not None and record.state in ("failed", "interrupted")
+        pending: HandoffRecord | None = None
+        # Only a control-enabled pipeline can have a ledger row at all, and only a store with the
+        # capability can be asked for one: otherwise a third-party store that never implemented it
+        # would fail here instead of in `_control_problem`, which reports it as the configuration error
+        # it is. (A pipeline cannot silently lose its declaration and keep its ledger: the control block
+        # is part of `spec_digest`, so that combination is an identity conflict.)
+        if resumable and spec.control is not None and supports_handoff(self.store):
+            assert record is not None  # narrowed by `resumable`; kept explicit for readers
+            pending = self._latest_handoff(spec.pipeline_id)
+            if pending is not None and (pending.handoff_id or 0) <= record.handoff_floor:
+                pending = None
+            if pending is not None and pending.to_seq is None:
+                if self._settle_terminal_cursor(spec, record, run_id, handoff=pending):
+                    return None
+                pending = None  # the entry artifact was unusable: the row was rewound to 0
         if (
             record is not None
             and record.state in ("failed", "interrupted")
@@ -1194,7 +1248,24 @@ class Runner:
         start_index = 0
         value: Any = spec.seed
         artifact: Artifact | None = None
-        if record is not None and record.state in ("failed", "interrupted") and record.n_tasks_done > 0:
+        handoff_resume: HandoffRecord | None = None
+        if resumable and pending is not None and pending.to_seq is not None:
+            assert record is not None
+            if pending.to_seq >= record.n_tasks_done:
+                # The ledger is ahead of (or level with) the cursor: the pipeline was killed after the
+                # handoff commit and before the target finished, so it resumes *at the target* with the
+                # recorded entry state and never re-runs the source task. Forward-only traversal makes
+                # the newest row the only candidate: every older destination is strictly smaller.
+                point = self._handoff_resume_point(spec, pending)
+                if point is None:
+                    # The entry payload is gone (journal=summary, a null backend, a deleted blob): the
+                    # documented restart-from-zero rule, with the cursor rewound so the ordinary branch
+                    # below does not try to decode an artifact the skipping never produced.
+                    record.n_tasks_done = 0
+                else:
+                    start_index, artifact, value = point
+                    handoff_resume = pending
+        if resumable and start_index == 0 and record is not None and record.n_tasks_done > 0:
             candidate = self.store.get_artifact(spec.pipeline_id, record.n_tasks_done - 1)
             if candidate is not None and candidate.available:
                 start_index = record.n_tasks_done
@@ -1226,6 +1297,11 @@ class Runner:
             seed_digest=spec.seed_digest,
             spec_digest=spec.spec_digest,
         )
+        # Before any seed replay, durably invalidate the previous execution's ledger
+        # with the reset cursor. Keep the watermark unchanged on target resumes.
+        if start_index == 0 and spec.control is not None and supports_handoff(self.store):
+            latest = self._latest_handoff(spec.pipeline_id)
+            record.handoff_floor = (latest.handoff_id or 0) if latest is not None else 0
         record.run_id = run_id
         record.state = "running"
         record.started_at = record.started_at or time.time()
@@ -1234,8 +1310,15 @@ class Runner:
         record.n_tasks_done = start_index
         record.resume_of = resumed_from
         record.error_type = record.error_message = record.traceback = record.failed_task = None
-        self.store.upsert_pipeline(record)
-        problem = self._pool_problem(spec)
+        if start_index == 0 and spec.control is not None and supports_handoff(self.store):
+            self.store.reset_pipeline(record)
+        else:
+            self.store.upsert_pipeline(record)
+        problem, phase = self._pool_problem(spec), "resource_check"
+        if problem is None:
+            control_problem = self._control_problem(spec)
+            if control_problem is not None:
+                problem, phase = control_problem, "control_check"
         if problem is not None:
             self._counters["pipelines_failed"] += 1
             self._counters["pipelines_done"] += 1
@@ -1246,15 +1329,19 @@ class Runner:
             self._emit(
                 "pipeline.failed",
                 pipeline_id=spec.pipeline_id,
-                data={"error": str(problem), "phase": "resource_check"},
+                data={"error": str(problem), "phase": phase},
             )
             return None
         if start_index:
-            self._emit(
-                "pipeline.resumed",
-                pipeline_id=spec.pipeline_id,
-                data={"from_seq": start_index, "resume_of": resumed_from},
-            )
+            resumed_data: dict[str, Any] = {"from_seq": start_index, "resume_of": resumed_from}
+            if handoff_resume is not None:
+                resumed_data["via"] = "handoff"
+                resumed_data["handoff"] = {
+                    "from_task": handoff_resume.from_task,
+                    "from_seq": handoff_resume.from_seq,
+                    "entry_artifact_id": handoff_resume.entry_artifact_id,
+                }
+            self._emit("pipeline.resumed", pipeline_id=spec.pipeline_id, data=resumed_data)
 
         seed_artifact = self.store.get_artifact(spec.pipeline_id, SEED_SEQ)
         if seed_artifact is None or not seed_artifact.available:
@@ -1279,8 +1366,80 @@ class Runner:
         self._begin_task(state)
         return state
 
+    def _latest_handoff(self, pipeline_id: str) -> HandoffRecord | None:
+        """The pipeline's newest ledger row, or ``None`` when it never handed off.
+
+        Only ever called on a pipeline whose spec declares ``control`` and whose store passed the
+        capability probe in :meth:`_control_problem`, so the read is available by construction.
+        """
+        rows = self.store.handoffs(pipeline_id=pipeline_id, limit=1)
+        return rows[-1] if rows else None
+
+    def _handoff_resume_point(
+        self, spec: PipelineSpec, handoff: HandoffRecord
+    ) -> tuple[int, Artifact, Any] | None:
+        """Load a recorded hop's entry state: ``(start_seq, artifact, value)``, or ``None`` when unusable.
+
+        "Unusable" is the same rule an ordinary checkpoint obeys — the artifact is missing, its payload
+        was not kept, or it no longer decodes — and it is reported as ``pipeline.checkpoint_missing`` /
+        ``pipeline.checkpoint_unusable`` so a restart-from-zero is never silent.
+        """
+        assert handoff.to_seq is not None, "_handoff_resume_point is only for forward handoffs"
+        # `int()` rather than `handoff.entry_seq or 0`: a persisted row always carries its entry
+        # address, and a missing one must be loud instead of silently reading seq 0.
+        entry = self.store.get_artifact(spec.pipeline_id, int(handoff.entry_seq))
+        unavailable = {
+            "handoff_id": handoff.handoff_id,
+            "from_task": handoff.from_task,
+            "from_seq": handoff.from_seq,
+            "to_seq": handoff.to_seq,
+            "entry_artifact_id": handoff.entry_artifact_id,
+        }
+        if entry is None or not entry.available:
+            self._emit(
+                "pipeline.checkpoint_missing",
+                pipeline_id=spec.pipeline_id,
+                data={
+                    "reason": "the handoff entry artifact is gone or its payload was not kept; "
+                    "rerunning the whole pipeline",
+                    **unavailable,
+                },
+            )
+            return None
+        try:
+            value = self.registry.load(entry.encoded())
+        except Exception as exc:
+            self._emit(
+                "pipeline.checkpoint_unusable",
+                pipeline_id=spec.pipeline_id,
+                data={"error": str(exc), **unavailable},
+            )
+            return None
+        return handoff.to_seq, entry, value
+
+    def _control_problem(self, spec: PipelineSpec) -> ConfigError | None:
+        """A control-enabled pipeline needs a store that can commit a handoff atomically.
+
+        Checked when the pipeline is opened, so a store without the capability is a clear configuration
+        error instead of a jump that is silently not durable. Non-atomic handoffs are not offered: the
+        ledger, the source task and the cursor land together or the feature is refused.
+        """
+        if spec.control is None or supports_handoff(self.store):
+            return None
+        inner = getattr(self.store, "inner", self.store)
+        return ConfigError(
+            f"pipeline {spec.name!r} declares control (handoffs), but the store backend "
+            f"{type(inner).__name__} does not provide the optional commit_handoff/reset_pipeline capability; a handoff "
+            "is a durability promise, so it is refused rather than downgraded (see store/base.py)"
+        )
+
     def _settle_terminal_cursor(
-        self, spec: PipelineSpec, record: PipelineRecord, run_id: str
+        self,
+        spec: PipelineSpec,
+        record: PipelineRecord,
+        run_id: str,
+        *,
+        handoff: HandoffRecord | None = None,
     ) -> bool:
         """Settle a failed/interrupted row whose cursor already reached (or passed) the end.
 
@@ -1295,6 +1454,10 @@ class Runner:
           **decodable**.
         * ``n_tasks_done > n_tasks`` — not a state the Runner can create. The row is reported as corrupt
           and is never promoted to success; the cursor is deliberately left untouched as the evidence.
+
+        ``handoff`` names the ledger row that ended the pipeline early: the terminal artifact is then that
+        row's *entry* artifact rather than the chain's last slot, which is exactly why this repair has to
+        be consulted before the linear rule (an early ``END`` left no artifact at ``n_tasks - 1``).
 
         A repair that fails — in ``mark_final`` or in the terminal settle itself — must never replace the
         failure that created the torn state: the row is left exactly as it was (state, cursor, owning run
@@ -1316,6 +1479,10 @@ class Runner:
             "n_tasks_done": record.n_tasks_done,
             "n_tasks_total": spec.n_tasks,
         }
+        if handoff is not None:
+            previous["handoff_id"] = handoff.handoff_id
+            previous["handoff_from"] = handoff.from_task
+            previous["handoff_entry"] = handoff.entry_artifact_id
         if record.n_tasks_done > spec.n_tasks:
             error = CorruptCheckpoint(
                 f"stored cursor n_tasks_done={record.n_tasks_done} exceeds the {spec.n_tasks} "
@@ -1337,7 +1504,11 @@ class Runner:
             )
             return True
 
-        last = self.store.get_artifact(spec.pipeline_id, spec.n_tasks - 1)
+        last = (
+            self.store.get_artifact(spec.pipeline_id, int(handoff.entry_seq))
+            if handoff is not None
+            else self.store.get_artifact(spec.pipeline_id, spec.n_tasks - 1)
+        )
         if last is None or not last.available:
             self._emit(
                 "pipeline.checkpoint_missing",
@@ -1403,7 +1574,12 @@ class Runner:
         self._emit(
             "pipeline.succeeded",
             pipeline_id=spec.pipeline_id,
-            data={"tasks": spec.n_tasks, "resumed_from": None, "repaired": True},
+            data={
+                "tasks": spec.n_tasks,
+                "resumed_from": None,
+                "repaired": True,
+                **({"handed_off": True} if handoff is not None else {}),
+            },
         )
         return True
 
@@ -1490,6 +1666,13 @@ class Runner:
                 )
                 return
 
+            if result.handoff is not None:
+                # ★ a handoff is a checkpoint of a different shape: one commit writes the source task
+                # row, the handed-off attempt, the entry artifact, the ledger row and the cursor.
+                if self._commit_handoff(state, result.handoff):
+                    return  # END: the pipeline finished here
+                continue  # forward: the target is already open, run it next
+
             outcome = result.outcome or _Outcome(
                 error=PyAttackerError("attempt finished without a result")
             )
@@ -1548,6 +1731,77 @@ class Runner:
             state.artifact = outcome.artifact
             state.seq += 1
             self._begin_task(state)
+
+    def _commit_handoff(self, state: _RunState, hop: _HandoffPlan) -> bool:
+        """Commit one handoff and continue the pipeline at its target (or finish it).
+
+        The store does the whole commit atomically (see the capability contract in ``store/base.py``), so
+        the ledger row, the finalized source task, the handed-off attempt, the entry artifact and the new
+        cursor cannot come apart: after a crash, :meth:`_open_pipeline` sees either none of them or all of
+        them. The ``pipeline.handoff`` event is the audit trail, not the recovery source — a hard kill can
+        lose it while the ledger stays authoritative, which the docs say out loud.
+
+        Returns ``True`` when the pipeline finished here (``END``), ``False`` when the target has been
+        opened and execution continues there.
+        """
+        spec = state.spec
+        record = HandoffRecord(
+            pipeline_id=state.pipeline_id,
+            run_id=state.run_id,
+            from_seq=state.seq,
+            from_task=state.task_spec.name,
+            to_seq=hop.target,
+            to_task=hop.to_task,
+            # A payload handoff has no address until the store allocates one inside the commit.
+            entry_seq=hop.entry_seq,
+            entry_reused=hop.reused,
+            reason=hop.reason,
+        )
+        stored = self.store.commit_handoff(
+            record,
+            task=state.task_record,
+            attempt=hop.attempt,
+            payload=hop.payload,
+            cursor=spec.n_tasks if hop.target is None else hop.target,
+            final=hop.target is None,
+        )
+        self._emit(
+            "pipeline.handoff",
+            pipeline_id=state.pipeline_id,
+            task_run_id=state.task_record.task_run_id,
+            data={
+                "task": state.task_spec.name,
+                "seq": state.seq,
+                "to_task": hop.to_task,
+                "to_seq": hop.target,
+                "reason": hop.reason,
+                "handoff_id": record.handoff_id,
+                "entry_artifact_id": record.entry_artifact_id,
+                "entry_reused": hop.reused,
+            },
+        )
+        if hop.target is None:
+            state.record.n_tasks_done = spec.n_tasks
+            self._counters["pipelines_succeeded"] += 1
+            self._counters["pipelines_done"] += 1
+            self._check_all_done()
+            self._emit(
+                "pipeline.succeeded",
+                pipeline_id=state.pipeline_id,
+                data={"tasks": spec.n_tasks, "resumed_from": state.start_index, "handed_off": True},
+            )
+            return True
+        # Forward hop: the cursor is a *position* now, not a count of executed tasks — the skipped slots
+        # never ran, and their task rows deliberately do not exist.
+        state.record.n_tasks_done = hop.target
+        state.seq = hop.target
+        if not hop.reused:
+            state.value = hop.entry_value
+            state.artifact = stored
+        # A reused entry keeps value/artifact exactly as they were: the target enters with the same
+        # durable input this task received, and the ledger references that artifact's address.
+        self._begin_task(state)
+        return False
 
     def _pool_problem(self, spec: PipelineSpec) -> ConfigError | None:
         """Problems that should be blocked at construction time: a task declares an unknown resource pool."""
@@ -1647,6 +1901,24 @@ class Runner:
                 f"task {task_spec.name!r} ended while still holding {leaked} leases (strict_leases=True)"
             )
 
+        # ---------------- a handoff is a return, intercepted before it is ever encoded ----------------
+        # Deliberately after the lease check: a leak under strict_leases stays a task failure, exactly as
+        # it would for any other non-success exit, and a returned directive must not paper over it.
+        if error is None and isinstance(out_value, Handoff):
+            try:
+                hop = self._handoff_plan(
+                    state, out_value, task_run_id, attempts_used, attempt_started, attempt_ms, ctx
+                )
+            except Exception as exc:  # authoring error (FatalError) or an unencodable payload
+                error = exc
+            else:
+                record.state = "handed_off"
+                record.ended_at = time.time()
+                record.duration_ms = attempt_ms
+                record.output_artifact_id = None  # a handed-off task produces no artifact of its own
+                record.error_class = record.error_type = record.error_message = None
+                return _TaskResult(handoff=hop, attempts=attempts_used)
+
         if error is None:
             artifact = self._store_artifact(spec, task_spec.name, seq, out_value)
             record.state = "succeeded"
@@ -1724,7 +1996,55 @@ class Runner:
         return _TaskResult(retry_after=delay, attempts=attempts_used)
 
     # ------------------------------------------------------------------ helpers
-    def _record_attempt(
+    def _handoff_plan(
+        self,
+        state: _RunState,
+        directive: Handoff,
+        task_run_id: str,
+        attempts_used: int,
+        attempt_started: float,
+        attempt_ms: float,
+        ctx: TaskContext,
+    ) -> _HandoffPlan:
+        """Resolve a returned directive against the declared edges, and encode its payload if it has one.
+
+        Everything that can be an authoring mistake is raised here, inside the attempt, so it becomes an
+        ordinary fatal task failure with a clear message instead of a control transfer the pipeline did
+        not declare. :class:`~pyattacker.errors.FatalError` is never retried.
+        """
+        spec = state.spec
+        plan: ControlPlan | None = spec.control
+        name = state.task_spec.name
+        if plan is None:
+            raise FatalError(
+                f"task {name!r} returned a Handoff, but pipeline {spec.name!r} declares no control block; "
+                "declare control={'edges': {...}} on the pipeline to allow a handoff (see docs/design.md §4.8)"
+            )
+        target = plan.allows(state.seq, directive.target)
+        reused = directive.reuses_input
+        if reused and state.artifact is None:  # pragma: no cover - defensive: a task always has an input
+            raise FatalError(
+                f"task {name!r} handed off without a value, but it has no durable input artifact to reuse"
+            )
+        try:
+            payload = None if reused else self.registry.dump(directive.value)
+        except Exception as exc:
+            raise FatalError(f"task {name!r} returned an unencodable handoff payload: {exc}") from exc
+        return _HandoffPlan(
+            target=target,
+            to_task=None if target is None else spec.tasks[target].name,
+            reason=directive.reason,
+            reused=reused,
+            entry_seq=state.artifact.seq if reused and state.artifact is not None else None,
+            entry_value=UNSET if reused else directive.value,
+            payload=payload,
+            attempt=self._attempt_record(
+                spec, state.task_spec, task_run_id, attempts_used, attempt_started, attempt_ms,
+                "handed_off", None, ctx.lease_log(), {},
+            ),
+        )
+
+    def _attempt_record(
         self,
         spec: PipelineSpec,
         task_spec: TaskSpec,
@@ -1737,8 +2057,14 @@ class Runner:
         leases: Sequence[Any],
         extra: Mapping[str, Any],
     ) -> AttemptRecord:
+        """Build one attempt row without writing it.
+
+        Split out from :meth:`_record_attempt` because a handoff's attempt must be written by the atomic
+        commit (``store.commit_handoff``) rather than through the ordinary ``record_attempt`` path —
+        which is also what keeps it out of the write-behind buffer.
+        """
         decision = dict(extra.get("decision", {}))
-        record = AttemptRecord(
+        return AttemptRecord(
             pipeline_id=spec.pipeline_id,
             run_id=self._run_id or "",
             task_run_id=task_run_id,
@@ -1760,6 +2086,23 @@ class Runner:
             retry_delay_s=decision.get("delay_s"),
             decision=decision,
             leases=[_lease_entry(lease) for lease in leases],
+        )
+
+    def _record_attempt(
+        self,
+        spec: PipelineSpec,
+        task_spec: TaskSpec,
+        task_run_id: str,
+        attempt_no: int,
+        started: float,
+        duration_ms: float,
+        outcome: str,
+        error: BaseException | None,
+        leases: Sequence[Any],
+        extra: Mapping[str, Any],
+    ) -> AttemptRecord:
+        record = self._attempt_record(
+            spec, task_spec, task_run_id, attempt_no, started, duration_ms, outcome, error, leases, extra
         )
         return self.store.record_attempt(record)
 

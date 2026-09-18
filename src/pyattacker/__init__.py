@@ -71,6 +71,7 @@ from .errors import (
     error_class_of,
 )
 from .export import FORMATS, ROW_KINDS, export_store, export_stores, iter_rows
+from .handoff import Handoff
 from .merge import MergedReport, merge_reports
 from .pipeline import Chain, PipelineSpec, PipelineTemplate, compute_spec_digest, pipeline, with_retry
 from .plugins import PLUGINS, PluginRegistry, list_plugins
@@ -78,7 +79,15 @@ from .resource import Bus, Lease, Pool, Resource, ResourceEvent, ResourceState
 from .runner import RunConfig, Runner, RunReport
 from .server import StatsServer
 from .shard import in_shard, parse_shard, shard_index, shard_specs, shard_store_path
-from .store import AttemptRecord, EventRecord, MemoryStore, PipelineRecord, SqliteStore, open_store
+from .store import (
+    AttemptRecord,
+    EventRecord,
+    HandoffRecord,
+    MemoryStore,
+    PipelineRecord,
+    SqliteStore,
+    open_store,
+)
 from .task import UNSET, Retrying, TaskContext, TaskSpec, build_task_spec, task
 from .tasks import (
     boom,
@@ -120,6 +129,7 @@ __all__ = [
     "PipelineTemplate",
     "compute_spec_digest",
     "with_retry",
+    "Handoff",
     "Artifact",
     "Codec",
     "CodecRegistry",
@@ -143,6 +153,7 @@ __all__ = [
     "SqliteStore",
     "AttemptRecord",
     "EventRecord",
+    "HandoffRecord",
     "PipelineRecord",
     # declarative
     "load_spec",
