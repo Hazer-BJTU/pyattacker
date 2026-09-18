@@ -10,8 +10,10 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
 import itertools
+import operator
 import typing
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -19,6 +21,7 @@ from typing import Any
 
 from .artifact import DEFAULT_REGISTRY, CodecRegistry, canonical_json, digest_of
 from .errors import PipelineBuildError
+from .handoff import ControlPlan, Handoff, build_control
 from .task import TaskSpec
 
 __all__ = ["Chain", "PipelineTemplate", "PipelineSpec", "pipeline"]
@@ -54,7 +57,31 @@ class Chain:
         return self.tasks[index]
 
 
+def _without_handoff(annotation: Any) -> Any:
+    """Drop a ``Handoff`` member from an annotation, because a directive is never an artifact value.
+
+    A task that may hand off declares it in its return type (``-> Handoff | Report``). The remaining
+    members still have to chain into the next task; an annotation of exactly ``Handoff`` chains with
+    anything, because such a task produces no artifact at all on that path. The accepted side is
+    treated the same way for symmetry — a value passed across an edge is never a ``Handoff``.
+    """
+    if annotation is Handoff:
+        return Any
+    members = typing.get_args(annotation)
+    if not members or Handoff not in members:
+        return annotation
+    remaining = tuple(member for member in members if member is not Handoff)
+    if not remaining:  # pragma: no cover - defensive (Handoff alone is handled above)
+        return Any
+    if len(remaining) == 1:
+        return remaining[0]
+    # The union is built from a runtime tuple, so `X | Y` is spelled as a fold rather than statically.
+    return functools.reduce(operator.or_, remaining)
+
+
 def _compatible(produced: Any, accepted: Any) -> bool:
+    produced = _without_handoff(produced)
+    accepted = _without_handoff(accepted)
     if produced is Any or accepted is Any:
         return True
     if produced is inspect.Parameter.empty or accepted is inspect.Parameter.empty:
@@ -107,6 +134,10 @@ class PipelineTemplate:
     tags: dict[str, Any] = field(default_factory=dict)
     spec_digest: str = ""
     registry: CodecRegistry = field(default=DEFAULT_REGISTRY, compare=False, repr=False)
+    # The resolved ``control=`` declaration (**advanced**), or None for an ordinary linear pipeline. Kept
+    # after ``registry`` so positional construction keeps its meaning, and excluded from comparison like
+    # the registry: identity lives in ``spec_digest``, which folds the plan in when there is one.
+    control: ControlPlan | None = field(default=None, compare=False)
 
     # ------------------------------------------------------- construction
     @property
@@ -121,12 +152,15 @@ class PipelineTemplate:
         return [t.name for t in self.tasks]
 
     def describe(self) -> dict[str, Any]:
-        return {
+        described = {
             "name": self.name,
             "tasks": self.task_names(),
             "tags": dict(self.tags),
             "spec_digest": self.spec_digest,
         }
+        if self.control is not None:
+            described["control"] = self.control.describe()
+        return described
 
     # ------------------------------------------------------------ binding
     def bind(self, seed: Any, *, key: str | None = None, repeat: int = 0) -> "PipelineSpec":
@@ -187,12 +221,28 @@ class PipelineSpec:
     def n_tasks(self) -> int:
         return len(self.template.tasks)
 
+    @property
+    def control(self) -> ControlPlan | None:
+        """The pipeline's resolved control declaration, or ``None`` when it is an ordinary chain."""
+        return self.template.control
+
     def __repr__(self) -> str:  # pragma: no cover - debugging
         return f"<PipelineSpec {self.name} id={self.pipeline_id[:12]} tasks={self.n_tasks}>"
 
 
-def compute_spec_digest(tasks: Sequence[TaskSpec], *, include_code: bool = True) -> str:
-    payload = [t.fingerprint(include_code=include_code) for t in tasks]
+def compute_spec_digest(
+    tasks: Sequence[TaskSpec], *, include_code: bool = True, control: ControlPlan | None = None
+) -> str:
+    """The pipeline's identity: the task fingerprints, plus the control block **only when there is one**.
+
+    That "only when" is a compatibility contract, not an optimisation: folding an always-present key in
+    would change every stored ``spec_digest``, and with it every default pipeline id, checkpoint and
+    shard assignment — the migration the ``v2:`` bump already paid for once. A control-free pipeline
+    therefore digests exactly what it digested before this feature existed.
+    """
+    payload: list[Any] = [t.fingerprint(include_code=include_code) for t in tasks]
+    if control is not None:
+        payload.append({"control": control.fingerprint()})
     return "v2:" + digest_of(canonical_json(payload))
 
 
@@ -202,8 +252,19 @@ def pipeline(
     tags: Mapping[str, Any] | None = None,
     include_code: bool = True,
     registry: CodecRegistry | None = None,
+    control: Mapping[str, Any] | None = None,
 ) -> PipelineTemplate:
-    """Declare a pipeline: ``pipeline("qa", fetch | ask | judge | metrics)``."""
+    """Declare a pipeline: ``pipeline("qa", fetch | ask | judge | metrics)``.
+
+    ``control`` (**advanced**, opt-in) declares which task may hand off where::
+
+        pipeline("qa", retrieve | ask | judge | report,
+                 control={"edges": {"judge": ["report", "end"], "ask": ["report"]}})
+
+    A destination is a task name, a task's seq or ``"end"``, and it must be strictly later than its
+    source (v1 is forward-only). Without the block nothing changes: a returned ``Handoff`` is then a
+    configuration error, not a silent jump. See ``docs/design.md`` §4.8.
+    """
     if not tasks_or_chain:
         raise PipelineBuildError("pipeline needs at least one task")
     if len(tasks_or_chain) == 1:
@@ -222,12 +283,14 @@ def pipeline(
                     f"pipeline members must be tasks, got {type(item).__name__}; the multi-argument form cannot mix in a chain"
                 )
     _validate_chain(items)
+    plan = build_control(control, [t.name for t in items]) if control is not None else None
     return PipelineTemplate(
         name=name,
         tasks=tuple(items),
         tags=dict(tags or {}),
-        spec_digest=compute_spec_digest(items, include_code=include_code),
+        spec_digest=compute_spec_digest(items, include_code=include_code, control=plan),
         registry=registry or DEFAULT_REGISTRY,
+        control=plan,
     )
 
 

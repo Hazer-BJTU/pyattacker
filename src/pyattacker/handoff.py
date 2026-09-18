@@ -1,0 +1,347 @@
+"""Handoff —— **advanced, opt-in**: a task may *skip ahead* by returning a directive instead of a value.
+
+Ordinary pipelines never touch this module: without a ``control`` declaration on the pipeline, a task
+that returns a :class:`Handoff` is a configuration error and nothing else changes (see
+``pipeline.pipeline`` and ``docs/design.md`` §4.8).
+
+The two moving parts:
+
+* :class:`Handoff` —— the value a task returns instead of its artifact. Because it is a return, it is
+  never a failure: the retry policy is not consulted, no exception class is involved, and a task-side
+  ``except Exception:`` cannot swallow the control transfer. The runner intercepts the directive before
+  it is ever encoded as an artifact.
+* :class:`ControlPlan` —— the resolved form of the pipeline's ``control={"edges": {...}}`` declaration.
+  Edges are **declared, not derived**: a handoff along an undeclared edge is a fatal error instead of a
+  silent jump, and every declared edge is range-checked against the chain when the pipeline is built.
+
+Invariants (v1):
+* forward only —— a destination is always strictly later than its source, so traversal stays acyclic and
+  terminates structurally;
+* no joins, no cross-pipeline transfer, no target invented at runtime;
+* the entry state always has a durable reference: ``Handoff.to(target)`` with no value reuses the
+  artifact this task received, an explicit value becomes a payload artifact of its own.
+"""
+
+from __future__ import annotations
+
+import difflib
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any
+
+from .errors import FatalError, PipelineBuildError, PyAttackerError
+from .task import UNSET
+
+__all__ = ["END", "Handoff", "ControlPlan", "build_control"]
+
+END = "end"
+"""The destination spelling for "finish the pipeline here" —— ``Handoff.end()`` is its runtime form."""
+
+CONTROL_KEYS = frozenset({"edges"})
+"""Keys a ``control=`` block may set. v1 has exactly one mode, so ``mode`` is deliberately absent."""
+
+
+@dataclass(frozen=True, slots=True)
+class Handoff:
+    """A task's directive: "this pipeline continues over there, with this entry state".
+
+    Built through :meth:`to` / :meth:`end` rather than by hand, and returned from a task like any other
+    value::
+
+        @task("judge")
+        async def judge(value: Verdict, ctx: TaskContext) -> Handoff | Report:
+            if value.good_enough:
+                return Handoff.end(value.as_report(), reason="already good enough")
+            if not value.needs_metrics:
+                return Handoff.to("report", value.as_report(), reason="metrics not needed")
+            return await write_report(value)
+
+    Attributes:
+        target: A task name, a task's seq, or ``None`` for ``END``.
+        value: The target's entry state; :data:`~pyattacker.task.UNSET` means "reuse the artifact this
+            task received" (an explicit ``None`` is a real payload, not "no value").
+        reason: Free-form explanation, recorded in the handoff ledger and the ``pipeline.handoff`` event.
+    """
+
+    target: str | int | None
+    value: Any = UNSET
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        # FatalError, not a build error: the directive is normally *built inside the task*, and an
+        # authoring mistake must never be retried (`FatalError` is outside every retry policy).
+        if self.target is not None and not isinstance(self.target, (str, int)):
+            raise FatalError(
+                f"a Handoff target must be a task name, a seq or END, got {type(self.target).__name__}"
+            )
+        if isinstance(self.target, bool):  # bool is an int subclass; `Handoff.to(True)` is always a typo
+            raise FatalError("a Handoff target must be a task name or a seq, not a bool")
+        if isinstance(self.target, str) and not self.target:
+            raise FatalError("a Handoff target name must not be empty")
+        if isinstance(self.target, int) and self.target < 0:
+            raise FatalError(f"a Handoff target seq must be >= 0, got {self.target}")
+        if not isinstance(self.reason, str):
+            raise FatalError(f"a Handoff reason must be a string, got {type(self.reason).__name__}")
+
+    @classmethod
+    def to(cls, target: str | int, value: Any = UNSET, *, reason: str = "") -> "Handoff":
+        """Continue at ``target`` (a task name, a seq, or ``"end"``) with ``value`` as its entry state."""
+        if target == END:
+            return cls(None, value, reason)
+        return cls(target, value, reason)
+
+    @classmethod
+    def end(cls, value: Any = UNSET, *, reason: str = "") -> "Handoff":
+        """Finish the pipeline successfully here, with ``value`` as the final artifact."""
+        return cls(None, value, reason)
+
+    @property
+    def is_end(self) -> bool:
+        return self.target is None
+
+    @property
+    def reuses_input(self) -> bool:
+        """Whether the target enters with the artifact this task received, rather than a new payload."""
+        return self.value is UNSET
+
+    def __repr__(self) -> str:  # the payload is omitted on purpose: it can be arbitrarily large
+        head = "Handoff.end(" if self.target is None else f"Handoff.to({self.target!r}, "
+        parts = [] if self.value is UNSET else ["value=<payload>"]
+        parts.append(f"reason={self.reason!r}")
+        return head + ", ".join(parts) + ")"
+
+
+@dataclass(frozen=True)
+class ControlPlan:
+    """The resolved, validated form of a pipeline's ``control=`` declaration.
+
+    Resolution happens once, at pipeline-build time: names become seqs, "end" becomes ``None``, and every
+    edge is range-checked (both ends exist, the destination is strictly later). The plan is then the
+    single source of truth at runtime — a returned :class:`Handoff` is matched against ``edges``, so an
+    undeclared jump fails loudly instead of silently rewriting the pipeline's shape.
+
+    Attributes:
+        task_names: The chain's task names, by seq — used for resolution, error messages and rendering.
+        edges: ``{from_seq: (destination seqs…)}`` with ``None`` for ``END``; both keys and destinations
+            are sorted, so the plan (and therefore ``spec_digest``) does not depend on declaration order.
+    """
+
+    task_names: tuple[str, ...] = ()
+    edges: Mapping[int, tuple[int | None, ...]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for from_seq, targets in self.edges.items():
+            if not 0 <= from_seq < len(self.task_names):
+                raise PipelineBuildError(f"control: no task at seq {from_seq}")
+            for target in targets:
+                if target is not None and target <= from_seq:
+                    raise PipelineBuildError(
+                        f"control: handoffs are forward-only, but {from_seq} -> {target} is not"
+                    )
+
+    # -------------------------------------------------------------- resolution
+    def targets(self, from_seq: int) -> tuple[int | None, ...]:
+        """The destinations declared for the task at ``from_seq`` (empty when it declares none)."""
+        return tuple(self.edges.get(from_seq, ()))
+
+    def allows(self, from_seq: int, target: str | int | None) -> int | None:
+        """Resolve one runtime target against the declared edges, or raise :class:`FatalError`.
+
+        The error is fatal by design: an undeclared edge is an authoring mistake, so it must not be
+        retried, silently ignored, or turned into an ordinary value.
+        """
+        destination = self.resolve_target(target, where=f"task {self.task_names[from_seq]!r}")
+        if destination is None and from_seq == len(self.task_names) - 1:
+            raise FatalError(
+                f"task {self.task_names[from_seq]!r} is the last task, so Handoff.end() has no effect; "
+                "return the value instead"
+            )
+        declared = self.edges.get(from_seq, ())
+        if destination not in declared:
+            detail = (
+                "the pipeline declares only [" + ", ".join(self._render(dest) for dest in declared) + "] for it"
+                if declared
+                else "the pipeline declares no edge from it"
+            )
+            raise FatalError(
+                f"task {self.task_names[from_seq]!r} (seq {from_seq}) handed off to "
+                f"{self._render(destination)}, but {detail}; add the edge to control={{'edges': {{...}}}}"
+            )
+        return destination
+
+    def resolve_target(self, target: str | int | None, *, where: str) -> int | None:
+        """Turn a name / seq / ``"end"`` / ``None`` into a destination, or raise :class:`FatalError`.
+
+        ``None`` is accepted alongside ``"end"`` because that is the runtime form of
+        :meth:`Handoff.end` — the declaration spells it ``"end"``, a returned directive carries ``None``.
+        """
+        if target is None or target == END:
+            return None
+        if isinstance(target, bool) or not isinstance(target, (str, int)):
+            raise FatalError(f"{where} handed off to {target!r}, which is not a task name, a seq or END")
+        if isinstance(target, int):
+            if not 0 <= target < len(self.task_names):
+                raise FatalError(
+                    f"{where} handed off to seq {target}, but the pipeline has "
+                    f"{len(self.task_names)} task(s) (seq 0..{len(self.task_names) - 1})"
+                )
+            return target
+        return _lookup_name(target, self.task_names, where=where, kind="destination", error=FatalError)
+
+    # ------------------------------------------------------------------ views
+    def fingerprint(self) -> dict[str, Any]:
+        """The canonical, digestable form: resolved seqs, so the spelling of a declaration is irrelevant."""
+        return {
+            "edges": {
+                str(from_seq): [("end" if target is None else target) for target in targets]
+                for from_seq, targets in sorted(self.edges.items())
+            }
+        }
+
+    def describe(self) -> dict[str, Any]:
+        """The declaration as the effective config shows it: task names, ``"end"`` for the terminal."""
+        return {
+            "edges": {
+                self.task_names[from_seq]: [self._render(target) for target in targets]
+                for from_seq, targets in sorted(self.edges.items())
+            }
+        }
+
+    def _render(self, target: int | None) -> str:
+        if target is None:
+            return END
+        name = self.task_names[target]
+        # A repeated task name needs its seq to be unambiguous; a unique one reads better bare.
+        return f"{name}#{target}" if self.task_names.count(name) > 1 else name
+
+
+def _lookup_name(
+    name: str,
+    task_names: Sequence[str],
+    *,
+    where: str,
+    kind: str,
+    error: type[PyAttackerError] = PipelineBuildError,
+) -> int:
+    """Resolve a task name to its seq; an ambiguous name is an error, not a guess.
+
+    ``error`` is the class to raise: :class:`~pyattacker.errors.PipelineBuildError` while a pipeline is
+    being built (where the declarative layer turns it into a field-path config error), and
+    :class:`~pyattacker.errors.FatalError` for the same mistake made at runtime.
+    """
+    matches = [index for index, candidate in enumerate(task_names) if candidate == name]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        known = sorted(set(task_names))
+        close = difflib.get_close_matches(name, known, n=1)
+        hint = f" (did you mean {close[0]!r}?)" if close else ""
+        raise error(
+            f"{where} names unknown {kind} task {name!r}{hint}; tasks: {[(i, n) for i, n in enumerate(task_names)]}"
+        )
+    raise error(
+        f"{where} names {kind} task {name!r}, which appears at seqs {matches} — "
+        "use the numeric seq to say which one"
+    )
+
+
+def build_control(raw: Any, task_names: Sequence[str]) -> ControlPlan:
+    """Resolve and structurally validate a ``control=`` declaration.
+
+    The single validation entry for both worlds: ``pipeline(control=...)`` calls it directly, and the
+    declarative layer calls it so a config file reports the same problems with a field path. Every
+    message therefore starts with a path relative to the block (``control.edges['judge'][0]: …``), which
+    the declarative layer prefixes with ``pipeline.``.
+
+    Structural checks only: a handoff payload is an arbitrary argument, not the source's normal return
+    type, so ``source.returns -> target.accepts`` is deliberately *not* checked — it would reject valid
+    handoffs and accept invalid ones.
+    """
+    if not isinstance(raw, Mapping):
+        raise PipelineBuildError(
+            f"control: must be a mapping like {{'edges': {{'judge': ['report', 'end']}}}}, "
+            f"got {type(raw).__name__}"
+        )
+    unknown = sorted(str(key) for key in raw if key not in CONTROL_KEYS)
+    if unknown:
+        note = (
+            "; v1 has exactly one mode, so 'edges' is the only key"
+            if "mode" in unknown
+            else f"; available: {sorted(CONTROL_KEYS)}"
+        )
+        raise PipelineBuildError(f"control: unknown field(s) {unknown}{note}")
+    if "edges" not in raw:
+        raise PipelineBuildError("control: missing required field 'edges'")
+    raw_edges = raw["edges"]
+    if not isinstance(raw_edges, Mapping):
+        raise PipelineBuildError(
+            f"control.edges: must be a mapping of task -> [destinations], got {type(raw_edges).__name__}"
+        )
+    if not raw_edges:
+        raise PipelineBuildError("control.edges: is empty; declare at least one edge or drop the control block")
+
+    names = tuple(task_names)
+    edges: dict[int, tuple[int | None, ...]] = {}
+    for token, destinations in raw_edges.items():
+        path = f"control.edges[{token!r}]"
+        if token == END:
+            raise PipelineBuildError(f"{path}: 'end' is a destination, not a task")
+        if isinstance(token, bool) or not isinstance(token, (str, int)):
+            raise PipelineBuildError(
+                f"{path}: an edge source must be a task name or a seq, got {type(token).__name__}"
+            )
+        if isinstance(token, int):
+            if not 0 <= token < len(names):
+                raise PipelineBuildError(
+                    f"{path}: no task at seq {token}; the chain has {len(names)} task(s) "
+                    f"(seq 0..{len(names) - 1})"
+                )
+            from_seq = token
+        else:
+            from_seq = _lookup_name(token, names, where=path, kind="source")
+        if not isinstance(destinations, (list, tuple)):
+            raise PipelineBuildError(
+                f"{path}: destinations must be a list, got {type(destinations).__name__}"
+            )
+        if not destinations:
+            raise PipelineBuildError(f"{path}: has no destinations; drop the entry instead")
+
+        resolved: set[int | None] = set()
+        for index, destination in enumerate(destinations):
+            target = _build_target(
+                destination, names, from_seq=from_seq, path=f"{path}[{index}]", source=names[from_seq]
+            )
+            resolved.add(target)
+        edges[from_seq] = tuple(sorted(resolved, key=lambda value: (value is None, value)))
+
+    return ControlPlan(task_names=names, edges=edges)
+
+
+def _build_target(destination: Any, names: Sequence[str], *, from_seq: int, path: str, source: str) -> int | None:
+    """Validate one declared destination of one declared edge."""
+    if destination == END:
+        if from_seq == len(names) - 1:
+            raise PipelineBuildError(
+                f"{path}: 'end' from the last task {source!r} has no effect (it is already the end); "
+                "drop the edge"
+            )
+        return None
+    if isinstance(destination, bool) or not isinstance(destination, (str, int)):
+        raise PipelineBuildError(
+            f"{path}: a destination must be a task name, a seq or 'end', got {type(destination).__name__}"
+        )
+    if isinstance(destination, int):
+        if not 0 <= destination < len(names):
+            raise PipelineBuildError(
+                f"{path}: no task at seq {destination}; the chain has {len(names)} task(s) "
+                f"(seq 0..{len(names) - 1})"
+            )
+        target: int = destination
+    else:
+        target = _lookup_name(destination, names, where=path, kind="destination")
+    if target <= from_seq:
+        raise PipelineBuildError(
+            f"{path}: destination {names[target]!r} (seq {target}) is not later than the source "
+            f"{source!r} (seq {from_seq}); v1 handoffs are forward-only"
+        )
+    return target

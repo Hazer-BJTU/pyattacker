@@ -1,6 +1,6 @@
 # pyattacker Design Document
 
-> Version: 0.1.0 (M0–M4 complete — see "Implemented / Left for later" in Section 9)
+> Version: 0.1.0 (M0–M4 complete, M5 advanced control flow in progress — see "Implemented / Left for later" in Section 9)
 > In one sentence: **an async task orchestration framework centered on the artifact, using the pipeline as the unit of completion, and the resource pool as the only shared surface.**
 > It does not touch the network, does not do reduction, and does not do DAG scheduling — it is only responsible for "running tens of thousands of mutually independent pipelines to completion, reliably, recoverably, and observably".
 
@@ -34,7 +34,10 @@ These six are the foundation of the design; no change may break them:
 1. **Zero semantic coupling between pipelines.** The only shared surface is the resource pool (including bus
    signals). Concurrency is therefore trivial: one coroutine per pipeline, with no global dependency graph.
 2. **Task = a unary `(Artifact) -> Artifact` function**, chained linearly, with no branching and no joining.
-   When you need fan-out/loops/batching, the task does its own `asyncio.gather` internally.
+   When you need fan-out/loops/batching, the task does its own `asyncio.gather` internally. A task may
+   instead **hand off** (§4.8, advanced, opt-in): the chain is still a chain of unary tasks with no joins,
+   and the task is literally still `(Artifact) -> Artifact | Handoff`; what changes is the *traversal order*
+   along declared forward edges, not the topology or the artifact contract.
 3. **Artifacts are persisted as soon as they are produced**, so the **checkpoint granularity = task**, not pipeline.
 4. **Failure is an exception**, and no state machine is introduced. Retry has two orthogonal boundaries: the
    task level (replay with the same input artifact) and the pipeline level (a full rerun).
@@ -97,6 +100,10 @@ Three direct consequences:
 * **pass@k for free**: `template.map(seeds, repeats=3)` expands into three independent pipelines in one go,
   sharing the same seed digest.
 
+The `control` block of a handoff-enabled pipeline (§4.8) is part of this fingerprint **only when it is
+present**: a control-free pipeline digests exactly the task-fingerprint list it always did, so this feature
+invalidates no stored digest, checkpoint or shard assignment (a `v3:` migration would).
+
 The spec fingerprint is versioned as `v2:`. Explicit keys retain their supplied identity, but
 stored spec/seed digests must match before skip or restore. Legacy stores remain readable;
 default IDs change and explicit legacy keys conflict. Closures, globals, endpoint options and
@@ -131,6 +138,10 @@ resume(spec):
     if rec exists and (rec.spec_digest != spec.spec_digest or rec.seed_digest != spec.seed_digest):
         → PipelineIdentityConflict; preserve existing pipeline and checkpoint
     if rec.state == succeeded and not retry_succeeded:  → skip (counted as skipped)
+    if rec.state in (failed, interrupted) and spec declares control and the newest handoff row is an END:
+        → mark_final(entry artifact) + settle succeeded   # before the linear rule below, which cannot
+          decide it: an early END left no artifact at n_tasks - 1; an unusable entry instead rewinds
+          the cursor to 0 and emits checkpoint_missing (§4.8.4)
     if rec.state in (failed, interrupted) and rec.n_tasks_done >= n_tasks:
         if rec.n_tasks_done > n_tasks:    # not a state the Runner can create
             → record CorruptCheckpoint, emit pipeline.corrupt_cursor, leave the cursor as evidence
@@ -144,11 +155,22 @@ resume(spec):
                           # the ordinary restart rule below applies
     start = 0
     if rec.state in (failed, interrupted) and rec.n_tasks_done > 0:
-        prev = store.get_artifact(pid, rec.n_tasks_done - 1)
-        if prev.available:  start = rec.n_tasks_done; prev_value = decode(prev)
-        else:               start = 0   # journal=summary stores no payload → the whole pipeline must be rerun (an event is left behind)
+        h = newest handoff row for pid
+        if h is not None and h.to_seq is not None and h.to_seq >= rec.n_tasks_done:
+            entry = store.get_artifact(pid, h.entry_seq)      # the ledger names the entry state (§4.8.3)
+            if entry.available: start = h.to_seq; prev_value = decode(entry)
+            else:               start = 0   # the entry payload is gone → restart from the seed, loudly
+        else:
+            prev = store.get_artifact(pid, rec.n_tasks_done - 1)
+            if prev.available:  start = rec.n_tasks_done; prev_value = decode(prev)
+            else:               start = 0   # journal=summary stores no payload → the whole pipeline must be rerun (an event is left behind)
     for seq in range(start, n_tasks):  ...
 ```
+
+The handoff branch is consulted first and is deliberately narrow: only the **newest** ledger row can be
+pending, because forward-only handoffs have strictly increasing targets, so a row whose `to_seq` is below the
+cursor has been consumed by later forward progress and the ordinary artifact rule applies. A consumed row
+therefore costs nothing, and a pending one resumes at the target without re-running the source task.
 
 A failure in **either** step of that finalization — the finality mark or the terminal settle — is contained
 by the recovery path: the row is left exactly as it was (original failure, cursor, owning run), and
@@ -338,6 +360,201 @@ own handling contains it, exactly like an ordinary exception. Cancellation is un
 worker still marks its pipeline `interrupted` and re-raises, and supervision does not turn a deliberate cancel
 into a crash.
 
+### 4.8 Advanced: Handoffs —— Declared Forward Jumps (Opt-In, Experimental)
+
+Everything above describes an ordinary pipeline: a chain walked one task at a time, each task returning the
+artifact the next one consumes. This section describes the one feature that changes the *traversal* of that
+chain: a step that can tell the rest of the chain no longer needs to run — the answer is good enough, the
+sample is out of scope, a cached result exists — can **skip ahead** instead of running stations it does not
+need, or hiding the branch inside one task, or raising (which would record the pipeline as failed, which is a
+lie). The feature is deliberately fenced off from the rest:
+
+* **opt-in** — without a `control` declaration a pipeline behaves exactly as before, down to a byte-identical
+  `spec_digest` (see §3.1). Nothing in this section applies to a pipeline that does not ask for it;
+* **advanced tier** — not because it is hard to call, but because it changes the execution model. It is
+  documented under its own heading, released as a minor, and marked *experimental until 1.0*: the guarantees
+  below are the stable part, while the spelling (`Handoff`, `control`) may still change;
+* **forward-only** — a handoff may only skip *ahead*. The motivating case for the capability is the opposite
+  one (a validator sends a bad model output **back** to the generator for another sample), and that model is
+  specified in §4.8.7 so that this first version does not foreclose it. It is not implemented here.
+
+#### 4.8.1 The transport is a return value, not a control-flow exception
+
+A task hands off by **returning** a framework-owned directive instead of a value:
+
+```python
+from pyattacker import Handoff
+
+@task("judge")
+async def judge(value: Verdict, ctx: TaskContext) -> Handoff | Report:
+    if value.good_enough:
+        return Handoff.end(value.as_report(), reason="already good enough")          # finish here
+    if not value.needs_metrics:
+        return Handoff.to("report", value.as_report(), reason="metrics not needed")  # skip ahead
+    return await write_report(value)                                                 # ordinary success
+```
+
+`Handoff.to(target, value=UNSET, *, reason="")` names a destination — a task name, a task's seq, or `"end"`;
+`Handoff.end(value=UNSET, *, reason="")` finishes the pipeline with that value as its final artifact.
+`UNSET` (the sentinel the task layer uses for "not given") means "the target enters with the artifact *this*
+task received"; an explicit value becomes a payload artifact of its own. `None` is a legitimate payload, so
+only `UNSET` means "reuse".
+
+Because the directive is a **return value**, it is not a failure and there is no new failure path:
+
+* the retry policy is never consulted, so `retry.on=(Exception,)` and `retry_unknown=True` cannot turn a
+  handoff into a retry, and no `decision.reason` value is added;
+* no exception class is involved, so a task-side `except Exception:` or a `try/finally` cannot swallow or
+  cancel the transfer — a control transfer buried in an exception is exactly what this design avoids;
+* leases are released on the way out exactly as on success: `async with ctx.acquire(...)` has already
+  returned them, and `finally: ctx.reclaim_now()` still runs. `strict_leases=True` plus a leaked lease
+  stays a task failure, and the handoff is not honoured;
+* cancellation and `timeout_s` are unchanged: a cancelled or timed-out attempt never reaches the return.
+
+The honest cost, accepted deliberately: a handoff is initiated where the task can `return`, so a helper deep
+in the call stack must hand the directive back up. That is the intended trade — an explicit, reviewable
+handoff beats an invisible control transfer — and it keeps the task's signature honest
+(`-> Handoff | Report`).
+
+#### 4.8.2 A handoff is a durable state transition, not a control-flow trick
+
+The runner intercepts the directive inside the attempt, before it is ever encoded as an artifact, and turns
+it into one recorded hop. Five facts land together (see §4.8.4):
+
+| Fact | Where | Meaning |
+|---|---|---|
+| the source task row | `tasks.state` | `handed_off` — it ended cleanly and produced no artifact |
+| the attempt row | `attempts.outcome` | `handed_off`, with an empty `decision` (there was no decision) |
+| the entry artifact | `artifacts` | the target's input: either the artifact the source received, or a new payload |
+| the ledger row | `handoffs` | from/to, the entry reference, whether it was reused, and the author's reason |
+| the cursor | `pipelines.n_tasks_done` | the target's position (`n_tasks` for `END`) |
+
+The ledger is what makes "why does this pipeline's task list skip stations" answerable straight from the
+store, and it is the **source of truth for recovery**. The `pipeline.handoff` event is the audit trail: a hard
+kill can lose the event while the ledger stays authoritative, which is the one asymmetry to remember.
+
+#### 4.8.3 The entry state always has a durable reference, at its own address
+
+`Handoff.to(target)` with no value records `state.artifact.id` — the artifact this task received — so the
+ledger's `entry_artifact_id` is never null. An explicit value is encoded by the project's `CodecRegistry` and
+written as an ordinary artifact whose `seq` is allocated **inside the commit** as `n_tasks + k` (`k` = the
+handoffs already recorded for that pipeline). The documented artifact order therefore becomes:
+
+```
+seed (-1)  →  chain (0 … n-1)  →  handoff payloads (>= n)
+```
+
+Two consequences matter. A payload can never overwrite a task slot (the trap a naive "write it into slot
+`t-1`" design falls into), and it is recorded under the name of the task that handed it off. And
+`Artifact.seq` is no longer globally synonymous with a task position: it is a task position for the chain,
+`-1` for the seed, and a payload address at or above `n_tasks` once control flow is enabled. Readers that
+only ever see the chain keep their existing semantics.
+
+#### 4.8.4 The commit, and the resume rule it enables
+
+A handoff is a checkpoint, so its write ordering is part of the contract. The store gains one **optional**
+capability, `commit_handoff(record, *, task, attempt, payload=None, cursor, final=False)` — the
+`resources()`/`settle_pipeline` precedent — which performs the whole transition **atomically**: finalize the
+source task, insert the handed-off attempt, persist the payload (allocating its address), append the ledger
+row, and move the cursor while keeping the pipeline `running`. For `END` it also marks the entry artifact
+final and settles the pipeline `succeeded` in that same commit.
+
+Atomicity is a *requirement* of the capability rather than a bonus, because there is deliberately no second
+recovery protocol: a store that cannot commit as one unit simply does not expose the method, and opening a
+pipeline that declares `control` on such a store fails fast with a `ConfigError` naming the capability. A
+silently non-durable handoff is the one outcome this rule exists to prevent. (`WriteBehindStore` forwards the
+capability, flushing buffered attempts and events first, and writes the current handed-off attempt through the
+commit rather than through its buffer.)
+
+Recovery then has exactly one new branch, and it is consulted **before** the linear terminal rules:
+
+```
+newest ledger row h for the pipeline
+if rec.state in (failed, interrupted) and h is not None:
+    if h.to_seq is None:                 # END that did not finish writing
+        entry = artifact(h.entry_seq)
+        if usable: mark_final(entry); settle succeeded       # never re-run the source task
+        else:      cursor = 0; checkpoint_missing            # the ordinary restart-from-zero rule
+    elif h.to_seq >= rec.n_tasks_done:   # the commit landed, the target did not finish
+        entry = artifact(h.entry_seq)
+        if usable: start at h.to_seq with decode(entry)
+        else:      cursor = 0; checkpoint_missing
+    else:                                # consumed by later forward progress
+        the ordinary artifact(cursor - 1) rule
+```
+
+Only the newest row can be pending, because forward-only handoffs have strictly increasing targets — a
+`to_seq` below the cursor has necessarily been passed. The `END` branch has to be consulted first because an
+early `END` left no artifact at `n_tasks - 1` at all, so the linear terminal repair cannot even decide the
+case.
+
+#### 4.8.5 The cursor is a position, and traversal still terminates structurally
+
+`n_tasks_done` keeps its field and its "seq to run next" meaning. For a control-enabled pipeline it is a
+**position**, not a count of executed tasks: skipped slots never ran, so their task rows do not exist and
+`n_tasks_done == n_tasks_total` no longer implies "every task ran". No new progress field is introduced, and
+no surface may render `n_tasks_done / n_tasks_total` as a completion percentage for such a pipeline
+(`report`/`watch`/`/pipelines` expose the handoff count next to it for exactly that reason).
+
+Termination is still structural, not budgetary: a handoff may only target a strictly later position, so the
+cursor strictly increases and the chain is walked at most once. That is what keeps this version free of loop
+budgets — and why the v2 backward case cannot be added without one (§4.8.7).
+
+#### 4.8.6 Declaring edges, and what validation does (and does not) check
+
+```python
+pipeline("qa", retrieve | ask | judge | report,
+         control={"edges": {"judge": ["report", "end"], "ask": ["report"]}})
+```
+
+Edges are **declared, not derived**: a returned `Handoff` along an undeclared edge is a fatal error (never a
+silent jump, never a retry), and every declared edge is resolved and range-checked when the pipeline is built:
+
+* the source and the destination must exist, and a repeated task name must be disambiguated by its numeric
+  seq (the error says which seqs matched);
+* a destination must be strictly later than its source (forward-only);
+* `"end"` is a valid destination, except from the last task, where it has no effect and is refused;
+* the block has no unknown keys — `mode` is deliberately absent, because this version has exactly one mode.
+
+Validation is **structural only**. The handoff payload is an arbitrary argument, not the source's normal
+return type, so `source.returns -> target.accepts` is deliberately not checked: it would reject valid
+handoffs (a judge handing `value.more_queries()` to an `ask` step) and accept invalid ones.
+
+The one annotation rule this adds: a `Handoff` member in an annotation is an escape. On the `returns` side
+`-> Handoff | Report` chains as `Report`, and `-> Handoff` alone chains with anything, because such a task
+produces no artifact on that path; the accepted side is stripped the same way, since a value crossing an edge
+is never a directive. The declarative layer accepts the same block as `pipeline.control`, with
+field paths (`pipeline.control.edges['judge'][0]`), validated through the same entry point, so `validate` and
+`run` refuse the same configs with exit 2.
+
+#### 4.8.7 What is deliberately not in this version
+
+The motivating case for the whole capability is the **opposite** direction, and writing it down is part of
+committing to it:
+
+```
+ask(temperature=0.2) ─▶ validate ─▶ (invalid) ⇢ revoke to ask(temperature=0.7) ─▶ validate ─▶ …
+```
+
+Model evaluation is sampling, not function application: a structured-output step regularly produces a
+structurally invalid result, and the validator can tell. The pipeline should then *go back* to the generator
+and try again, possibly with different parameters carried in the artifact. A task-internal loop cannot express
+that well — it collapses generation, validation and the intermediate steps into one record, one lease history,
+one retry policy and one timeout, which makes "how many regenerations did this sample need" invisible exactly
+where it is the measurement. A revoke handoff would make each regeneration a real visit of the generation step
+with its own attempt records, and keep the whole thing crash-resumable, so a run over thousands of samples
+still resumes mid-sample instead of restarting it. It is the reason several record decisions here are shaped
+the way they are, and it is the reason the model below is specified now rather than discovered later:
+
+| Not included | Why, and what would be needed |
+|---|---|
+| Backward / revoke handoffs | The motivating case for the capability: a validator sends work **back** to the generator. It needs a visit model — `(seq, visit)` identity on tasks and attempts, a durable per-seq counter advanced in the same commit as the entry record, visit-aware RNG (`ctx.seed` is currently `digest(pipeline_id\|seq\|attempt)`, so a revisit would see identical randomness), a loop budget (termination is no longer structural), and progress reporting that does not present a visit count as completion. The record decisions here — the ledger, the entry-artifact address, the atomic commit, the position cursor — were chosen so that model can be added without changing them. |
+| Declared DAGs, joins, fan-in | The chain stays a chain. A handoff is a scheduling statement about one pipeline, not a graph edge. |
+| Cross-pipeline handoffs | Pipelines stay semantically independent; the only shared surface is still the resource pool. |
+| Runtime-invented targets | Edges are declared, so a typed or misspelled target fails loudly instead of silently reshaping the pipeline. |
+| Handoffs from `fanout` branches | A group is one step in the record (`fanout` runs its children inside one task), so a control transfer cannot be attributed to one of N concurrent branches. A returned directive fails the group with a clear `FatalError` instead of travelling inside a collected payload. |
+| Payload type checking | See §4.8.6: it has no sound definition without a declared payload contract of its own. |
+
 ---
 
 ## 5. Data Model (SQLite, WAL + `synchronous=NORMAL`)
@@ -350,8 +567,9 @@ Three layers of facts with non-overlapping responsibilities:
 | `pipelines` | **Current state** | one SQL query selects the pending work on resume; `n_tasks_done` is the checkpoint cursor |
 | `tasks` | The current state of each task | overwritten in place; records `attempts_used`, duration, error, leases used |
 | `attempts` | **Append-only history** | one row per attempt, numbered continuously across resumes, never overwritten |
-| `artifacts` | The state carrier | content-addressed + `payload BLOB`; `is_final` marks the final product |
+| `artifacts` | The state carrier | content-addressed + `payload BLOB`; `is_final` marks the final product. `seq` is a task position for the chain, `-1` for the seed, and a **handoff payload address at or above `n_tasks`** on a control-enabled pipeline (§4.8.3) |
 | `events` | **Structured log** | `scope ∈ run/pipeline/task/pool/resource`; the complete story of one pipeline = a query by `pipeline_id` |
+| `handoffs` | **Control-flow history** (advanced, opt-in) | append-only: one row per task-initiated jump, naming the from/to positions and the durable entry artifact; the authoritative record recovery resumes from (§4.8) |
 | `resources` | The pool's final state | resource specs (keys masked) + health statistics |
 
 **The complete record of one pipeline**:
@@ -360,7 +578,8 @@ Three layers of facts with non-overlapping responsibilities:
 SELECT * FROM pipelines WHERE pipeline_id = ?;                  -- state and checkpoint
 SELECT * FROM tasks     WHERE pipeline_id = ? ORDER BY seq;     -- final state of each task
 SELECT * FROM attempts  WHERE pipeline_id = ? ORDER BY seq, attempt_no;  -- full history and retry decisions
-SELECT * FROM artifacts WHERE pipeline_id = ? ORDER BY seq;     -- intermediate states and the final product
+SELECT * FROM artifacts WHERE pipeline_id = ? ORDER BY seq;     -- intermediate states, payloads, the final product
+SELECT * FROM handoffs  WHERE pipeline_id = ? ORDER BY handoff_id;-- control-flow history: where it jumped, and why
 SELECT * FROM events    WHERE pipeline_id = ? ORDER BY event_id;-- structured log
 ```
 
@@ -575,6 +794,7 @@ src/pyattacker/
   errors.py       exception hierarchy + pure error-classification functions
   task.py         @task / TaskSpec / TaskContext / lease tracking and force-reclaim
   pipeline.py     Chain composition / artifact type chaining checks / pipeline_key / map(repeats)
+  handoff.py      the Handoff directive + the resolved, validated control-edge plan (M5, advanced)
   resource.py     Resource / Pool / Lease / Bus / state machine and event stream
   algorithm.py    acquisition algorithms (immediate/wait/backoff/least_busy/failover)
   runner.py       pipeline coroutine scheduling / task-level checkpoint / retry / graceful shutdown / stats
@@ -595,7 +815,7 @@ src/pyattacker/
   tasks/          built-in utility tasks: mock.* / fanout / shell.run / file.write_jsonl / jsonl_source
 ```
 
-The dependency direction is strictly one-way: `errors → artifact → task → pipeline → resource/algorithm → store → runner → cli`,
+The dependency direction is strictly one-way: `errors → artifact → task → handoff → pipeline → resource/algorithm → store → runner → cli`,
 and `resource` does not depend on `algorithm` in reverse (algorithms are injected through `pool.acquire`).
 `shard`/`merge`/`export` sit beside the kernel: they read stores and pipeline streams, and nothing in the kernel
 depends on them. `benchmark/` sits beside it too, one level lower: it drives `Pool` and the algorithms directly
@@ -636,6 +856,8 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
 10. **A pipeline is a linear chain**: the kernel is implemented in terms of "nodes + dependency edges", so
     adding `Parallel/Gather` is just syntactic sugar, but it is deliberately not exposed. Use `fanout(...)`
     inside a task instead: branches stay one step in the record, at the cost of group-level retry granularity.
+    The one qualification is the opt-in, forward-only handoff of §4.8: it changes the *traversal* of the chain
+    along declared edges, never its topology — there is still no join and no second entry point.
 11. **A `null` backend costs you recovery granularity**: dropping payloads means intermediate artifacts
     cannot be reused, so `resume` reruns the whole pipeline — the same tradeoff as `journal=summary`.
     A missing blob file behaves the same way, on purpose: `available` goes false and the work is redone.
@@ -663,6 +885,15 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
     `asyncio` cannot send `CTRL_BREAK_EVENT` to a child's group), so only the direct child is terminated
     there and a descendant may outlive the task. The offline tests verify the descendant guarantee on POSIX
     and skip those two cases elsewhere with that reason stated.
+16. **Handoffs are opt-in, forward-only and fenced off** (§4.8). A pipeline that declares `control` trades
+    one guarantee for another: its cursor becomes a *position* rather than a progress count (skipped slots
+    have no task rows, and `n_tasks_done / n_tasks_total` is not a completion percentage for such a
+    pipeline), and its recovery depends on the `handoffs` ledger being readable — which is why a store
+    without the atomic `commit_handoff` capability is refused up front instead of being downgraded to a
+    non-durable jump. The feature is marked experimental until 1.0: the guarantees above are the stable
+    part, the spelling may still change. Backward handoffs, joins and cross-pipeline transfers are not
+    included; a pipeline that is mostly handoffs is a sign the problem wants a graph engine, which this is
+    not.
 
 ---
 
@@ -727,6 +958,14 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
 * `tests/test_errors.py` — `error_class_of`/`is_retryable_class`/`retry_after_of` as pure functions: every
   `_STATUS_RULES` bracket, the `FatalError`/`TimeoutError`/`ConnectionError` branches, explicit `.error_class`
   precedence, and extracting a server-suggested `retry_after` from both a direct attribute and response headers.
+* `tests/test_handoff.py` — the advanced feature end to end: a control-free run is provably untouched
+  (a literal `spec_digest` and no new rows), a forward handoff skips stations and a returned directive along
+  an undeclared edge is fatal without being retried, `END` finalizes its entry artifact, a **real SIGKILLed
+  process** resumes at the target without re-running the source task, a consumed ledger row falls back to the
+  ordinary artifact rule, a lost entry payload restarts from zero, the commit is atomic and the handed-off
+  attempt never passes through the write-behind buffer, a store without the capability is refused (while a
+  control-free pipeline on that same store keeps working), and validation, `fanout` rejection, leases,
+  timeouts and every observability surface are pinned.
 * `tests/test_monitor.py` — the `watch` terminal renderer: progress-bar clamping/rounding, run-scoped vs.
   store-wide snapshots, pool bars, and the leaked-leases/stopping indicators.
 * `tests/test_tasks.py` — `shell_run`: string vs. argv form; string commands reject `{value}` interpolation
@@ -785,13 +1024,16 @@ entry-point plugins, external artifact backends, a fan-out helper, and a read-on
 | **M2 Smarter resources and retries** ✅ | write-behind, backoff that yields the worker, per-resource targeted wakeups, quota-aware algorithms, finer `acquire` metrics | backoff is observable when the pool is saturated, and can be replayed from `events` |
 | **M3 Scale and ergonomics** ✅ | `--shard i/N` + `--shards N`, merged reports, shard utilities, multi-shape/multi-format export | multiple processes run the same dataset |
 | **M4 Ecosystem** ✅ | entry-point plugins, external artifact backends, fan-out helper, HTTP monitoring endpoint, 0.1.0 packaging | third parties can publish task packages |
+| **M5 Advanced control flow (opt-in)** 🚧 | declared forward handoffs (`Handoff`, `control=`, the `handoffs` ledger, atomic `commit_handoff`, ledger-first recovery) | a handoff is a durable checkpoint: a killed process resumes at the target with the entry state, and a control-free pipeline is provably unchanged |
 
 ---
 
 ## 11. Non-Goals (written into the README to prevent scope creep)
 
 * No HTTP client / provider SDK adapter layer (you write the tasks yourself; this is deliberate design, not a missing feature)
-* No DAG / multi-turn agent orchestration (pipelines stay linear; fan-out is implemented inside a task)
+* No DAG / multi-turn agent orchestration (pipelines stay linear; fan-out is implemented inside a task, and
+  the one exception is the opt-in, forward-only handoff of §4.8 — no declared graph, no joins, no
+  cross-pipeline orchestration)
 * No semantic reduction (accuracy / pass@k / any cross-pipeline aggregation)
 * No service-ification / gateway / proxy
 * No dataset store (it only accepts an iterable stream of seeds + one `jsonl_source` utility)

@@ -25,7 +25,8 @@ from typing import Any
 from . import errors as _errors
 from .algorithm import ALGORITHMS, resolve_algorithm
 from .backends import BACKENDS
-from .errors import ConfigError, PyAttackerError
+from .errors import ConfigError, PipelineBuildError, PyAttackerError
+from .handoff import build_control
 from .pipeline import PipelineSpec, PipelineTemplate, pipeline
 from .resource import Pool, Resource
 from .task import UNSET, Retrying, TaskSpec, build_task_spec
@@ -206,7 +207,7 @@ RUN_FIELDS = frozenset({
 (``--resume``, which process) rather than the config file, and the CLI owns them.
 """
 
-_PIPELINE_FIELDS = frozenset({"name", "resource", "tags", "include_code", "tasks"})
+_PIPELINE_FIELDS = frozenset({"name", "resource", "tags", "include_code", "tasks", "control"})
 _TASK_FIELDS = frozenset(
     {"use", "args", "kwargs", "name", "resource", "algorithm", "timeout_s", "config", "version", "retry"}
 )
@@ -759,11 +760,21 @@ def load_spec(path: str | Path, *, strict_env: bool = False) -> DeclarativeSpec:
     _validate_pipeline(pipe_cfg, [pool.name for pool in pools])
     tasks = tuple(_build_task(entry, default_pool=pipe_cfg.get("resource")) for entry in entries)
     _validate_pool_references(tasks, [pool.name for pool in pools])
+    control = pipe_cfg.get("control")
+    if control is not None:
+        # The shared validation entry, so `validate` and `run` refuse exactly the same declarations —
+        # and so a config error names the field path (`pipeline.control.edges[...]`) instead of the
+        # SDK's relative one. `pipeline()` below builds the same plan again from the same mapping.
+        try:
+            build_control(control, [task.name for task in tasks])
+        except PipelineBuildError as exc:
+            raise ConfigError(f"pipeline.{exc}") from exc
     template = pipeline(
         pipe_cfg.get("name") or path.stem,
         *tasks,
         tags=dict(pipe_cfg.get("tags") or {}),
         include_code=bool(pipe_cfg.get("include_code", True)),
+        control=control,
     )
     source = dict(raw.get("source") or {"kind": "range", "n": 1})
     return DeclarativeSpec(

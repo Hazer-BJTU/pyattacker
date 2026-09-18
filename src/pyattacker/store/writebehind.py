@@ -23,10 +23,12 @@ import time
 from collections.abc import Iterator, Mapping
 from typing import Any
 
-from ..artifact import Artifact
+from ..artifact import Artifact, Encoded
+from ..errors import ConfigError
 from .base import (
     AttemptRecord,
     EventRecord,
+    HandoffRecord,
     PipelineRecord,
     RunRecord,
     Store,
@@ -199,6 +201,44 @@ class WriteBehindStore:
     ) -> list[AttemptRecord]:
         self.flush()
         return self.inner.attempts(run_id=run_id, pipeline_id=pipeline_id, limit=limit)
+
+    # ------------------------------------------------- handoffs (advanced, passthrough)
+    # Both methods are forwarded *and* defined explicitly, because a forwarded call would skip the
+    # flush: the commit must never land on top of buffered facts (a crash would then lose the attempt
+    # trail of a handoff that is durably committed), and a read must see what is buffered. The
+    # handed-off attempt itself travels through the commit — never through the buffered
+    # ``record_attempt`` path. Whether the capability exists at all is decided by the store underneath;
+    # ``supports_handoff`` unwraps this wrapper before probing.
+    def commit_handoff(
+        self,
+        record: HandoffRecord,
+        *,
+        task: TaskRecord,
+        attempt: AttemptRecord,
+        payload: Encoded | None = None,
+        cursor: int,
+        final: bool = False,
+    ) -> Artifact | None:
+        self.flush()
+        inner = getattr(self.inner, "commit_handoff", None)
+        if inner is None:
+            raise ConfigError(
+                f"{type(self.inner).__name__} cannot commit handoffs: it does not provide the optional "
+                "commit_handoff capability (see store/base.py)"
+            )
+        return inner(record, task=task, attempt=attempt, payload=payload, cursor=cursor, final=final)
+
+    def handoffs(
+        self, *, pipeline_id: str | None = None, run_id: str | None = None, limit: int | None = None
+    ) -> list[HandoffRecord]:
+        self.flush()
+        inner = getattr(self.inner, "handoffs", None)
+        if inner is None:
+            raise ConfigError(
+                f"{type(self.inner).__name__} cannot read handoffs: it does not provide the optional "
+                "handoffs capability (see store/base.py)"
+            )
+        return inner(pipeline_id=pipeline_id, run_id=run_id, limit=limit)
 
     # ----------------------------------------------------------------- resources
     def upsert_resource(

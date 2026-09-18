@@ -6,6 +6,7 @@ from .base import (
     TASK_STATES,
     AttemptRecord,
     EventRecord,
+    HandoffRecord,
     PagedStore,
     PipelineRecord,
     RunRecord,
@@ -17,6 +18,7 @@ from .base import (
     iter_pipelines,
     iter_tasks,
     open_store,
+    supports_handoff,
 )
 from .memory import MemoryStore
 from .sqlite import SqliteStore
@@ -35,6 +37,8 @@ __all__ = [
     "TaskRecord",
     "AttemptRecord",
     "EventRecord",
+    "HandoffRecord",
+    "supports_handoff",
     "PIPELINE_STATES",
     "TASK_STATES",
     "ITER_BATCH_SIZE",

@@ -521,6 +521,7 @@ _EXPORT_KEYS = {
     "error_message",
     "tasks",
     "artifacts",
+    "handoffs",
 }
 _TASK_ROW_KEYS = {
     "name",

@@ -19,14 +19,17 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
-from ..artifact import Artifact
+from ..artifact import Artifact, Encoded
+from ..errors import PyAttackerError
 from .base import (
     ITER_BATCH_SIZE,
     AttemptRecord,
     EventRecord,
+    HandoffRecord,
     PipelineRecord,
     RunRecord,
     TaskRecord,
+    handoff_row,
 )
 
 __all__ = ["SqliteStore"]
@@ -150,6 +153,28 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_pipeline ON events(pipeline_id, event_id);
 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, event_id);
+
+-- Advanced control flow (docs/design.md §4.8): one append-only row per task-initiated handoff, the
+-- pipeline's control-flow history and the durable state recovery resumes at. `to_seq`/`to_task` are
+-- NULL for END; `entry_seq` is the entry artifact's position (the lookup key), `entry_artifact_id` the
+-- recorded reference, never null. A new *table* needs no `_migrate` step: CREATE TABLE IF NOT EXISTS
+-- in this script is the whole upgrade for an existing store.
+CREATE TABLE IF NOT EXISTS handoffs (
+    handoff_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pipeline_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    from_seq INTEGER NOT NULL,
+    from_task TEXT NOT NULL,
+    to_seq INTEGER,
+    to_task TEXT,
+    entry_seq INTEGER NOT NULL,
+    entry_artifact_id TEXT NOT NULL,
+    entry_reused INTEGER NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_handoffs_pipeline ON handoffs(pipeline_id, handoff_id);
+CREATE INDEX IF NOT EXISTS idx_handoffs_run ON handoffs(run_id, handoff_id);
 
 CREATE TABLE IF NOT EXISTS resources (
     pool TEXT NOT NULL,
@@ -343,7 +368,8 @@ class SqliteStore:
         return count
 
     # ------------------------------------------------------------- artifacts
-    def put_artifact(self, artifact: Artifact) -> Artifact:
+    def _write_artifact(self, artifact: Artifact) -> Artifact:
+        """The artifact INSERT without the commit, so several facts can land in one transaction."""
         stored = _persist_form(artifact, self.journal, self.backend)
         self._conn.execute(
             "INSERT OR REPLACE INTO artifacts (artifact_id,pipeline_id,task_name,seq,type_name,codec,"
@@ -354,6 +380,10 @@ class SqliteStore:
                 1 if stored.is_final else 0, stored.blob_ref,
             ),
         )
+        return stored
+
+    def put_artifact(self, artifact: Artifact) -> Artifact:
+        stored = self._write_artifact(artifact)
         self._conn.commit()
         return stored
 
@@ -376,7 +406,8 @@ class SqliteStore:
         return [_hydrate(_to_artifact(r), self.backend) for r in rows]
 
     # ----------------------------------------------------------------- tasks
-    def record_task(self, record: TaskRecord) -> None:
+    def _write_task(self, record: TaskRecord) -> None:
+        """The task upsert without the commit, so several facts can land in one transaction."""
         self._conn.execute(
             "INSERT OR REPLACE INTO tasks (task_run_id,pipeline_id,run_id,name,seq,state,attempts_used,"
             "started_at,ended_at,duration_ms,input_artifact_id,output_artifact_id,error_class,error_type,"
@@ -389,9 +420,13 @@ class SqliteStore:
                 _dumps(record.leases), _dumps(record.metrics),
             ),
         )
+
+    def record_task(self, record: TaskRecord) -> None:
+        self._write_task(record)
         self._conn.commit()
 
-    def record_attempt(self, record: AttemptRecord) -> AttemptRecord:
+    def _write_attempt(self, record: AttemptRecord) -> int:
+        """The attempt INSERT without the commit; returns the assigned ``attempt_id``."""
         cur = self._conn.execute(
             "INSERT INTO attempts (run_id,pipeline_id,task_run_id,task_name,seq,attempt_no,started_at,"
             "ended_at,duration_ms,outcome,error_class,error_type,error_message,traceback,retry_delay_s,"
@@ -404,9 +439,140 @@ class SqliteStore:
                 _dumps(record.metrics),
             ),
         )
+        return int(cur.lastrowid)
+
+    def record_attempt(self, record: AttemptRecord) -> AttemptRecord:
+        record.attempt_id = self._write_attempt(record)
         self._conn.commit()
-        record.attempt_id = cur.lastrowid
         return record
+
+    # -------------------------------------------------------------- handoffs
+    def _has_handoffs(self) -> bool:
+        """Whether this database has the ``handoffs`` table yet.
+
+        A **reader** can open a store that was created before this feature existed — ``report``, ``watch``
+        and ``serve`` all open read-only, and a read-only connection never runs the schema. Asking
+        ``sqlite_master`` first is what keeps such a store readable instead of failing with "no such
+        table: handoffs"; the lookup is not cached, because a live writer may create the table at any time.
+        """
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='handoffs'"
+            ).fetchone()
+            is not None
+        )
+
+    def commit_handoff(
+        self,
+        record: HandoffRecord,
+        *,
+        task: TaskRecord,
+        attempt: AttemptRecord,
+        payload: Encoded | None = None,
+        cursor: int,
+        final: bool = False,
+    ) -> Artifact | None:
+        """One transaction: task row + handed-off attempt + payload artifact + ledger row + cursor.
+
+        See the capability contract in ``store/base.py``. The payload's ``seq`` is allocated here as
+        ``n_tasks_total + k`` (``k`` = the handoffs already recorded for this pipeline), so a payload can
+        never land in a task slot and every payload gets its own address; the documented artifact order
+        is therefore ``seed (-1) → chain (0 … n-1) → handoff payloads (≥ n)``.
+        """
+        row = self._conn.execute(
+            "SELECT n_tasks_total FROM pipelines WHERE pipeline_id=?", (record.pipeline_id,)
+        ).fetchone()
+        if row is None:
+            raise PyAttackerError(
+                f"commit_handoff: no pipeline row for {record.pipeline_id!r}; the handoff has no pipeline "
+                "to advance (a handoff is only ever committed while its pipeline is open)"
+            )
+        stored: Artifact | None = None
+        if payload is not None:
+            recorded = self._conn.execute(
+                "SELECT COUNT(*) FROM handoffs WHERE pipeline_id=?", (record.pipeline_id,)
+            ).fetchone()[0]
+            seq = int(row["n_tasks_total"]) + int(recorded)
+            stored = self._write_artifact(
+                Artifact(
+                    id=Artifact.build_id(record.pipeline_id, seq),
+                    pipeline_id=record.pipeline_id,
+                    task_name=task.name,
+                    seq=seq,
+                    type_name=payload.type_name,
+                    codec=payload.codec,
+                    digest=payload.digest,
+                    size=payload.size,
+                    payload=payload.data,
+                    created_at=time.time(),
+                    is_final=final,
+                )
+            )
+            record.entry_seq = seq
+        if record.entry_seq is None:
+            raise PyAttackerError(
+                "commit_handoff: entry_seq is required when a handoff reuses an artifact (only a payload "
+                "handoff lets the store allocate the entry address)"
+            )
+        record.entry_artifact_id = Artifact.build_id(record.pipeline_id, record.entry_seq)
+        self._write_task(task)
+        attempt.attempt_id = self._write_attempt(attempt)
+        cur = self._conn.execute(
+            "INSERT INTO handoffs (pipeline_id,run_id,from_seq,from_task,to_seq,to_task,entry_seq,"
+            "entry_artifact_id,entry_reused,reason,ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                record.pipeline_id, record.run_id, record.from_seq, record.from_task, record.to_seq,
+                record.to_task, record.entry_seq, record.entry_artifact_id,
+                1 if record.entry_reused else 0, record.reason, record.ts,
+            ),
+        )
+        record.handoff_id = int(cur.lastrowid)
+        if final:
+            # END: finality and the terminal row travel with the ledger row. Clearing the failure fields
+            # mirrors settle_pipeline — a resumed pipeline that finishes here must not keep the previous
+            # run's error text on a row that is now `succeeded`.
+            self._conn.execute(
+                "UPDATE artifacts SET is_final=1 WHERE pipeline_id=? AND seq=?",
+                (record.pipeline_id, record.entry_seq),
+            )
+            self._conn.execute(
+                "UPDATE pipelines SET state='succeeded', n_tasks_done=?, run_id=?, finished_at=?, "
+                "error_type=NULL, error_message=NULL, traceback=NULL, failed_task=NULL "
+                "WHERE pipeline_id=?",
+                (cursor, record.run_id, time.time(), record.pipeline_id),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE pipelines SET state='running', n_tasks_done=?, run_id=? WHERE pipeline_id=?",
+                (cursor, record.run_id, record.pipeline_id),
+            )
+        self._conn.commit()
+        return stored
+
+    def handoffs(
+        self, *, pipeline_id: str | None = None, run_id: str | None = None, limit: int | None = None
+    ) -> list[HandoffRecord]:
+        """The ledger, oldest first; ``limit`` keeps the newest N, oldest first (the ``events`` rule).
+
+        An empty list on a store that predates the feature: it has no ledger, which is the truth, and
+        its pipelines cannot have handed off.
+        """
+        if not self._has_handoffs():
+            return []
+        sql = "SELECT * FROM handoffs WHERE 1=1"
+        args: list[Any] = []
+        if pipeline_id:
+            sql += " AND pipeline_id=?"
+            args.append(pipeline_id)
+        if run_id:
+            sql += " AND run_id=?"
+            args.append(run_id)
+        sql += " ORDER BY handoff_id DESC"
+        if limit:
+            sql += " LIMIT ?"
+            args.append(limit)
+        rows = self._conn.execute(sql, args).fetchall()
+        return [_to_handoff(r) for r in reversed(rows)]
 
     # ---------------------------------------------------------------- events
     def emit_event(self, event: EventRecord) -> None:
@@ -722,6 +888,16 @@ class SqliteStore:
             "attempts_total": self._conn.execute(
                 f"SELECT COUNT(*) AS n FROM attempts {task_where}", task_args
             ).fetchone()["n"],
+            # Handoffs are counted for every run, not only control-enabled ones: a run with none
+            # reports 0, which keeps the stats shape stable for readers — including a store created
+            # before this feature existed, which has no ledger table at all.
+            "handoffs_total": (
+                self._conn.execute(
+                    f"SELECT COUNT(*) AS n FROM handoffs {task_where}", task_args
+                ).fetchone()["n"]
+                if self._has_handoffs()
+                else 0
+            ),
             "events_total": self._conn.execute(
                 f"SELECT COUNT(*) AS n FROM events {task_where}", task_args
             ).fetchone()["n"],
@@ -792,6 +968,8 @@ class SqliteStore:
                     }
                     for a in arts
                 ],
+                # Empty for an ordinary pipeline, and always present: one row shape for every pipeline.
+                "handoffs": [handoff_row(h) for h in self.handoffs(pipeline_id=record.pipeline_id)],
             }
 
     def close(self) -> None:
@@ -872,6 +1050,16 @@ def _to_event(row: sqlite3.Row) -> EventRecord:
         ts=row["ts"], kind=row["kind"], scope=row["scope"], run_id=row["run_id"],
         pipeline_id=row["pipeline_id"], task_run_id=row["task_run_id"], pool=row["pool"],
         resource_id=row["resource_id"], data=json.loads(row["data_json"]), event_id=row["event_id"],
+    )
+
+
+def _to_handoff(row: sqlite3.Row) -> HandoffRecord:
+    return HandoffRecord(
+        handoff_id=row["handoff_id"], pipeline_id=row["pipeline_id"], run_id=row["run_id"],
+        from_seq=row["from_seq"], from_task=row["from_task"], to_seq=row["to_seq"],
+        to_task=row["to_task"], entry_seq=row["entry_seq"],
+        entry_artifact_id=row["entry_artifact_id"], entry_reused=bool(row["entry_reused"]),
+        reason=row["reason"], ts=row["ts"],
     )
 
 
