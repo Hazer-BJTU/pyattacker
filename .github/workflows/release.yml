@@ -115,6 +115,21 @@ jobs:
           fi
           echo "sdist contains no local tooling state"
 
+      # The size is a check of its own because 0.2.0 shipped 883 KB of logo PNG in a 1.26 MB sdist:
+      # `assets/` was in the include list, PNG does not compress, and nothing that unpacks an sdist
+      # needs branding. Source, tests and docs come to about 440 KB, so a 1 MiB cap leaves room for
+      # the project to grow while still failing on the next binary that does not belong in a source
+      # tree — which is cheaper to find here than in a release.
+      - name: Check the sdist stays lean
+        run: |
+          size=$(stat -c %s dist/*.tar.gz)
+          if [ "$size" -gt 1048576 ]; then
+            echo "::error::the sdist is $size bytes, over the 1 MiB cap; see the include list in pyproject.toml"
+            tar tzvf dist/*.tar.gz | sort -k3 -n -r | head -5
+            exit 1
+          fi
+          echo "sdist is $size bytes, under the 1 MiB cap"
+
       - name: Check the sdist rebuilds and passes its own tests
         run: |
           mkdir -p /tmp/sdist && tar xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1

@@ -6,6 +6,7 @@ the running code reports drift apart, or where a module is added to the package 
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import tomllib
@@ -41,8 +42,6 @@ def test_declared_dependencies_are_intentional(project):
 
 def test_no_module_imports_yaml_at_import_time():
     """`import pyattacker` must not need the extra; reading a .yaml file is the only thing that may."""
-    import re
-
     package_root = Path(pyattacker.__file__).parent
     offenders = sorted(
         path.name
@@ -108,3 +107,19 @@ def test_public_api_is_exported():
     missing = [name for name in promised if not hasattr(pyattacker, name)]
     assert missing == []
     assert set(promised).issubset(set(pyattacker.__all__))
+
+
+def test_readme_images_are_absolute_urls():
+    """The sdist ships the source tree, not the branding, so no image may point into the checkout.
+
+    `assets/` is deliberately absent from the sdist include list in `pyproject.toml` — the two logo
+    files were 883 KB of a 1.26 MB tarball — and that is only safe while every image is loaded from
+    somewhere else. PyPI renders this file as the project description, where a relative `src`
+    resolves against nothing, and an unpacked sdist does not contain the file it would name.
+    """
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    images = re.findall(r'<img[^>]*\ssrc="([^"]+)"', readme)
+    images += re.findall(r"!\[[^\]]*\]\(([^)\s]+)", readme)
+    assert images, "README.md declares no images; remove this test if the header lost its artwork"
+    relative = [src for src in images if not src.startswith(("https://", "http://"))]
+    assert relative == [], f"README images must be absolute URLs: {relative}"
