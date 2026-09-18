@@ -294,6 +294,21 @@ class SqliteStore:
         return _to_pipeline(row) if row else None
 
     def upsert_pipeline(self, record: PipelineRecord) -> None:
+        self._write_pipeline(record)
+        self._conn.commit()
+
+    def reset_pipeline(self, record: PipelineRecord) -> None:
+        """Reset current state and persist the new ledger boundary in one transaction."""
+        with self._conn:
+            self._conn.execute("DELETE FROM tasks WHERE pipeline_id=?", (record.pipeline_id,))
+            self._conn.execute(
+                "DELETE FROM artifacts WHERE pipeline_id=? AND seq>=0 AND seq<?",
+                (record.pipeline_id, record.n_tasks_total),
+            )
+            self._conn.execute("UPDATE artifacts SET is_final=0 WHERE pipeline_id=?", (record.pipeline_id,))
+            self._write_pipeline(record)
+
+    def _write_pipeline(self, record: PipelineRecord) -> None:
         self._conn.execute(
             "INSERT INTO pipelines (pipeline_id,run_id,name,key,state,tags_json,created_at,started_at,"
             "finished_at,n_tasks_total,n_tasks_done,attempts_total,failed_task,error_type,error_message,"
@@ -313,7 +328,6 @@ class SqliteStore:
                 record.spec_digest, record.resume_of, record.handoff_floor,
             ),
         )
-        self._conn.commit()
 
     def finish_pipeline(
         self,
@@ -954,6 +968,7 @@ class SqliteStore:
                 "n_tasks_done": record.n_tasks_done,
                 "n_tasks_total": record.n_tasks_total,
                 "attempts_total": record.attempts_total,
+                "handoff_floor": record.handoff_floor,
                 "started_at": record.started_at,
                 "finished_at": record.finished_at,
                 "duration_ms": (

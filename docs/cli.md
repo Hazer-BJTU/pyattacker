@@ -152,7 +152,7 @@ pyattacker watch STORE [--run-id ID] [--interval S] [--iterations N] [--no-clear
 A read-only connection to the same SQLite file, so it runs beside a live run (WAL allows one writer and many
 readers). Shows the pipeline state distribution, latency percentiles, per-pool `active/capacity`,
 `ready/degraded/dead`, how many pipelines are waiting or parked, and recent errors. A run with handoffs also
-shows `handoffs=N` on its attempts line — on a control-enabled pipeline the cursor is a position, not a
+shows `handoffs=N` (commits in the selected scope, all history without a run filter; a resume may reuse earlier active handoffs) on its attempts line — on a control-enabled pipeline the cursor is a position, not a
 progress count, so that number is what explains a short task list. `--iterations N` makes it
 exit on its own, which is what you want in a script.
 

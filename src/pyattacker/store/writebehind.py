@@ -320,6 +320,10 @@ class WriteBehindStore:
         self.flush()
         self.inner.close()
 
+    def reset_pipeline(self, record: PipelineRecord) -> None:
+        self.flush()
+        self.inner.reset_pipeline(record)
+
     def __getattr__(self, name: str) -> Any:
         """Anything not delegated explicitly (store-specific extras) passes through."""
         return getattr(self.inner, name)

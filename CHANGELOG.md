@@ -35,6 +35,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+* Review follow-up: freeze resolved control topology; atomically reset current task/chain artifact state
+  on control-enabled seed replays while retaining history; expose handoff identity/watermark and active
+  versus historical API counts; treat unencodable handoff payloads as fatal; correct return-only
+  annotation documentation. Handoff-capable custom stores must also provide `reset_pipeline(record)`.
+
 * Handoff follow-up: isolate historical ledger rows on whole-pipeline restarts with a durable
   `handoff_floor` watermark (including old-store migration and read-only compatibility); roll back failed
   SQLite handoff commits; select a single final artifact after reruns; reject duplicate source aliases;

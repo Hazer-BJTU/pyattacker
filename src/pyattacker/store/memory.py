@@ -78,6 +78,17 @@ class MemoryStore:
     def get_pipeline(self, pipeline_id: str) -> PipelineRecord | None:
         return self._pipelines.get(pipeline_id)
 
+    def reset_pipeline(self, record: PipelineRecord) -> None:
+        """Reset current slots, retaining append-only history and high-band payloads."""
+        self._tasks = {key: task for key, task in self._tasks.items()
+                       if task.pipeline_id != record.pipeline_id}
+        self._artifacts = {key: artifact for key, artifact in self._artifacts.items()
+                           if key[0] != record.pipeline_id or not 0 <= key[1] < record.n_tasks_total}
+        for key, artifact in list(self._artifacts.items()):
+            if key[0] == record.pipeline_id:
+                self._artifacts[key] = dataclasses.replace(artifact, is_final=False)
+        self.upsert_pipeline(record)
+
     def upsert_pipeline(self, record: PipelineRecord) -> None:
         self._pipelines[record.pipeline_id] = record
 
@@ -473,6 +484,7 @@ class MemoryStore:
                 "n_tasks_done": p.n_tasks_done,
                 "n_tasks_total": p.n_tasks_total,
                 "attempts_total": p.attempts_total,
+                "handoff_floor": p.handoff_floor,
                 "started_at": p.started_at,
                 "finished_at": p.finished_at,
                 "duration_ms": (

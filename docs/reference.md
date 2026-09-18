@@ -1152,9 +1152,16 @@ with `pipeline.checkpoint_missing`, exactly like a lost linear checkpoint.
 A restart from seq 0 (including `retry_succeeded` and an unusable checkpoint) durably advances
 `PipelineRecord.handoff_floor` to the latest ledger ID before task execution. Rows at or below that
 watermark remain in the append-only history and export, but cannot drive recovery for the new execution.
+For control-enabled pipelines, `reset_pipeline(record)` commits that cursor/watermark together with
+deleting previous current task rows and chain artifacts (`0 <= seq < n_tasks`). Seed and high-band
+payload artifacts and append-only attempts/events/handoffs remain; retained artifacts have final flags
+cleared. Thus `tasks()` and chain artifact exports describe the current execution, including skipped
+stations having no rows. Historical reused-entry addresses may reference deleted/replaced chain slots;
+the ledger preserves provenance, not immutable snapshots of those slots.
+
 The watermark survives subsequent resumes and process restarts; filtering by the current `run_id` would
 incorrectly discard a valid handoff after a second interrupted resume. Custom stores offering handoffs
-must persist this field on pipeline reads and writes. Writable SQLite opens migrate older databases with
+must persist this field on pipeline reads and writes and provide the atomic reset capability. Writable SQLite opens migrate older databases with
 a default of zero; read-only tools treat a missing column as zero without migrating.
 
 Successful completion selects exactly one `is_final` artifact per pipeline, clearing old final flags
@@ -1232,15 +1239,15 @@ plugin layer is public API, and existing plugins were written against the list m
 * `Store` remains the only protocol `open_store()` checks, so adding the extension breaks nothing.
   `WriteBehindStore` implements it and flushes before every paged read, like its other read views.
 
-**`commit_handoff(record, *, task, attempt, payload=None, cursor, final=False)`** and
-**`handoffs(*, pipeline_id=None, run_id=None, limit=None)`** are the optional capability behind the advanced
+**`commit_handoff(record, *, task, attempt, payload=None, cursor, final=False)`**,
+**`handoffs(*, pipeline_id=None, run_id=None, limit=None)`** and **`reset_pipeline(record)`** are the optional capability behind the advanced
 handoff feature, in the same "not part of the protocol" spirit as `resources()`. The commit is **one atomic
 write**: finalize the source task as `handed_off`, insert the handed-off attempt, persist the payload
 allocating its address above the chain, append the ledger row and move the cursor — and for `END` also mark
 the entry artifact final and settle the pipeline `succeeded`. Atomicity is a requirement of the capability,
 not a bonus: there is deliberately no second recovery protocol, so a store that cannot do it as one unit must
 not expose the method, and opening a pipeline that declares `control` on such a store fails fast with a
-`ConfigError` naming `commit_handoff` rather than writing a non-durable jump. `handoffs()` reads the ledger
+`ConfigError` naming the commit/reset capability rather than writing a non-durable jump. `handoffs()` reads the ledger
 oldest first, and `limit` keeps the newest N (oldest first), like `events`/`attempts`. `supports_handoff(store)`
 is the probe: it unwraps `WriteBehindStore`, which forwards the capability with a flush of buffered
 attempts/events first, and writes the handed-off attempt through the commit rather than through its buffer.
@@ -1250,6 +1257,12 @@ Handoff-capable stores must also preserve `PipelineRecord.handoff_floor` across 
 restart rule above).
 Both built-in backends implement it; a third-party store that does not simply cannot run control-enabled
 pipelines, while ordinary pipelines on it are untouched.
+
+**`reset_pipeline(record)`** must atomically delete previous current task rows and chain artifact slots,
+clear remaining artifact final flags, and persist the reset pipeline row including cursor and watermark.
+Preserve the seed, high-band payloads and append-only history. It runs only on control-enabled seed starts;
+resuming at a target leaves the current state intact. `WriteBehindStore` flushes before reset. A store
+missing this method cannot advertise handoff support; ordinary control-free pipelines remain supported.
 
 **`settle_pipeline(pipeline_id, *, state, n_tasks_done, run_id)`** is the other optional capability, in the
 same "not part of the protocol" spirit as `resources()`: one write that moves a row to its terminal state,
@@ -1489,6 +1502,11 @@ export_store(store, "attempts.csv", kind="attempts", fmt="csv")
 ```
 
 `pipelines` rows are nested — tasks, artifacts and handoffs included — which is why it is the default. The
+`handoffs` list includes `handoff_id` and committing `run_id`; the pipeline row includes
+`handoff_floor`. IDs above the floor belong to the active execution history; IDs at or below it are
+historical records excluded from recovery. `store.handoffs(pipeline_id=...)` includes all records.
+`stats(run_id)["handoffs_total"]` counts only commits by that run, so a resume can use an active handoff
+from a previous run while reporting zero new handoffs. The
 `handoffs` list is `[]` for an ordinary pipeline and has one object per recorded jump otherwise (see
 [handoffs](#advanced-handoffs-opt-in)); it is nested rather than a row kind of its own, so `ROW_KINDS` is
 unchanged. CSV takes its
@@ -1775,8 +1793,9 @@ with StatsServer("runs/qa.db", port=8787) as server:
 | `/` | a small auto-refreshing dashboard |
 | `/stats`, `/events`, `/pipelines`, `/resources`, `/errors` | JSON |
 
-`/stats` carries `handoffs_total` (how many jumps the run recorded), and each `/pipelines` row carries a
-`handoffs` count next to `n_tasks_done`/`n_tasks_total` — on a control-enabled pipeline those two are a
+`/stats` carries `handoffs_total` (commits by the selected run, or all commits without a run filter), and each `/pipelines` row carries a
+`handoffs` count of active-execution records, `handoffs_historical` count of all records and
+`handoff_floor`, next to `n_tasks_done`/`n_tasks_total` — on a control-enabled pipeline those two are a
 **position** in the chain, not a count of tasks that ran, so a non-zero `handoffs` is what says "this
 pipeline skipped stations".
 

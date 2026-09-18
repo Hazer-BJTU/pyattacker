@@ -1729,7 +1729,8 @@ What is worth knowing before you use it:
   `ConfigError` rather than writing a jump that would not survive a crash.
 
 A whole-pipeline restart (for example `retry_succeeded=True` or a lost entry payload) keeps previous
-handoffs as history, but advances a durable ledger watermark before restarting at seq 0. A later failure
+handoffs, attempts and events as history, but atomically clears current task/chain artifact state
+with the durable ledger watermark before restarting at seq 0. A later failure
 therefore cannot resume an old jump or recover an old END result. Subsequent target resumes preserve the
 current watermark, so repeated interruptions still use the active handoff. Completion leaves one final
 artifact. See the [store recovery contract](reference.md#tables-and-readers) when implementing a backend.

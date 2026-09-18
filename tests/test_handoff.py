@@ -703,7 +703,7 @@ def test_handoffs_read_back_in_order_on_both_backends(store):
         row = next(row for row in store.export_rows() if row["pipeline_id"] == pid)
         assert set(row["handoffs"][0]) == {
             "from_task", "from_seq", "to_task", "to_seq", "reason",
-            "entry_artifact_id", "entry_seq", "entry_reused", "ts",
+            "entry_artifact_id", "entry_seq", "entry_reused", "ts", "handoff_id", "run_id",
         }
 
 
@@ -1345,5 +1345,131 @@ def test_repeated_end_completion_has_one_final_artifact(tmp_path, sqlite):
         assert len(finals) == 1
         assert json.loads(finals[0].payload) == "second"
         assert len(store.handoffs()) == 2
+    finally:
+        runner.close()
+
+
+
+def test_control_plan_is_deeply_immutable():
+    raw = {0: [2]}
+    plan = ControlPlan(task_names=["a", "b", "c"], edges=raw)
+    raw[0].append(1)
+    raw[2] = [0]
+    assert plan.edges == {0: (2,)}
+    template = pipeline("frozen", ho_a | ho_b | ho_c, control={"edges": {0: [2]}})
+    digest = template.spec_digest
+    with pytest.raises(TypeError):
+        template.control.edges[2] = (0,)
+    assert template.spec_digest == digest
+    assert template.control.fingerprint() == {"edges": {"0": [2]}}
+
+
+@pytest.mark.parametrize("sqlite", [False, True])
+@pytest.mark.parametrize("write_behind", [False, True])
+def test_replay_resets_current_task_and_chain_artifact_views(tmp_path, sqlite, write_behind):
+    store = SqliteStore(tmp_path / "reset.db") if sqlite else MemoryStore()
+    if write_behind:
+        store = WriteBehindStore(store, batch_size=1000)
+    mode = ["linear"]
+
+    @task("source")
+    def source(value, ctx):
+        return Handoff.end("done") if mode[0] == "end" else value
+
+    spec = pipeline("reset", source | ho_b | ho_c,
+                    control={"edges": {"source": ["end"]}}).bind({"row": 1})
+    runner = Runner(store=store, retry_succeeded=True, handle_signals=False)
+    try:
+        runner.run([spec], run_id="linear")
+        assert [t.seq for t in store.tasks(spec.pipeline_id)] == [0, 1, 2]
+        mode[0] = "end"
+        runner.run([spec], run_id="end")
+        assert [t.seq for t in store.tasks(spec.pipeline_id)] == [0]
+        row = next(store.export_rows())
+        assert [t["seq"] for t in row["tasks"]] == [0]
+        assert [a["seq"] for a in row["artifacts"]] == [-1, 3]
+        assert len(store.attempts(pipeline_id=spec.pipeline_id)) == 4
+        assert store.events(pipeline_id=spec.pipeline_id)
+        assert len(row["handoffs"]) == 1
+        assert row["handoffs"][0]["run_id"] == "end"
+        assert row["handoffs"][0]["handoff_id"] > row["handoff_floor"]
+        # A new linear execution retains the ledger/payload history, but has no active jumps.
+        mode[0] = "linear"
+        runner.run([spec], run_id="linear-again")
+        row = next(store.export_rows())
+        assert len(row["handoffs"]) == 1
+        assert row["handoffs"][0]["handoff_id"] <= row["handoff_floor"]
+        server = StatsServer(store)
+        status, body = server.payload("/pipelines", {})
+        assert status == 200
+        assert body["rows"][0]["handoffs"] == 0
+        assert body["rows"][0]["handoffs_historical"] == 1
+    finally:
+        runner.close()
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_unencodable_handoff_payload_is_fatal_under_aggressive_retry(unknown):
+    from pyattacker import Retrying
+
+    calls = []
+    @task("bad", retry=Retrying(max_attempts=3, on=(Exception,), retry_unknown=unknown))
+    def bad(value, ctx):
+        calls.append("bad")
+        return Handoff.end(object())
+
+    runner = Runner(handle_signals=False)
+    spec = pipeline("bad", bad | echo, control={"edges": {"bad": ["end"]}}).bind("seed")
+    try:
+        report = runner.run([spec])
+        assert report.stats["pipelines"]["by_state"] == {"failed": 1}
+        assert calls == ["bad"]
+        assert runner.store.get_pipeline(spec.pipeline_id).error_type == "FatalError"
+        assert "unencodable handoff payload" in runner.store.get_pipeline(spec.pipeline_id).error_message
+        assert runner.store.handoffs() == []
+    finally:
+        runner.close()
+
+
+def test_sqlite_execution_reset_rolls_back_as_one_unit(tmp_path, monkeypatch):
+    from pyattacker.store.base import EventRecord
+
+    store = SqliteStore(tmp_path / "reset-atomic.db")
+    spec = pipeline("reset-atomic", ho_a | ho_b | ho_c,
+                    control={"edges": {0: ["end"]}}).bind(SEED)
+    runner = Runner(store=store, handle_signals=False)
+    try:
+        runner.run([spec])
+        previous = store.get_pipeline(spec.pipeline_id)
+        record = replace(previous, n_tasks_done=0, handoff_floor=10, state="running")
+        def fail_write(record):
+            raise RuntimeError("reset metadata write failed")
+        monkeypatch.setattr(store, "_write_pipeline", fail_write)
+        with pytest.raises(RuntimeError, match="reset metadata"):
+            store.reset_pipeline(record)
+        store.emit_event(EventRecord(ts=time.time(), kind="test.after_failed_reset"))
+        probe = SqliteStore(tmp_path / "reset-atomic.db", read_only=True)
+        try:
+            assert [t.seq for t in probe.tasks(spec.pipeline_id)] == [0, 1, 2]
+            assert [a.seq for a in probe.artifacts(spec.pipeline_id)] == [-1, 0, 1, 2]
+            assert [a.seq for a in probe.artifacts(spec.pipeline_id) if a.is_final] == [2]
+            assert probe.get_pipeline(spec.pipeline_id).n_tasks_done == 3
+            assert probe.get_pipeline(spec.pipeline_id).handoff_floor == 0
+        finally:
+            probe.close()
+    finally:
+        runner.close()
+
+
+def test_store_without_atomic_reset_refuses_control_but_accepts_linear():
+    class NoResetStore(MemoryStore):
+        reset_pipeline = None
+
+    runner = Runner(store=NoResetStore(), handle_signals=False)
+    try:
+        spec = pipeline("no-reset", ho_a | ho_b, control={"edges": {0: ["end"]}}).bind(SEED)
+        assert runner.run([spec]).stats["pipelines"]["by_state"] == {"failed": 1}
+        assert "reset_pipeline" in runner.store.get_pipeline(spec.pipeline_id).error_message
+        assert runner.run(pipeline("plain", ho_a | ho_b).map([SEED])).stats["pipelines"]["by_state"] == {"succeeded": 1}
     finally:
         runner.close()

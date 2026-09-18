@@ -27,6 +27,7 @@ from __future__ import annotations
 import difflib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 from .errors import FatalError, PipelineBuildError, PyAttackerError
@@ -130,11 +131,20 @@ class ControlPlan:
     edges: Mapping[int, tuple[int | None, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "task_names", tuple(self.task_names))
+        object.__setattr__(self, "edges", MappingProxyType({
+            source: tuple(targets) for source, targets in self.edges.items()
+        }))
         for from_seq, targets in self.edges.items():
+            if isinstance(from_seq, bool) or not isinstance(from_seq, int):
+                raise PipelineBuildError("control: source seq must be an integer")
             if not 0 <= from_seq < len(self.task_names):
                 raise PipelineBuildError(f"control: no task at seq {from_seq}")
             for target in targets:
-                if target is not None and target <= from_seq:
+                if target is None and from_seq == len(self.task_names) - 1:
+                    raise PipelineBuildError("control: end from the last task has no effect")
+                if target is not None and (isinstance(target, bool) or not isinstance(target, int)
+                                           or not from_seq < target < len(self.task_names)):
                     raise PipelineBuildError(
                         f"control: handoffs are forward-only, but {from_seq} -> {target} is not"
                     )

@@ -398,6 +398,10 @@ class Store(Protocol):
     #   artifact (or ``None`` when the entry state is a reused artifact). Atomicity is a *requirement*
     #   of the capability rather than a bonus, because there is deliberately no second recovery
     #   protocol: a store that cannot do it atomically must not expose the method.
+    # * ``reset_pipeline(record)`` atomically deletes current task rows and chain artifacts
+    #   (0 <= seq < n_tasks_total), clears remaining final flags, and persists the reset cursor
+    #   and handoff_floor. Preserve seed, high-band payloads, attempts, events and ledger history.
+    #   WriteBehindStore flushes buffered facts before forwarding this synchronous reset.
     # * ``handoffs(...)`` reads the ledger oldest first, and ``limit`` keeps the newest N, oldest first
     #   (the ``events``/``attempts`` rule), so recovery can ask for the latest row alone.
     #
@@ -473,6 +477,8 @@ def handoff_row(record: HandoffRecord) -> dict[str, Any]:
     one definition and cannot drift between backends.
     """
     return {
+        "handoff_id": record.handoff_id,
+        "run_id": record.run_id,
         "from_task": record.from_task,
         "from_seq": record.from_seq,
         "to_task": record.to_task,
@@ -486,14 +492,14 @@ def handoff_row(record: HandoffRecord) -> dict[str, Any]:
 
 
 def supports_handoff(store: Store) -> bool:
-    """Whether ``store`` can commit a handoff atomically —— the optional ``commit_handoff`` capability.
+    """Whether ``store`` can commit a handoff atomically —— the optional commit/reset/read capability.
 
     ``WriteBehindStore`` is unwrapped first: it forwards the capability (with a flush) only when the
     store underneath actually implements it, so the batching wrapper can never make a store without
     durable handoff support look capable.
     """
     target = getattr(store, "inner", store)
-    return callable(getattr(target, "commit_handoff", None)) and callable(
+    return callable(getattr(target, "reset_pipeline", None)) and callable(getattr(target, "commit_handoff", None)) and callable(
         getattr(target, "handoffs", None)
     )
 

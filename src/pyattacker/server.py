@@ -198,7 +198,8 @@ class StatsServer:
                     # "the cursor below is a position, not progress": a pipeline with handoffs skipped
                     # stations, so n_tasks_done is where it is, not how many tasks ran.
                     count = getattr(store, "handoffs", None)
-                    handoffs = len(count(pipeline_id=record.pipeline_id)) if callable(count) else 0
+                    history = count(pipeline_id=record.pipeline_id) if callable(count) else []
+                    handoffs = sum((hop.handoff_id or 0) > record.handoff_floor for hop in history)
                     rows.append(
                         {
                             "pipeline_id": record.pipeline_id,
@@ -208,6 +209,8 @@ class StatsServer:
                             "n_tasks_done": record.n_tasks_done,
                             "n_tasks_total": record.n_tasks_total,
                             "handoffs": handoffs,
+                            "handoffs_historical": len(history),
+                            "handoff_floor": record.handoff_floor,
                             "attempts_total": record.attempts_total,
                             "failed_task": record.failed_task,
                             "error_type": record.error_type,

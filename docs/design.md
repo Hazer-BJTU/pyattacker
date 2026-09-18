@@ -486,7 +486,9 @@ if rec.state in (failed, interrupted) and h is not None:
 ```
 
 On every restart from the seed, persist `rec.handoff_floor = newest ledger ID` with the reset cursor
-before executing tasks. This excludes handoffs from an abandoned execution without deleting history;
+through `reset_pipeline(record)` before executing tasks. The reset atomically removes current task rows
+and chain artifacts (seq 0..n-1), clears prior final flags, and writes the cursor/watermark together.
+Seed and high-band payload artifacts, attempts, events and handoffs remain as history. This excludes handoffs from an abandoned execution without deleting history;
 the watermark stays unchanged on a resumed target. SQLite migrates the column with a zero default and
 read-only readers tolerate its absence. A failed SQLite handoff transaction rolls back before any later
 event or cleanup write can commit. Completion selects one final artifact, clearing older final flags.
@@ -530,10 +532,15 @@ handoffs (a judge handing `value.more_queries()` to an `ask` step) and accept in
 
 The one annotation rule this adds: a `Handoff` member in an annotation is an escape. On the `returns` side
 `-> Handoff | Report` chains as `Report`, and `-> Handoff` alone chains with anything, because such a task
-produces no artifact on that path; the accepted side is stripped the same way, since a value crossing an edge
-is never a directive. The declarative layer accepts the same block as `pipeline.control`, with
+produces no artifact on that path. The escape applies only to produced/return annotations; the accepted
+side remains unchanged because the runner never passes a directive as an artifact. The declarative layer accepts the same block as `pipeline.control`, with
 field paths (`pipeline.control.edges['judge'][0]`), validated through the same entry point, so `validate` and
 `run` refuse the same configs with exit 2.
+
+The resolved control plan defensively copies task names and target sequences, then freezes the mapping.
+Runtime topology cannot be changed after validation or diverge from the computed `spec_digest`. An
+unencodable explicit handoff payload raises `FatalError`, so an aggressive retry policy cannot replay
+a task that returned that invalid directive.
 
 #### 4.8.7 What is deliberately not in this version
 

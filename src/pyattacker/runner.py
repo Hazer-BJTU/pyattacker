@@ -1310,7 +1310,10 @@ class Runner:
         record.n_tasks_done = start_index
         record.resume_of = resumed_from
         record.error_type = record.error_message = record.traceback = record.failed_task = None
-        self.store.upsert_pipeline(record)
+        if start_index == 0 and spec.control is not None and supports_handoff(self.store):
+            self.store.reset_pipeline(record)
+        else:
+            self.store.upsert_pipeline(record)
         problem, phase = self._pool_problem(spec), "resource_check"
         if problem is None:
             control_problem = self._control_problem(spec)
@@ -1426,7 +1429,7 @@ class Runner:
         inner = getattr(self.store, "inner", self.store)
         return ConfigError(
             f"pipeline {spec.name!r} declares control (handoffs), but the store backend "
-            f"{type(inner).__name__} does not provide the optional commit_handoff capability; a handoff "
+            f"{type(inner).__name__} does not provide the optional commit_handoff/reset_pipeline capability; a handoff "
             "is a durability promise, so it is refused rather than downgraded (see store/base.py)"
         )
 
@@ -2023,7 +2026,10 @@ class Runner:
             raise FatalError(
                 f"task {name!r} handed off without a value, but it has no durable input artifact to reuse"
             )
-        payload = None if reused else self.registry.dump(directive.value)
+        try:
+            payload = None if reused else self.registry.dump(directive.value)
+        except Exception as exc:
+            raise FatalError(f"task {name!r} returned an unencodable handoff payload: {exc}") from exc
         return _HandoffPlan(
             target=target,
             to_task=None if target is None else spec.tasks[target].name,

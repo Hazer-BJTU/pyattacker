@@ -522,6 +522,7 @@ _EXPORT_KEYS = {
     "tasks",
     "artifacts",
     "handoffs",
+    "handoff_floor",
 }
 _TASK_ROW_KEYS = {
     "name",
