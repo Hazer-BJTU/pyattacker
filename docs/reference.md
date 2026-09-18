@@ -1,5 +1,7 @@
 # API Reference
 
+**English** | [简体中文](zh-CN/reference.md)
+
 Every public name in `pyattacker`, with its signature, its parameters, and a usage example.
 
 **Looking for something else?** [`docs/tutorial.md`](tutorial.md) teaches the workflow step by step;
@@ -1002,7 +1004,7 @@ checkpoint granularity a task rather than a pipeline.
 | `blob_ref` | where the bytes live when they are not inline |
 | `is_final` | whether this is the pipeline's final output |
 | `available` | whether the payload can actually be read back — **this is what resume checks** |
-| `encoded()` | an `Encoded` pair ready for `registry.load(...)` |
+| `encoded()` | an `Encoded` triple ready for `registry.load(...)` |
 
 ```python
 artifact = store.get_artifact(pipeline_id, 1)
@@ -1666,7 +1668,7 @@ is in [`examples/plugin_package/`](../examples/plugin_package/README.md).
 
 ## Built-in tasks
 
-Two of these are for production use (`fanout`, `shell_run`, `write_jsonl`); the rest simulate work so you can
+Three of these are for production use (`fanout`, `shell_run`, `write_jsonl`); the rest simulate work so you can
 exercise the machinery without a network. In configs they carry `mock.*` names: `use: pyattacker.tasks:flaky`.
 
 ### `fanout`

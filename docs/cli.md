@@ -1,5 +1,7 @@
 # CLI Reference
 
+**English** | [简体中文](zh-CN/cli.md)
+
 ```
 pyattacker {run,resume,report,watch,export,serve,plugins,validate,demo}
 ```
