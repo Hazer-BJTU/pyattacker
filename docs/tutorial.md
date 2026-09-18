@@ -949,6 +949,14 @@ Events worth alerting on: `pipeline.resumed`, `pipeline.skipped`, `pipeline.chec
 `pipeline.checkpoint_unusable`, `pipeline.deferred_interrupted`, `pipeline.terminal_repaired`,
 `pipeline.terminal_repair_failed`, `pipeline.terminal_cleanup_failed`, `pipeline.corrupt_cursor`.
 
+Two run-level events deserve the same treatment. `runner.internal_error` is a framework-level surprise
+recorded against one pipeline while the run carries on. `runner.worker_crashed` is heavier: a worker died
+outside its own handlers (a `BaseException` that is not a cancellation, raised by a store hook for example),
+so the run stops, the pipeline that worker was holding is recorded `failed` — or `interrupted` if the run was
+already stopping — and `run()` raises `WorkerCrashed` with the original exception as its cause. If this event
+shows up, the run did not finish on its own terms: read the pipeline row, fix the cause, and rerun with
+`--resume`.
+
 ---
 
 ## Step 10 — reading the record

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import inspect
 import json
 import os
@@ -51,6 +52,7 @@ from .errors import (
     PipelineIdentityConflict,
     PyAttackerError,
     StoreUnavailable,
+    WorkerCrashed,
     error_class_of,
 )
 from .pipeline import PipelineSpec
@@ -385,6 +387,16 @@ class Runner:
         self._all_done: asyncio.Event | None = None
         self._hard_stop = False  # set when the caller cancelled us: do not wait for in-flight work
         self._fatal_error: BaseException | None = None  # set when the store itself becomes untrustworthy
+        self._worker_crash: WorkerCrashed | None = None  # set when a worker died outside its own handlers
+        # Which item each worker is holding right now, so a worker that dies can be told which
+        # pipeline it left behind. Rebuilt per run; entries are removed by the done-callback.
+        self._inflight: dict[asyncio.Task[Any], Any] = {}
+        # Workers whose death has already been handled: the done-callback and the worker's own
+        # KeyboardInterrupt/SystemExit guard can both observe the same one.
+        self._crashed_workers: set[asyncio.Task[Any]] = set()
+        # Resolved when a worker dies: nothing may keep blocking on the work queue after that,
+        # because the queue is only ever drained by workers. See _hand_over.
+        self._abort: asyncio.Future[None] | None = None
         self._live: dict[str, Any] = {"running": 0, "started_at": None}
 
     # ------------------------------------------------------------- pool wiring
@@ -490,6 +502,10 @@ class Runner:
         self._all_done = asyncio.Event()
         self._hard_stop = False
         self._fatal_error = None
+        self._worker_crash = None
+        self._inflight = {}
+        self._crashed_workers = set()
+        self._abort = asyncio.get_running_loop().create_future()
         self._identity_error: PipelineIdentityConflict | None = None
         for pool in self.pools.values():
             pool.reset_waiters()
@@ -546,6 +562,11 @@ class Runner:
         workers = [
             asyncio.create_task(self._worker(queue, rid)) for _ in range(max(1, cfg.concurrency))
         ]
+        # Worker *lifetime* is supervised, not just counted: a worker that dies outside its own
+        # handlers can no longer advance the counters that completion is based on, so the run has
+        # to observe the death instead of waiting for a condition that can never become true.
+        for worker in workers:
+            worker.add_done_callback(functools.partial(self._on_worker_done, run_id=rid))
         # One pump moves parked pipelines back into the work queue once their backoff is over.
         pump = asyncio.create_task(self._delays.pump(queue), name="pyattacker-timers")
         producer_error: BaseException | None = None
@@ -563,7 +584,12 @@ class Runner:
                     self.stop("stop_after_failures")
                     break
                 self._counters["pipelines_admitted"] += 1
-                await queue.put(spec)
+                if not await self._hand_over(queue, spec):
+                    # A worker died before this pipeline could be handed over. It was never queued,
+                    # so it is un-admitted again rather than counted as work the run abandoned --
+                    # and admitting must stop here, because the crash handler owns the wind-down.
+                    self._counters["pipelines_admitted"] -= 1
+                    break
                 # Yield after every admission: without it a fast producer can fill the queue
                 # without ever letting a worker run, which delays every stop condition
                 # (failures, wall-clock budget) and makes Ctrl-C feel unresponsive.
@@ -623,6 +649,13 @@ class Runner:
         self._flush_store()
         if self._identity_error is not None:
             raise self._identity_error
+        if self._worker_crash is not None:
+            # A worker died outside its own handlers: the run-level fault wins over the ordinary
+            # return value. Everything the caller needs to investigate is already durable -- the
+            # pipeline has a terminal row, ``runner.worker_crashed`` carries the traceback, and the
+            # run record above is finished as ``interrupted`` -- so the record survives the raise,
+            # while a returned report would describe a run that lost a worker as merely stopped.
+            raise self._worker_crash
         if isinstance(producer_error, asyncio.CancelledError):
             raise producer_error
         if producer_error is not None:
@@ -647,12 +680,45 @@ class Runner:
         if self._counters["pipelines_done"] >= self._counters["pipelines_admitted"]:
             self._all_done.set()
 
+    async def _hand_over(self, queue: "asyncio.Queue[Any]", item: Any) -> bool:
+        """Put an item on the work queue, but stop waiting for room once a worker has died.
+
+        ``queue.put`` blocks while the queue is full, and a full queue is only ever drained by
+        workers — so waiting on it can outlive the worker that made waiting necessary. That is the
+        same liveness hole as the dead worker itself, one step removed: with every worker gone and
+        a full queue, the producer would park in ``put`` forever and the run would never reach the
+        wind-down that raises :class:`~pyattacker.errors.WorkerCrashed`.
+
+        Returns ``False`` when the abort won the race; the item was not queued then. The caller
+        decides what that means (stop admitting; fall back to a hard shutdown when delivering
+        shutdown sentinels).
+        """
+        assert self._abort is not None, "_hand_over is only valid while a run is in flight"
+        if not queue.full():
+            queue.put_nowait(item)  # fast path: room already available, no task and no second await
+            return True
+        putter = asyncio.create_task(queue.put(item))
+        try:
+            await asyncio.wait({putter, self._abort}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # A pending ``put`` is cancelled *before* it can enqueue: asyncio.Queue.put() removes its
+            # putter future and re-raises without calling put_nowait(), so the item is not delivered
+            # twice or half-delivered.
+            if not putter.done():
+                putter.cancel()
+            await asyncio.gather(putter, return_exceptions=True)
+        return not putter.cancelled()
+
     async def _wait_for_completion(self) -> None:
         """Wait for pipelines that are parked in the delay queue (retry backoffs).
 
         Without this, a run would "finish" the moment its workers went idle, and every
         pipeline sitting out a backoff would be recorded as interrupted. When a stop was
         requested we deliberately skip the wait: the stop is the whole point.
+
+        That early return is also what releases a run whose worker died: completion is otherwise a
+        counter condition that a dead worker can no longer satisfy, so the crash handler stops the
+        run instead of trying to make ``pipelines_done`` reach ``pipelines_admitted``.
         """
         cfg = self.config
         while True:
@@ -688,16 +754,24 @@ class Runner:
         try:
             pump.cancel()
             await asyncio.gather(pump, return_exceptions=True)
+            hard = self._hard_stop
+            if not hard:
+                # Delivering the sentinels is itself a blocking hand-over, so it uses the same
+                # abort-aware path as admission: a worker that dies while it is being drained would
+                # otherwise leave the run parked on a full queue that nothing can consume anymore.
+                for _ in workers:
+                    if not await self._hand_over(queue, None):
+                        hard = True
+                        break
             try:
-                if self._hard_stop:
-                    # The caller cancelled us: a worker stuck in a 30-minute task must not keep
-                    # the process alive, so cancel them rather than waiting.
+                if hard:
+                    # The caller cancelled us, or a worker died while draining: a worker stuck in a
+                    # 30-minute task must not keep the process alive, so cancel them rather than
+                    # waiting for a drain that may no longer be able to complete.
                     for worker in workers:
                         worker.cancel()
                     await asyncio.gather(*workers, return_exceptions=True)
                 else:
-                    for _ in workers:
-                        await queue.put(None)
                     try:
                         await asyncio.wait_for(
                             asyncio.gather(*workers, return_exceptions=True),
@@ -745,8 +819,30 @@ class Runner:
         return len(leftover)
 
     async def _worker(self, queue: "asyncio.Queue[Any]", run_id: str) -> None:
+        worker = asyncio.current_task()
+        try:
+            await self._worker_loop(queue, run_id, worker)
+        except (KeyboardInterrupt, SystemExit) as exc:
+            # asyncio deliberately re-raises these two out of the task, which stops the loop before
+            # any done-callback can run -- so the primary observation point never sees them. Handling
+            # them here is what still gets a terminal row and an event written; the exception is then
+            # re-raised unchanged, because "KeyboardInterrupt stops the process" is not ours to
+            # change. Every other BaseException is left to the done-callback, which sees it too;
+            # _crash_worker is idempotent per worker, so the two observation points cannot double up.
+            item = self._inflight.pop(worker, None) if worker is not None else None
+            self._crash_worker(exc, item, run_id=run_id, worker=worker)
+            raise
+
+    async def _worker_loop(
+        self, queue: "asyncio.Queue[Any]", run_id: str, worker: "asyncio.Task[Any] | None"
+    ) -> None:
         while True:
             item = await queue.get()
+            if worker is not None:
+                # Published before anything below can raise. This is what lets supervision name the
+                # pipeline a dead worker left behind, and it is deliberately not cleared on the way
+                # out: the done-callback that reads it runs only after this coroutine is gone.
+                self._inflight[worker] = item
             state = None
             try:
                 if item is None:
@@ -821,6 +917,179 @@ class Runner:
             finally:
                 queue.task_done()
 
+    # -------------------------------------------------------- worker supervision
+    def _on_worker_done(self, worker: asyncio.Task[Any], *, run_id: str) -> None:
+        """Observe worker lifetime: a worker that died outside its own handlers is a run-level fault.
+
+        Completion is counted (``pipelines_done`` against ``pipelines_admitted``), which assumes
+        every admitted pipeline reaches one of the worker loop's own terminal paths. A
+        ``BaseException`` that is not ``CancelledError`` reaches none of them: the task ends, the
+        counter can never advance, and ``_wait_for_completion`` would keep waiting for a condition
+        that has become impossible — a hang with no error, no exit code and no record. This callback
+        is the missing observation point, and because it is attached to the task rather than woven
+        into the handler chain it also sees a death *after* that chain (queue or worker housekeeping)
+        and one from a coroutine that never got that far.
+
+        It must never raise: a done-callback runs in the event loop's callback context, where an
+        exception is only logged — and the run would hang anyway.
+        """
+        item = self._inflight.pop(worker, None)
+        if worker.cancelled():
+            return  # a cancelled worker already recorded its own pipeline inside the worker loop
+        exc = worker.exception()
+        if exc is None:
+            return  # an ordinary end: the sentinel path, nothing to supervise
+        try:
+            self._crash_worker(exc, item, run_id=run_id, worker=worker)
+        except BaseException:  # pragma: no cover - defence in depth: a callback must not raise
+            # _crash_worker stops the run before it touches the store, so anything reaching here went
+            # wrong before that point. Release the run anyway: a callback that raises is a run that
+            # can hang waiting on a counter nobody advances, and asyncio logs what happened.
+            self._hard_stop = True
+            self.stop("worker_crashed")
+
+    def _crash_worker(
+        self,
+        exc: BaseException,
+        item: Any,
+        *,
+        run_id: str,
+        worker: "asyncio.Task[Any] | None" = None,
+    ) -> None:
+        """Stop the run for a worker that died, and leave a record of why.
+
+        Order matters: stopping comes first (the run must stop even if recording fails), and the
+        in-flight pipeline is terminalized before the event, so an event that says "this pipeline
+        crashed" is never published ahead of the row it describes.
+        """
+        if worker is not None:
+            if worker in self._crashed_workers:
+                return  # already handled: the two observation points can both see the same death
+            self._crashed_workers.add(worker)
+        crashing_pipeline = self._stopping.is_set()  # a crash while already winding down
+        tb = "".join(tb_mod.format_exception(exc))
+        pipeline_id = getattr(item, "pipeline_id", None)
+        crash = WorkerCrashed(
+            (
+                f"worker for pipeline {pipeline_id!r} died with {type(exc).__name__}: {exc}"
+                if pipeline_id is not None
+                else f"a worker died with {type(exc).__name__}: {exc}"
+            ),
+            pipeline_id=pipeline_id,
+        )
+        crash.__cause__ = exc
+        # The same shape as the other fatal paths: stop admitting (the abort also releases anything
+        # parked on the full work queue), do not wait for in-flight work, and deliberately do *not*
+        # manufacture ``pipelines_done`` to satisfy the counter invariant -- the run is no longer
+        # completing normally, and ``stop`` is what releases the waiter.
+        self._hard_stop = True
+        if self._abort is not None and not self._abort.done():
+            self._abort.set_result(None)
+        self.stop("worker_crashed")
+        # Recorded before the store is touched again, so nothing that happens below can stop the run
+        # from raising: the exception is what tells the caller a worker died. First crash wins -- it
+        # is the one that stopped the run, and later ones are usually its consequences (each still
+        # gets its own terminal row and event below).
+        self._worker_crash = self._worker_crash or crash
+        if item is not None:
+            try:
+                pipeline_id = self._terminalize_crashed_pipeline(
+                    item, crash, tb, run_id=run_id, interrupted=crashing_pipeline
+                )
+            except BaseException as store_exc:
+                # Recording the crash needs the store -- and *this* store is the prime suspect, so a
+                # second failure here is expected rather than exotic. If it happens, the run's
+                # durability guarantees are gone: take the existing fatal path (raise
+                # StoreUnavailable and skip the normal finalization) instead of retrying a broken
+                # store, and keep the crash as the cause so the fault that started this is not hidden
+                # behind the store's own error.
+                fatal = StoreUnavailable(
+                    f"a worker died with {type(exc).__name__} and the crash could not be persisted: "
+                    f"{type(store_exc).__name__}: {store_exc}"
+                )
+                fatal.__cause__ = exc
+                self._fatal_error = fatal
+        # The exception raised by run_async carries the type, the message and the traceback, so a
+        # store that cannot take this one event does not make the crash silent -- which is also why
+        # a BaseException escaping here is swallowed: this is already the last line of defence.
+        with contextlib.suppress(BaseException):
+            self._emit(
+                "runner.worker_crashed",
+                pipeline_id=pipeline_id,
+                data={
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": tb,
+                    "during_shutdown": crashing_pipeline,
+                },
+            )
+        # Pushed out immediately rather than at the next flush point: KeyboardInterrupt/SystemExit
+        # are about to tear the loop down, and anything still batched would go with it unless the
+        # embedding happens to give the run one more teardown pass. ``_flush_store`` swallows only
+        # ``Exception``, so it is suppressed again here: a done-callback that raises is a
+        # done-callback that can leave the run waiting on a counter nobody will advance.
+        with contextlib.suppress(BaseException):
+            self._flush_store()
+
+    def _terminalize_crashed_pipeline(
+        self, item: Any, error: WorkerCrashed, tb: str, *, run_id: str, interrupted: bool
+    ) -> str | None:
+        """Give the pipeline a dead worker was holding a terminal row.
+
+        Nothing else will ever move it out of ``running``: the worker that owned it is gone, and
+        every reader (the report, the CLI exit code, a later ``resume``) reads the persisted row.
+        A pipeline that was *already* terminal when the worker died -- the death happened in queue
+        housekeeping, after the pipeline had finished -- keeps its own state, because history is
+        not rewritten to blame a pipeline that actually succeeded.
+        """
+        state = item if isinstance(item, _RunState) else None
+        pipeline_id = getattr(item, "pipeline_id", None)
+        if pipeline_id is None:
+            return None  # nothing identifiable: the worker died between items
+        # The *persisted* row is authoritative, never the in-memory state. ``finish_pipeline`` is not
+        # required to write back into the caller's ``PipelineRecord`` (SQLite updates the row only),
+        # and the item can be an ``_RunState`` that came back through the delay queue while a terminal
+        # write it already made is durable -- the crash lands after that write, for example in the
+        # success event or in queue housekeeping. Trusting ``state.record`` would then rewrite a
+        # ``succeeded`` row (or an ordinary failure with its own provenance) as this crash.
+        record = self.store.get_pipeline(pipeline_id)
+        if record is not None and record.state in ("succeeded", "failed", "interrupted"):
+            return pipeline_id
+        if record is None:
+            # No durable row: use what the worker still holds, or create one from the spec (mirroring
+            # _finish_pipeline_after_internal_error). A crash before the row was ever written must not
+            # make the pipeline vanish from the report.
+            record = state.record if state is not None else None
+            if record is None:
+                spec = item if isinstance(item, PipelineSpec) else None
+                if spec is None:  # pragma: no cover - defensive: nothing to create a row from
+                    return pipeline_id
+                record = PipelineRecord(
+                    pipeline_id=pipeline_id,
+                    run_id=run_id,
+                    name=spec.name,
+                    key=spec.key,
+                    tags=dict(spec.template.tags),
+                    n_tasks_total=spec.n_tasks,
+                    seed_digest=spec.seed_digest,
+                    spec_digest=spec.spec_digest,
+                    state="running",
+                    started_at=time.time(),
+                )
+            self.store.upsert_pipeline(record)
+        # A death during an ordinary stop is recorded as interrupted, matching the run it belongs
+        # to: the pipeline did not finish, and the run was already winding down without it.
+        # Otherwise the worker's death is a failure of that pipeline, exactly like the
+        # internal-error path.
+        self.store.finish_pipeline(
+            pipeline_id,
+            "interrupted" if interrupted else "failed",
+            n_tasks_done=record.n_tasks_done,
+            error=error,
+            failed_task=state.task_spec.name if state is not None else None,
+            traceback=tb,
+        )
+        return pipeline_id
+
     def _finish_pipeline_after_internal_error(
         self, item: Any, state: "_RunState | None", exc: Exception, run_id: str, tb: str
     ) -> str | None:
@@ -834,6 +1103,12 @@ class Runner:
         ``"running"``), or it does not (``_open_pipeline`` itself raised, possibly before ever
         calling ``upsert_pipeline``) — in which case a row is created first so the pipeline does
         not simply vanish from the report.
+
+        Unlike ``_terminalize_crashed_pipeline``, this path deliberately rewrites the row *without*
+        checking whether it is already terminal: the run continues and returns a report afterwards,
+        so this row is the only trace the caller has that the run hit a framework-level fault. A
+        supervisor-observed death is different — the run stops and raises, so the exception carries
+        the fault and an already-earned terminal row must not be overwritten.
         """
         if state is not None:
             self.store.finish_pipeline(

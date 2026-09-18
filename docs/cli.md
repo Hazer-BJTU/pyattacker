@@ -14,15 +14,21 @@ Everything here is also reachable as `python -m pyattacker ...`. The commands sp
 |---|---|
 | `0` | every pipeline succeeded (or was skipped as already done) |
 | `1` | the run finished but some pipelines failed, or this run could not repair one (`repair_failures`) |
-| `2` | configuration error — nothing ran |
+| `2` | configuration error — nothing ran; also a run that ended on a named framework error (`WorkerCrashed`, `StoreUnavailable`) |
 | `130` | interrupted (SIGINT); parked and in-flight pipelines are recorded as resumable |
 
-`2` means "fix the config"; `1` means "read the report". A `130` run is always safe to `resume`.
+`2` means "fix the config" (or "read the error"); `1` means "read the report". A `130` run is always safe to
+`resume`.
 
 The `1` case covers two different things, and the report says which: a pipeline that reached a failed
 terminal state during this run (counted in `pipelines.by_state`), and a pipeline this run could not settle
 out of a torn terminal state — `repair_failures` in the report (and in `--summary-format json`), because its
 row deliberately keeps the original failure and the run that produced it.
+
+A `2` on `run` is not always a config mistake: a worker that dies outside its own handlers raises
+`WorkerCrashed` (printed as `WorkerCrashed: worker for pipeline … died with …`), after the pipeline it was
+holding has been recorded as failed and the run record closed. The run's own record survives the error, so
+`pyattacker report <store>` still shows what happened; fix the cause and rerun with `--resume`.
 
 ---
 
