@@ -200,6 +200,8 @@ class StatsServer:
                     count = getattr(store, "handoffs", None)
                     history = count(pipeline_id=record.pipeline_id) if callable(count) else []
                     handoffs = sum((hop.handoff_id or 0) > record.handoff_floor for hop in history)
+                    visit_reader = getattr(store, "visit_state", None)
+                    traversal = visit_reader(record.pipeline_id) if callable(visit_reader) else None
                     rows.append(
                         {
                             "pipeline_id": record.pipeline_id,
@@ -210,6 +212,7 @@ class StatsServer:
                             "n_tasks_total": record.n_tasks_total,
                             "handoffs": handoffs,
                             "handoffs_historical": len(history),
+                            **({"control": traversal, "cursor_kind": "position"} if traversal is not None else {}),
                             "handoff_floor": record.handoff_floor,
                             "attempts_total": record.attempts_total,
                             "failed_task": record.failed_task,

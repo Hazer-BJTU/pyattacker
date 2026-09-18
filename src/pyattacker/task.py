@@ -629,6 +629,7 @@ class TaskContext:
         "seed",
         "seq",
         "task_name",
+        "visit",
     )
 
     def __init__(
@@ -641,6 +642,7 @@ class TaskContext:
         task_name: str,
         seq: int,
         attempt: int,
+        visit: int = 0,
         clock: Any,
         pools: Mapping[str, Pool],
         bus: Any = None,
@@ -659,6 +661,7 @@ class TaskContext:
         self.task_name = task_name
         self.seq = seq
         self.attempt = attempt
+        self.visit = visit
         self.clock = clock
         self.bus = bus
         self.pools = pools
@@ -795,5 +798,6 @@ class TaskContext:
         payload.setdefault("task", self.task_name)
         payload.setdefault("seq", self.seq)
         payload.setdefault("attempt", self.attempt)
+        payload.setdefault("visit", self.visit)
         with contextlib.suppress(Exception):  # a failed event record must not affect scheduling
             self._emit_cb(kind, payload)

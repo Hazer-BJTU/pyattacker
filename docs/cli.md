@@ -47,7 +47,8 @@ pyattacker run -c config.yaml [options]
 | `--journal {full,summary}` | `full` (default) stores artifact payloads, which is what makes resume work at task granularity; `summary` keeps digests only |
 | `--label TEXT` | a label recorded on the run, for telling runs apart later |
 | `--resume` | skip finished pipelines, restart failed ones at their checkpoint |
-| `--retry-succeeded` | with `--resume`, rerun even the pipelines that succeeded |
+| `--retry-succeeded` | with `--resume`, rerun even the pipelines that succeeded. It only widens *which* pipelines are eligible; it never discards an unfinished one's checkpoint |
+| `--fresh-restart` | start admitted pipelines over from the seed: discard checkpoints/traversal, reset the control budget. Append-only history (attempts/events/handoffs) survives; a backward pipeline additionally keeps its visit occurrences and counters |
 | `--strict-leases` | a leaked lease fails its task (`LeaseLeakError`) instead of being reclaimed quietly. Worth turning on in CI |
 | `--stop-after-failures N` | stop admitting work once N pipelines have failed (best-effort: already-admitted pipelines still finish) |
 | `--no-signals` | do not install SIGINT/SIGTERM handlers |
@@ -80,6 +81,12 @@ that produced no artifact and everything after it. A task whose artifact is on d
 requests that already cost money are not re-sent. Two things defeat this and both leave a
 `pipeline.checkpoint_missing` event behind: `journal: summary` and the `null` artifact backend, neither of
 which keeps the payload a checkpoint needs.
+
+`--resume` is also what claims a pipeline whose row still says `running` — the shape a hard kill leaves. A
+backward-enabled pipeline is never taken over without it: the run skips that row (`pipeline.skipped` with
+`reason="owned_by_another_run"`) rather than forking a traversal another run may still own. A restart that
+should *discard* a checkpoint instead of resuming it is `--fresh-restart` (`fresh_restart=True`), which also
+resets a spent handoff budget; see [backward traversal](backward.md#recovery-and-ownership).
 
 ## `demo` — verify the install with zero config
 
@@ -280,7 +287,8 @@ source: { kind: jsonl, path: data.jsonl, limit: 100, key_field: id, repeats: 1 }
 
 The `run:` block accepts exactly the fields the CLI maps onto `RunConfig`: `store`, `journal`,
 `concurrency`, `label`, `heartbeat_s`, `grace_s`, `stale_after_s`, `strict_leases`,
-`stop_after_failures`, `stop_after_s`, `retry_succeeded`, `seed`, `notes`, `write_behind`,
+`stop_after_failures`, `stop_after_s`, `max_handoffs`, `retry_succeeded`, `fresh_restart`, `seed`, `notes`,
+`write_behind`,
 `write_batch`, `flush_interval`, `artifact_backend` and `meta`. Anything else is a config error, not a
 quietly ignored line. Precedence is explicit: a flag on the command line wins over the `run:` block,
 which wins over the built-in default.
@@ -327,11 +335,13 @@ pipeline:
 ```
 
 A destination is a task name, a task's numeric seq, or `end`, and it must be strictly later than its source
-(this version is forward-only). A name that appears twice in the chain must be given as a seq. Declaring
+(the `edges` operation is forward-only). A name that appears twice in the chain must be given as a seq. Declaring
 `end` from the *last* task is refused, because it would have no effect. Every problem is reported as a field
 path — `pipeline.control.edges['judge'][0]: destination 'fetch' (seq 0) is not later than the source
 'judge' (seq 2); v1 handoffs are forward-only` — under `validate` (exit 2) as well as `run`, because both go
-through the same validation entry. `edges` is the only key inside `control`; there is no `mode` in this version.
+through the same validation entry. Within an `edges` block there is no other key and no `mode` in this
+version; backward traversal declares its own `rewind` / `retry_all` / `max_handoffs` keys instead (see
+[Advanced backward control declarations](#advanced-backward-control-declarations)).
 
 Numeric source keys work across YAML, JSON and TOML: JSON/TOML spell seq 0 as the key `"0"`
 (e.g. `"edges": {"0": [2]}`). An exact task name takes precedence over a numeric string. Numeric
@@ -348,6 +358,15 @@ block are unaffected in every respect. See
 The declarative layer describes **composition and resources only**; the logic stays in Python behind `use:`.
 Anything it cannot express is a reason to use the SDK, not a reason to add YAML — see
 [`docs/tutorial.md`](tutorial.md) step 11 for where the line falls.
+
+### Advanced backward control declarations
+
+`pipeline.control` also accepts `rewind: {source: [earlier_targets]}`, `retry_all: [sources]` and
+required positive `max_handoffs` for backward traversal. `edges` is optional for backward-only plans;
+existing forward-only declarations stay unchanged. `run.max_handoffs` sets the runtime ceiling (default
+1000). Validation shares Python's name/seq resolution and reports configuration field paths. Rewind payloads
+are chosen by task code, not config. See [the backward guide](backward.md) for working Python examples,
+state-history interfaces, budget lifecycle and missing-payload recovery.
 
 ## See also
 

@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+* **Advanced backward traversal (opt-in, experimental):** `Handoff.rewind(target, value)` uses
+  author-selected state; `Handoff.retry_all()` replays immutable bound seed bytes. Separate declarations
+  require finite control budgets. Visit-aware atomic stores retain task/attempt/artifact occurrences,
+  effective lineage and exact pending inputs across rewind and resume. Revisited RNG includes `ctx.visit`;
+  visit-0 IDs and forward-only digests stay compatible. Optional `HistoryArtifact` payloads provide
+  detached snapshots, restoration, explicit pruning and registered-subclass codec round trips. Exports
+  and `/pipelines` expose visit-aware lineage. Restarting is explicit: `RunConfig.fresh_restart` /
+  `--fresh-restart` discards a checkpoint or traversal from the bound seed, resets the control budget and
+  keeps the append-only history, and a store that has committed its first revisit records a `base` → `visits-v1`
+  feature level (`store.feature_level()`, `StoreFeatureUnsupported`) so lineage-unaware writers are refused
+  rather than silently mutating the wrong occurrence. See [the backward guide](docs/backward.md).
+
 * **Advanced feature: handoffs — a task can skip ahead, on the record (opt-in, experimental).** A task may
   return `Handoff.to(target, value)` to continue at a declared later station, or `Handoff.end(value)` to
   finish the pipeline immediately. Until now the alternatives were to run the remaining stations anyway, to
@@ -28,12 +40,41 @@ All notable changes to this project are documented here. The format follows
   so no stored checkpoint, pipeline id or shard assignment is invalidated. Handoffs need a store that can
   commit them atomically; both built-in backends can, and a store that cannot is refused up front with a
   `ConfigError` rather than silently writing a non-durable jump. Marked *experimental until 1.0*;
-  backward/revoke handoffs, joins and cross-pipeline jumps are not included. See
+  the forward declaration excludes backward targets; joins and cross-pipeline jumps are not included. See
   [`docs/design.md` §4.8](docs/design.md#48-advanced-handoffs--declared-forward-jumps-opt-in-experimental),
   the [API reference](docs/reference.md#advanced-handoffs-opt-in) and
   [tutorial step 15](docs/tutorial.md#step-15--advanced-skipping-stations-handoffs).
 
 ### Fixed
+
+* Backward-traversal follow-up: an explicit fresh start now resets a backward pipeline's control budget
+  while preserving durable visit counters and audit history (the counters were never reset — reusing visit
+  IDs would collide with historical occurrences), so a pipeline that failed *because* it spent its budget
+  can be restarted instead of replaying the same fatal error forever; the forward capability check is
+  applied to backward-enabled pipelines too, and `supports_visits` requires the v1
+  `commit_handoff`/`reset_pipeline` ledger capability the transition actually uses;
+  `MemoryStore.stats()["attempts_total"]` counts attempt rows for the run like `SqliteStore`, instead of
+  double-counting a resumed visit's consumed attempts.
+
+* Backward-traversal review follow-up. `retry_succeeded=True` no longer restarts an unfinished backward
+  pipeline: it is an eligibility switch ("also admit succeeded pipelines"), and an unfinished pipeline still
+  owns a recoverable traversal, so replaying it from the seed would repeat external side effects the durable
+  checkpoint was about to continue. The operator escape hatch is the new `RunConfig.fresh_restart` /
+  `--fresh-restart` / `run.fresh_restart`: it discards the checkpoint or traversal, restarts from the bound
+  seed, resets the control budget and invalidates the previous ledger: append-only history (attempts,
+  events, handoffs, retained payloads) survives, and a backward pipeline additionally keeps its
+  visit-qualified occurrences and counters. It is also the documented recovery for a pipeline whose
+  traversal is gone, and it settles every task row it leaves in flight as `interrupted` instead of leaving
+  it `running` forever. Reopening a
+  `running` backward pipeline is now explicit: without `resume=True` the row is skipped
+  (`pipeline.skipped`, `reason="owned_by_another_run"`) instead of silently taking over a traversal another
+  run may still own; `resume=True` reclaims it and continues the exact durable visit. A fresh run no longer
+  reports `pipeline.checkpoint_missing` for its own seed (a `journal="summary"` store drops that payload by
+  design, which used to make every first execution look like a failed checkpoint). `control.retry_all` now
+  rejects aliases that resolve to the same source, matching `control.rewind`. A store that has committed a
+  revisit records it durably (`store_meta` feature level `visits-v1`, `store.feature_level()`), refuses to
+  open an unknown (newer) level with `StoreFeatureUnsupported`, and arms a writer guard so a lineage-unaware
+  writer fails loudly instead of mutating the wrong occurrence.
 
 * Review follow-up: freeze resolved control topology; atomically reset current task/chain artifact state
   on control-enabled seed replays while retaining history; expose handoff identity/watermark and active

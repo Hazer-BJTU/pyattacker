@@ -908,3 +908,104 @@ def test_a_worker_crash_exits_non_zero_with_a_named_error(tmp_path, monkeypatch,
     assert rows[0].error_type == "WorkerCrashed"
     assert "runner.worker_crashed" in [e.kind for e in store.events(limit=50)]
     store.close()
+
+
+# ------------------------------------------------- fresh restart (#52 review item 1)
+def _fresh_restart_config(**run: object) -> dict:
+    """A forward pipeline whose second task always fails, so the checkpoint is observable.
+
+    ``boom`` is built with a fatal error, so it fails once per run without retrying: the run fails
+    after checkpointing ``echo``, a later ``--resume`` continues at the second task, and
+    ``--fresh-restart`` must re-run both.
+    """
+    return {
+        "pipeline": {
+            "name": "restart-check",
+            "tasks": [{"use": "echo"}, {"use": "boom", "args": {"message": "down", "error": "fatal"}}],
+        },
+        "run": {"concurrency": 1, **run},
+        "source": {"kind": "range", "n": 1},
+    }
+
+
+def _attempts_per_task(db: Path) -> dict[str, int]:
+    """Attempt rows in the store, per task name — run-independent, so a resume is observable."""
+    store = SqliteStore(str(db))
+    try:
+        counts: dict[str, int] = {}
+        for attempt in store.attempts():
+            counts[attempt.task_name] = counts.get(attempt.task_name, 0) + 1
+        return counts
+    finally:
+        store.close()
+
+
+def test_fresh_restart_flag_discards_a_forward_checkpoint(tmp_path, capsys):
+    """`--fresh-restart` must reach RunConfig and change what a resume does.
+
+    The same store is resumed twice: plain `--resume` keeps the checkpoint (the first task is not
+    attempted again), `--resume --fresh-restart` starts over (both tasks run again).
+    """
+    cfg = _write_json_config(tmp_path, "restart.json", _fresh_restart_config())
+    db = tmp_path / "restart.db"
+
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 1
+    capsys.readouterr()
+    assert _attempts_per_task(db) == {"mock.echo": 1, "mock.boom": 1}
+
+    assert main(["resume", "-c", str(cfg), "--store", str(db)]) == 1
+    capsys.readouterr()
+    assert _attempts_per_task(db) == {"mock.echo": 1, "mock.boom": 2}  # checkpoint reused
+
+    assert main(["resume", "-c", str(cfg), "--store", str(db), "--fresh-restart"]) == 1
+    capsys.readouterr()
+    assert _attempts_per_task(db) == {"mock.echo": 2, "mock.boom": 3}  # ran from the seed again
+
+    store = SqliteStore(str(db))
+    try:
+        kinds = [e.kind for e in store.events(limit=50)]
+        assert "pipeline.restarted" in kinds
+        assert "pipeline.checkpoint_missing" not in kinds
+    finally:
+        store.close()
+
+
+def test_fresh_restart_is_accepted_in_the_config_run_block(tmp_path, capsys):
+    """The config surface is the same set as the flags (`RUN_FIELDS`), including the new switch."""
+    cfg = _write_json_config(tmp_path, "restart-config.json", _fresh_restart_config(fresh_restart=True))
+    db = tmp_path / "restart-config.db"
+
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 1
+    capsys.readouterr()
+    # The `run:` block applies on every run, so the resume restarts instead of resuming.
+    assert main(["resume", "-c", str(cfg), "--store", str(db)]) == 1
+    capsys.readouterr()
+    assert _attempts_per_task(db) == {"mock.echo": 2, "mock.boom": 2}
+
+    bad = _write_json_config(tmp_path, "restart-bad.json", _fresh_restart_config(fresh_restart="yes"))
+    assert main(["validate", "-c", str(bad)]) == 2
+
+
+def test_shard_children_inherit_fresh_restart():
+    """A restart flag that does not travel to the shard children would restart only the parent's shard."""
+    from pyattacker.cli import _child_argv
+
+    class _Args:
+        config = "cfg.json"
+        fresh_restart = True
+        retry_succeeded = False
+        strict_leases = False
+        no_write_behind = False
+        no_signals = False
+        strict_env = False
+        artifact_backend = None
+        journal = None
+        label = None
+        concurrency = None
+        stop_after_failures = None
+
+    argv = _child_argv(_Args(), 1, 2, "/tmp/shard.db", resume=True)
+    assert "--fresh-restart" in argv
+
+    _Args.fresh_restart = False
+    assert "--fresh-restart" not in _child_argv(_Args(), 1, 2, "/tmp/shard.db", resume=True)

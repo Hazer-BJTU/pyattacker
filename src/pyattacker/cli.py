@@ -118,6 +118,8 @@ def _cmd_run(args: argparse.Namespace, *, resume: bool = False) -> int:
         run_cfg["stop_after_failures"] = args.stop_after_failures
     if args.retry_succeeded:
         run_cfg["retry_succeeded"] = True
+    if args.fresh_restart:
+        run_cfg["fresh_restart"] = True
     if args.artifact_backend:
         run_cfg["artifact_backend"] = args.artifact_backend
     if args.no_write_behind:
@@ -187,6 +189,9 @@ _CHILD_PASSTHROUGH = (
 )
 _CHILD_FLAGS = (
     ("retry_succeeded", "--retry-succeeded"),
+    # A restart has to survive sharding too, or `run --shards N --fresh-restart` would restart only
+    # the shard the parent itself opened.
+    ("fresh_restart", "--fresh-restart"),
     ("strict_leases", "--strict-leases"),
     ("no_write_behind", "--no-write-behind"),
     ("no_signals", "--no-signals"),
@@ -553,6 +558,11 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--label", default=None)
     parser.add_argument("--resume", action="store_true", help="skip completed work and resume from the checkpoint")
     parser.add_argument("--retry-succeeded", action="store_true")
+    parser.add_argument(
+        "--fresh-restart",
+        action="store_true",
+        help="start over from the seed: discard checkpoints/traversal and reset the control budget",
+    )
     parser.add_argument("--strict-leases", action="store_true", help="treat leaked leases as a task failure")
     parser.add_argument("--stop-after-failures", type=int, default=None)
     parser.add_argument("--no-signals", action="store_true")

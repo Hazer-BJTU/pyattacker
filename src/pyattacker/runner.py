@@ -72,6 +72,7 @@ from .store import (
     open_store,
     supports_handoff,
 )
+from .store.visits import supports_visits
 from .task import UNSET, TaskContext, TaskSpec
 
 __all__ = ["Runner", "RunConfig", "RunReport"]
@@ -116,7 +117,19 @@ class RunConfig:
             itself: ``_open_pipeline`` restores an existing ``failed``/``interrupted`` pipeline's
             checkpoint unconditionally, based on the stored record alone.
         retry_succeeded: When true, re-run pipelines already marked ``"succeeded"`` instead of
-            skipping them (for re-evaluation passes over the same store).
+            skipping them (for re-evaluation passes over the same store). It is an *eligibility*
+            switch only: it never discards the durable state of a pipeline that has not succeeded.
+        fresh_restart: When true, an admitted pipeline starts over from its bound seed instead of
+            resuming: durable checkpoints and the effective traversal are discarded, a spent
+            control budget is reset, and the previous ledger is invalidated. Append-only history
+            (attempts, events, handoffs, retained high-band payloads) is never deleted; a
+            backward-enabled pipeline additionally keeps its visit-qualified task/artifact
+            occurrences and its visit counters, so historical occurrences stay addressable. A
+            forward pipeline reuses its task/artifact addresses by design (that is the v1 identity),
+            so its *current* task rows and chain artifacts are replaced rather than duplicated. This
+            is the operator escape hatch for a backward pipeline that failed *because* it exhausted
+            ``max_handoffs``, and for a checkpoint the framework can no longer open; combine it with
+            ``retry_succeeded`` to restart a pipeline that already succeeded.
         heartbeat_s: How often the run's heartbeat is written; drives ``stale_after_s`` staleness
             detection for other runners sharing the same store.
         grace_s: How long a graceful shutdown waits for in-flight workers before cancelling them.
@@ -146,6 +159,7 @@ class RunConfig:
     run_id: str | None = None
     resume: bool = False
     retry_succeeded: bool = False
+    fresh_restart: bool = False
     heartbeat_s: float = 5.0
     grace_s: float = 5.0
     stale_after_s: float = 30.0
@@ -164,6 +178,7 @@ class RunConfig:
     # (or {"kind": "file", "root": ..., "min_bytes": ...}) spills large ones to disk.
     artifact_backend: Any = None
     meta: dict[str, Any] = field(default_factory=dict)
+    max_handoffs: int = 1000
 
 
 @dataclass
@@ -183,7 +198,8 @@ class RunReport:
         stats: The store's aggregate view for this run — pipeline/task counts by state, latency
             percentiles, etc. (see ``Store.stats``); this is what :meth:`to_dict` flattens.
         skipped: Pipelines skipped because they were already ``"succeeded"`` (and
-            ``retry_succeeded`` was false).
+            ``retry_succeeded`` was false), or because a backward-enabled pipeline's row is still
+            owned by another run and this run did not pass ``resume`` to claim it.
         leases_leaked: Leases force-reclaimed because a task ended while still holding them.
         stop_reason: Why the run stopped early (``"stop_after_failures"``, ``"signal"``, ...);
             ``None`` when every admitted pipeline simply ran to completion.
@@ -334,6 +350,7 @@ class _HandoffPlan:
     entry_value: Any  # the payload value the target enters with (UNSET when reused)
     payload: Encoded | None  # the encoded payload, written by the commit
     attempt: AttemptRecord  # the handed-off attempt row, written by the commit
+    operation: str = "forward"
 
 
 @dataclass
@@ -1212,6 +1229,29 @@ class Runner:
             self._emit("pipeline.skipped", pipeline_id=spec.pipeline_id, data={"reason": "succeeded"})
             return None
 
+        if spec.control is not None and spec.control.backward_enabled:
+            if self._owned_by_another_run(record, resume=cfg.resume):
+                # Explicit ownership rule for backward traversal (`docs/backward.md`): a durable
+                # pending visit can be continued after a crash, so taking over a row that another
+                # run may still own would silently fork one traversal into two writers. `resume=True`
+                # is the operator's claim that the previous owner is gone; without it the row is left
+                # exactly as it is rather than rewritten or replayed.
+                assert record is not None  # narrowed by the ownership guard above
+                self._counters["skipped"] += 1
+                self._counters["pipelines_done"] += 1
+                self._check_all_done()
+                self._emit(
+                    "pipeline.skipped",
+                    pipeline_id=spec.pipeline_id,
+                    data={
+                        "reason": "owned_by_another_run",
+                        "owner_run_id": record.run_id,
+                        "hint": "pass resume=True (or --resume) to reclaim a pipeline whose owner is gone",
+                    },
+                )
+                return None
+            return self._open_backward_pipeline(spec, record, run_id)
+
         # A cursor at (or past) the end of the chain must never reach the resume rule below, which
         # would index spec.tasks[cursor] and raise IndexError -- forever, on every later run. Handle
         # the two shapes explicitly before the ordinary checkpoint branch.
@@ -1219,7 +1259,14 @@ class Runner:
         # A recorded handoff is consulted *before* those rules: with an early END the chain has no
         # artifact at n_tasks - 1 at all, so the linear terminal repair cannot decide the case, and a
         # durable END ledger row must finalize its own entry artifact instead.
-        resumable = record is not None and record.state in ("failed", "interrupted")
+        #
+        # `fresh_restart` is the operator's explicit "start this pipeline over" switch: it turns off
+        # every resume/repair rule at once and runs the chain from the bound seed again, so a
+        # checkpoint the framework can no longer use (or one the operator no longer trusts) is never
+        # a reason to keep a pipeline stuck. The ledger watermark is still bumped below, so no
+        # pre-restart handoff can be mistaken for pending work.
+        restart = cfg.fresh_restart and record is not None
+        resumable = record is not None and record.state in ("failed", "interrupted") and not restart
         pending: HandoffRecord | None = None
         # Only a control-enabled pipeline can have a ledger row at all, and only a store with the
         # capability can be asked for one: otherwise a third-party store that never implemented it
@@ -1236,7 +1283,8 @@ class Runner:
                     return None
                 pending = None  # the entry artifact was unusable: the row was rewound to 0
         if (
-            record is not None
+            not restart
+            and record is not None
             and record.state in ("failed", "interrupted")
             and record.n_tasks_done >= spec.n_tasks
             and self._settle_terminal_cursor(spec, record, run_id)
@@ -1285,6 +1333,22 @@ class Runner:
                     pipeline_id=spec.pipeline_id,
                     data={"reason": "journal did not persist the artifact payload; rerunning the whole pipeline"},
                 )
+
+        if restart:
+            # A fresh start is not a checkpoint failure, so it does not borrow that event: the
+            # previous cursor is discarded on purpose, not lost. The event claims only what is true
+            # for a forward pipeline -- append-only history survives; the current task rows and chain
+            # artifacts are replaced by `reset_pipeline` below, which is what a fresh start means.
+            self._emit(
+                "pipeline.restarted",
+                pipeline_id=spec.pipeline_id,
+                data={
+                    "reason": "fresh_restart",
+                    "via": "forward",
+                    "discarded_cursor": record.n_tasks_done if record is not None else 0,
+                    "append_only_history_preserved": True,
+                },
+            )
 
         resumed_from = record.run_id if record is not None and start_index > 0 else None
         record = record or PipelineRecord(
@@ -1366,6 +1430,155 @@ class Runner:
         self._begin_task(state)
         return state
 
+    def _owned_by_another_run(self, record: PipelineRecord | None, *, resume: bool) -> bool:
+        """Whether a ``running`` backward pipeline must be left alone by this run.
+
+        Only a *backward* pipeline reaches this: its recovery continues an exact durable visit, so
+        two writers would fork one traversal. A forward pipeline keeps the long-standing rule (a
+        ``running`` row of another run is simply restarted from zero), which is why this is not part
+        of the generic open path.
+
+        Ownership is decided by the stored row alone — never by heartbeat arithmetic — so the outcome
+        is deterministic and does not depend on how long ago the previous process died: without
+        ``resume`` a ``running`` row is never taken over (a same-run re-admission included: running one
+        pipeline twice under one ``run_id`` is never intended), and with it the operator has claimed
+        the traversal back.
+        """
+        return record is not None and record.state == "running" and not resume
+
+    def _open_backward_pipeline(self, spec: PipelineSpec, record: PipelineRecord | None,
+                                run_id: str) -> _RunState | None:
+        """Open exact visit checkpoints, including a pending author-selected entry at seq 0."""
+        if not supports_visits(self.store):
+            raise ConfigError(f"store {type(getattr(self.store, 'inner', self.store)).__name__} lacks visit-aware control capability")
+        # `supports_visits` covers the visit methods, but a backward transition also lands its ledger
+        # row, source task and attempt through `commit_handoff` and clears a previous execution through
+        # `reset_pipeline`. That is what `_control_problem` probed for the forward path, and it must be
+        # probed here too: without it the first rewind would die with an AttributeError instead of the
+        # configuration error that names the missing capability.
+        problem = self._control_problem(spec)
+        if problem is not None:
+            raise problem
+        ceiling = self.config.max_handoffs
+        if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling <= 0:
+            raise ConfigError("RunConfig.max_handoffs must be a positive finite integer")
+        problem = self._pool_problem(spec)
+        if problem is not None:
+            raise problem
+        previous = record.run_id if record is not None else None
+        traversal = self.store.visit_state(spec.pipeline_id)
+        # A missing traversal is only "corrupt" when something durable was actually written: an open
+        # that failed before its first transaction -- a bad runtime ceiling, a missing pool, a store
+        # that lacks the capability, an undecodable seed -- leaves a `failed` row with nothing to
+        # resume, and insisting on a traversal there poisons the pipeline id forever (every later run,
+        # `resume=True` included, would report the same corruption). The forward path never has this
+        # shape because it writes its row before its checks, so a fresh start is the matching recovery.
+        #
+        # Beyond that, a fresh execution is only ever explicit:
+        #
+        # * the row already succeeded, so there is no traversal left to resume (reached only under
+        #   `retry_succeeded`, which is what admits a succeeded row at all);
+        # * `fresh_restart=True`, the operator's documented "start this pipeline over" switch.
+        #
+        # `retry_succeeded` on its own must NOT appear here. It is an eligibility switch ("also
+        # consider succeeded pipelines"), and a *failed*, *interrupted* or hard-killed backward
+        # pipeline still owns a recoverable traversal: replaying it from the seed would repeat
+        # external side effects that the durable checkpoint was about to continue. The escape hatch
+        # for a pipeline that failed *because* it exhausted `max_handoffs` -- the one case where no
+        # checkpoint can make progress -- is `fresh_restart=True`, which is explicit about discarding
+        # the traversal and is also the recovery for a traversal the framework can no longer open.
+        restart = self.config.fresh_restart and record is not None
+        fresh = (
+            record is None
+            or (traversal is None and not self._visit_progress_written(spec))
+            or record.state == "succeeded"
+            or restart
+        )
+        record = record or PipelineRecord(pipeline_id=spec.pipeline_id, run_id=run_id, name=spec.name,
+                                         key=spec.key, tags=dict(spec.template.tags), n_tasks_total=spec.n_tasks,
+                                         seed_digest=spec.seed_digest, spec_digest=spec.spec_digest)
+        if not fresh and traversal is None:
+            raise PyAttackerError("corrupt visit checkpoint: missing traversal state")
+        record = dataclasses.replace(record, run_id=run_id, state="running", finished_at=None,
+                                     started_at=record.started_at or time.time(), resume_of=previous,
+                                     error_type=None, error_message=None, traceback=None, failed_task=None)
+        seed = self.store.get_artifact_by_id(Artifact.build_id(spec.pipeline_id, SEED_SEQ))
+        if seed is None or not seed.available:
+            # Decoded only when it is actually needed. Eager decoding would make an unrelated registry
+            # mismatch fatal on open even for a run that is about to resume an existing checkpoint,
+            # and it would waste the decode on every resume of a pipeline whose seed is still readable.
+            seed = self._store_artifact(
+                spec, SEED_TASK, SEED_SEQ, self.registry.load(spec.seed_encoded or self.registry.dump(spec.seed))
+            )
+        if fresh:
+            discarded = traversal["cursor"] if traversal else 0
+            record = self.store.reset_visits(record, seed, fresh_budget=True)
+            traversal = self.store.visit_state(spec.pipeline_id)
+            if restart:
+                self._emit(
+                    "pipeline.restarted",
+                    pipeline_id=spec.pipeline_id,
+                    data={
+                        "reason": "fresh_restart",
+                        "via": "visits",
+                        "discarded_cursor": discarded,
+                        "budget_reset": True,
+                        "counters_preserved": True,
+                        "visit_occurrences_preserved": True,
+                        "append_only_history_preserved": True,
+                    },
+                )
+        if traversal["terminal"] is not None:
+            terminal = self.store.get_artifact_by_id(traversal["terminal"])
+            if terminal is not None:
+                # Finality and terminal state were committed together; this only repairs an
+                # externally interrupted/failed row without replaying the producing task.
+                self.store.repair_visit_terminal(record)
+                self._counters["pipelines_succeeded"] += 1
+                self._counters["pipelines_done"] += 1
+                self._check_all_done()
+                return None
+            raise PyAttackerError("corrupt visit checkpoint: terminal occurrence is missing")
+        seq = traversal["cursor"]
+        if isinstance(seq, bool) or not isinstance(seq, int) or not 0 <= seq < spec.n_tasks:
+            raise PyAttackerError(f"corrupt visit checkpoint: invalid cursor {seq!r}")
+        # A fresh traversal starts at its bound seed *by construction*: the immutable seed bytes are
+        # already in hand, so there is nothing to load from the store and nothing that could be
+        # missing. Decoding the just-written seed occurrence instead would make a brand-new
+        # `journal="summary"` run (whose seed payload is dropped on purpose) report
+        # `pipeline.checkpoint_missing` and reset the traversal it had only just created -- a
+        # checkpoint failure that never happened, on the very first execution of the pipeline.
+        # The missing-payload fallback below stays reserved for a traversal that genuinely needs a
+        # payload written by an earlier execution.
+        if fresh:
+            value = self.registry.load(spec.seed_encoded or self.registry.dump(spec.seed))
+            entry = seed
+        else:
+            entry = self.store.get_artifact_by_id(traversal["input"])
+            try:
+                if entry is None or not entry.available:
+                    raise PyAttackerError("visit entry payload is unavailable")
+                value = self.registry.load(entry.encoded())
+            except Exception as exc:
+                self._emit("pipeline.checkpoint_missing", pipeline_id=spec.pipeline_id,
+                           data={"reason": str(exc), "via": "visits", "budget_preserved": True})
+                record = self.store.reset_visits(record, seed)
+                seq, entry = 0, seed
+                value = (
+                    self.registry.load(spec.seed_encoded or self.registry.dump(spec.seed))
+                    if not seed.available
+                    else self.registry.load(seed.encoded())
+                )
+        record.n_tasks_done = seq
+        self.store.upsert_pipeline(record)
+        state = _RunState(spec=spec, record=record, run_id=run_id, seq=seq, value=value, artifact=entry,
+                          task_spec=spec.tasks[seq], task_record=None, start_index=seq)
+        self._begin_task(state)
+        if not fresh:
+            self._emit("pipeline.resumed", pipeline_id=spec.pipeline_id,
+                       data={"from_seq": seq, "visit": state.task_record.visit, "via": "visits", "resume_of": previous})
+        return state
+
     def _latest_handoff(self, pipeline_id: str) -> HandoffRecord | None:
         """The pipeline's newest ledger row, or ``None`` when it never handed off.
 
@@ -1416,6 +1629,29 @@ class Runner:
             )
             return None
         return handoff.to_seq, entry, value
+
+    def _visit_progress_written(self, spec: PipelineSpec) -> bool:
+        """Whether a backward pipeline with no traversal record still left durable progress behind.
+
+        Used only to tell two shapes apart when ``visit_state`` is ``None``:
+
+        * a **failed open** — a configuration or capability check refused before any transaction, so
+          there is no task row, no ledger row and no chain artifact. Nothing can be lost by starting
+          over, and the row must not stay permanently unopenable.
+        * an **externally damaged checkpoint** — rows exist but the traversal that owns them is gone.
+          That is the corruption :meth:`_open_backward_pipeline` reports, because guessing here could
+          re-run committed work or reuse a stale artifact.
+
+        A method rather than an inline expression so both built-in stores and third-party visit stores
+        are asked through their public API only.
+        """
+        if self.store.tasks(spec.pipeline_id):
+            return True
+        if self.store.handoffs(pipeline_id=spec.pipeline_id, limit=1):
+            return True
+        return any(
+            artifact.seq >= 0 for artifact in self.store.artifacts(spec.pipeline_id)
+        )
 
     def _control_problem(self, spec: PipelineSpec) -> ConfigError | None:
         """A control-enabled pipeline needs a store that can commit a handoff atomically.
@@ -1641,7 +1877,11 @@ class Runner:
             started_at=time.time(),
             input_artifact_id=state.artifact.id if state.artifact else None,
         )
-        self.store.record_task(state.task_record)
+        if state.spec.control is not None and state.spec.control.backward_enabled:
+            state.task_record = self.store.commit_entry(state.task_record)
+            state.attempts_used = state.task_record.attempts_used
+        else:
+            self.store.record_task(state.task_record)
 
     async def _drive(self, state: _RunState) -> None:
         """Run one pipeline until it finishes, fails, or parks itself for a retry backoff."""
@@ -1671,6 +1911,9 @@ class Runner:
                 # row, the handed-off attempt, the entry artifact, the ledger row and the cursor.
                 if self._commit_handoff(state, result.handoff):
                     return  # END: the pipeline finished here
+                if state.spec.control.backward_enabled and result.handoff.operation in ("rewind", "retry_all"):
+                    self._delays.push(state, 0.0)
+                    return  # requeue through the timer pump, releasing this worker
                 continue  # forward: the target is already open, run it next
 
             outcome = result.outcome or _Outcome(
@@ -1701,6 +1944,20 @@ class Runner:
                     },
                 )
                 return
+
+            if state.spec.control is not None and state.spec.control.backward_enabled:
+                state.record.n_tasks_done = state.seq + 1
+                if state.seq + 1 >= state.spec.n_tasks:
+                    self._counters["pipelines_succeeded"] += 1
+                    self._counters["pipelines_done"] += 1
+                    self._check_all_done()
+                    self._emit("pipeline.succeeded", pipeline_id=state.pipeline_id,
+                               data={"tasks": state.spec.n_tasks, "resumed_from": state.start_index})
+                    return
+                state.value, state.artifact = outcome.value, outcome.artifact
+                state.seq += 1
+                self._begin_task(state)
+                continue
 
             # ★ task-level checkpoint: the artifact is already durable, now advance the cursor
             state.record.n_tasks_done = state.seq + 1
@@ -1756,15 +2013,25 @@ class Runner:
             entry_seq=hop.entry_seq,
             entry_reused=hop.reused,
             reason=hop.reason,
+            operation=hop.operation,
+            from_visit=state.task_record.visit,
         )
-        stored = self.store.commit_handoff(
-            record,
-            task=state.task_record,
-            attempt=hop.attempt,
-            payload=hop.payload,
-            cursor=spec.n_tasks if hop.target is None else hop.target,
-            final=hop.target is None,
-        )
+        if spec.control.backward_enabled:
+            target_task = None if hop.target is None else TaskRecord(
+                task_run_id="", pipeline_id=state.pipeline_id, run_id=state.run_id,
+                name=hop.to_task, seq=hop.target, state="running", started_at=time.time())
+            entry_id = state.artifact.id if hop.reused and state.artifact is not None else None
+            if hop.operation == "retry_all":
+                entry_id = Artifact.build_id(state.pipeline_id, SEED_SEQ)
+            stored = self.store.commit_control_transition(
+                record, pipeline=state.record, task=state.task_record, attempt=hop.attempt,
+                payload=hop.payload, entry_id=entry_id, target_task=target_task,
+                limit=self._control_budget_used(spec, spec.control)[1])
+        else:
+            stored = self.store.commit_handoff(
+                record, task=state.task_record, attempt=hop.attempt, payload=hop.payload,
+                cursor=spec.n_tasks if hop.target is None else hop.target, final=hop.target is None,
+            )
         self._emit(
             "pipeline.handoff",
             pipeline_id=state.pipeline_id,
@@ -1778,6 +2045,10 @@ class Runner:
                 "handoff_id": record.handoff_id,
                 "entry_artifact_id": record.entry_artifact_id,
                 "entry_reused": hop.reused,
+                "operation": hop.operation,
+                "from_visit": state.task_record.visit,
+                **({"to_visit": record.to_visit, "transition_version": record.transition_version}
+                   if spec.control.backward_enabled else {}),
             },
         )
         if hop.target is None:
@@ -1795,7 +2066,14 @@ class Runner:
         # never ran, and their task rows deliberately do not exist.
         state.record.n_tasks_done = hop.target
         state.seq = hop.target
-        if not hop.reused:
+        if spec.control.backward_enabled:
+            state.artifact = stored
+            if hop.operation == "retry_all":
+                state.value = self.registry.load(spec.seed_encoded or self.registry.dump(spec.seed))
+            elif hop.payload is not None:
+                state.value = hop.entry_value
+            # A reused input keeps the decoded state even in summary journal mode.
+        elif not hop.reused:
             state.value = hop.entry_value
             state.artifact = stored
         # A reused entry keeps value/artifact exactly as they were: the target enters with the same
@@ -1833,12 +2111,16 @@ class Runner:
         # sits in the delay queue waiting out a retry backoff must not lose the attempt count
         # that already durably happened. Pipeline state writes are synchronous by convention
         # (see store/base.py), so one extra write per attempt is the correct trade, not batched.
-        self.store.upsert_pipeline(state.record)
+        if spec.control is not None and spec.control.backward_enabled:
+            self.store.commit_visit_attempt(state.record, record)
+        else:
+            self.store.upsert_pipeline(state.record)
         # Deterministic seed, not the shared `random` module: re-running the same pipeline/seq/attempt
         # (e.g. replaying a resumed run against the same checkpoint) must reproduce the same backoff
         # jitter and the same ctx.seed, or two "identical" runs would silently diverge. Do not switch
         # this to random.Random() without a good reason.
-        rng = random.Random(int(digest_of(f"{spec.pipeline_id}|{seq}|{attempts_used}")[:16], 16))
+        seed_key = f"{spec.pipeline_id}|{seq}|{attempts_used}" if record.visit == 0 else f"{spec.pipeline_id}|{seq}|{record.visit}|{attempts_used}"
+        rng = random.Random(int(digest_of(seed_key)[:16], 16))
         ctx = TaskContext(
             run_id=state.run_id,
             pipeline_id=spec.pipeline_id,
@@ -1847,6 +2129,7 @@ class Runner:
             task_name=task_spec.name,
             seq=seq,
             attempt=attempts_used,
+            visit=record.visit,
             clock=self.clock,
             pools=self.pools,
             bus=self.bus,
@@ -1889,7 +2172,7 @@ class Runner:
         if cancelled:
             self._record_attempt(
                 spec, task_spec, task_run_id, attempts_used, attempt_started, attempt_ms,
-                "cancelled", error, ctx.lease_log(), {},
+                "cancelled", error, ctx.lease_log(), {}, seq, record.visit,
             )
             record.state = "interrupted"
             record.ended_at = time.time()
@@ -1920,22 +2203,29 @@ class Runner:
                 return _TaskResult(handoff=hop, attempts=attempts_used)
 
         if error is None:
-            artifact = self._store_artifact(spec, task_spec.name, seq, out_value)
+            backward = spec.control is not None and spec.control.backward_enabled
+            artifact = self._store_artifact(spec, task_spec.name, seq, out_value,
+                                            visit=record.visit, persist=not backward)
             record.state = "succeeded"
             record.ended_at = time.time()
             record.duration_ms = attempt_ms
             record.output_artifact_id = artifact.id
             record.error_class = record.error_type = record.error_message = None
-            self.store.record_task(record)
-            self._record_attempt(
+            attempt = self._attempt_record(
                 spec, task_spec, task_run_id, attempts_used, attempt_started, attempt_ms,
-                "succeeded", None, ctx.lease_log(), {"decision": {"retry": False, "reason": "ok"}},
+                "succeeded", None, ctx.lease_log(), {"decision": {"retry": False, "reason": "ok"}}, seq, record.visit,
             )
+            if backward:
+                artifact = self.store.commit_visit_success(state.record, record, attempt, artifact,
+                                                          final=seq + 1 == spec.n_tasks)
+            else:
+                self.store.record_task(record)
+                self.store.record_attempt(attempt)
             self._emit(
                 "task.succeeded",
                 pipeline_id=spec.pipeline_id,
                 task_run_id=task_run_id,
-                data={"task": task_spec.name, "seq": seq, "attempt": attempts_used,
+                data={"task": task_spec.name, "seq": seq, "visit": record.visit, "attempt": attempts_used,
                       "duration_ms": round(attempt_ms, 3), "artifact": artifact.id,
                       "digest": artifact.digest},
             )
@@ -1956,7 +2246,7 @@ class Runner:
         self._record_attempt(
             spec, task_spec, task_run_id, attempts_used, attempt_started, attempt_ms,
             "timeout" if error_class == "timeout" else "failed", error, ctx.lease_log(),
-            {"decision": decision},
+            {"decision": decision}, seq, record.visit,
         )
         self._emit(
             "task.failed",
@@ -1965,6 +2255,7 @@ class Runner:
             data={
                 "task": task_spec.name,
                 "seq": seq,
+                "visit": record.visit,
                 "attempt": attempts_used,
                 "error_class": error_class,
                 "error": f"{type(error).__name__}: {error}",
@@ -1996,6 +2287,21 @@ class Runner:
         return _TaskResult(retry_after=delay, attempts=attempts_used)
 
     # ------------------------------------------------------------------ helpers
+    def _control_budget_used(self, spec: PipelineSpec, plan: ControlPlan) -> tuple[int, int]:
+        """``(consumed, allowed)`` nonterminal transfers for a backward-enabled pipeline.
+
+        The declared ``control.max_handoffs`` and the runtime ``RunConfig.max_handoffs`` ceiling are
+        both caps, so the lower one is the effective limit. Read defensively: a store that lost its
+        traversal state between opening the pipeline and returning a directive is a corrupt checkpoint,
+        and that must be reported as one instead of surfacing as a ``TypeError`` inside the attempt.
+        """
+        traversal = self.store.visit_state(spec.pipeline_id)
+        if traversal is None:
+            raise PyAttackerError(
+                "corrupt visit checkpoint: traversal state is missing for a backward-enabled pipeline"
+            )
+        return traversal["handoffs"], min(plan.max_handoffs, self.config.max_handoffs)
+
     def _handoff_plan(
         self,
         state: _RunState,
@@ -2020,7 +2326,14 @@ class Runner:
                 f"task {name!r} returned a Handoff, but pipeline {spec.name!r} declares no control block; "
                 "declare control={'edges': {...}} on the pipeline to allow a handoff (see docs/design.md §4.8)"
             )
-        target = plan.allows(state.seq, directive.target)
+        target = plan.allows(state.seq, directive.target, directive.operation)
+        if plan.backward_enabled and target is not None:
+            # `target is None` is END, which consumes no transfer (store/visits.py counts only
+            # nonterminal handoffs), so it stays outside this check: a loop whose exit is
+            # `Handoff.end()` still finishes at the declared limit.
+            count, limit = self._control_budget_used(spec, plan)
+            if count >= limit:
+                raise FatalError(f"control budget exhausted: consumed {count}, allowed {limit}")
         reused = directive.reuses_input
         if reused and state.artifact is None:  # pragma: no cover - defensive: a task always has an input
             raise FatalError(
@@ -2040,8 +2353,9 @@ class Runner:
             payload=payload,
             attempt=self._attempt_record(
                 spec, state.task_spec, task_run_id, attempts_used, attempt_started, attempt_ms,
-                "handed_off", None, ctx.lease_log(), {},
+                "handed_off", None, ctx.lease_log(), {}, state.seq, state.task_record.visit,
             ),
+            operation=directive.operation,
         )
 
     def _attempt_record(
@@ -2056,6 +2370,8 @@ class Runner:
         error: BaseException | None,
         leases: Sequence[Any],
         extra: Mapping[str, Any],
+        seq: int,
+        visit: int,
     ) -> AttemptRecord:
         """Build one attempt row without writing it.
 
@@ -2069,7 +2385,8 @@ class Runner:
             run_id=self._run_id or "",
             task_run_id=task_run_id,
             task_name=task_spec.name,
-            seq=int(task_run_id.rsplit(":", 1)[1]),
+            seq=seq,
+            visit=visit,
             attempt_no=attempt_no,
             started_at=time.time() - duration_ms / 1000.0,
             ended_at=time.time(),
@@ -2100,18 +2417,21 @@ class Runner:
         error: BaseException | None,
         leases: Sequence[Any],
         extra: Mapping[str, Any],
+        seq: int,
+        visit: int,
     ) -> AttemptRecord:
         record = self._attempt_record(
-            spec, task_spec, task_run_id, attempt_no, started, duration_ms, outcome, error, leases, extra
+            spec, task_spec, task_run_id, attempt_no, started, duration_ms, outcome, error, leases, extra, seq, visit
         )
         return self.store.record_attempt(record)
 
     def _store_artifact(
-        self, spec: PipelineSpec, task_name: str, seq: int, value: Any, *, is_final: bool = False
+        self, spec: PipelineSpec, task_name: str, seq: int, value: Any, *, is_final: bool = False,
+        visit: int = 0, persist: bool = True
     ) -> Artifact:
         encoded = self.registry.dump(value)
         artifact = Artifact(
-            id=Artifact.build_id(spec.pipeline_id, seq),
+            id=Artifact.build_id(spec.pipeline_id, seq) + (f"#{visit}" if visit else ""),
             pipeline_id=spec.pipeline_id,
             task_name=task_name,
             seq=seq,
@@ -2122,8 +2442,9 @@ class Runner:
             payload=encoded.data,
             created_at=time.time(),
             is_final=is_final,
+            visit=visit,
         )
-        return self.store.put_artifact(artifact)
+        return self.store.put_artifact(artifact) if persist else artifact
 
     def _emit(
         self,

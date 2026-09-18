@@ -62,6 +62,7 @@ def _task_row(record: Any) -> dict[str, Any]:
         "run_id": record.run_id,
         "name": record.name,
         "seq": record.seq,
+        "visit": getattr(record, "visit", 0),
         "state": record.state,
         "attempts_used": record.attempts_used,
         "started_at": record.started_at,
@@ -80,10 +81,12 @@ def _task_row(record: Any) -> dict[str, Any]:
 def _attempt_row(record: Any) -> dict[str, Any]:
     return {
         "attempt_id": record.attempt_id,
+        "task_run_id": record.task_run_id,
         "pipeline_id": record.pipeline_id,
         "run_id": record.run_id,
         "task_name": record.task_name,
         "seq": record.seq,
+        "visit": getattr(record, "visit", 0),
         "attempt_no": record.attempt_no,
         "outcome": record.outcome,
         "started_at": record.started_at,
@@ -120,6 +123,7 @@ def _artifact_row(record: Any) -> dict[str, Any]:
         "pipeline_id": record.pipeline_id,
         "task_name": record.task_name,
         "seq": record.seq,
+        "visit": getattr(record, "visit", 0),
         "type_name": record.type_name,
         "codec": record.codec,
         "digest": record.digest,
@@ -134,7 +138,7 @@ def _artifact_row(record: Any) -> dict[str, Any]:
 def _decode(artifact: Any) -> Any:
     if artifact.payload is None:
         return None
-    if artifact.codec == "json":
+    if artifact.codec in ("json", "history-v1"):
         try:
             return json.loads(artifact.payload.decode("utf-8"))
         except Exception:  # pragma: no cover - defensive

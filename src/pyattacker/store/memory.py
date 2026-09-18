@@ -7,10 +7,12 @@ method names in the :class:`~pyattacker.store.base.Store` protocol (``pipelines`
 from __future__ import annotations
 
 import base64
+import copy
 import dataclasses
 import json
 import time
 from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any
 
 from ..artifact import Artifact, Encoded
@@ -24,11 +26,12 @@ from .base import (
     TaskRecord,
     handoff_row,
 )
+from .visits import FEATURE_BASE, FEATURE_VISITS, VisitStore
 
 __all__ = ["MemoryStore"]
 
 
-class MemoryStore:
+class MemoryStore(VisitStore):
     """Pure in-memory :class:`~pyattacker.store.base.Store` implementation — for tests, dry runs, and "nothing hits disk" scenarios.
 
     Invariants: satisfies the same semantics as :class:`~pyattacker.store.sqlite.SqliteStore`
@@ -53,6 +56,101 @@ class MemoryStore:
         self._handoffs: list[HandoffRecord] = []
         self._events: list[EventRecord] = []
         self._event_id = 0
+        self._visits: dict[str, dict[str, Any]] = {}
+        self._occurrences: dict[str, Artifact] = {}
+        self._feature_level = FEATURE_BASE
+
+    @contextmanager
+    def _visit_atomic(self, pipeline_id):
+        names = (
+            "_pipelines", "_tasks", "_attempts", "_artifacts", "_handoffs", "_visits", "_occurrences",
+            # The feature level is part of the same transaction: a rolled-back revisit must not leave
+            # the store marked as one (SQLite gets this for free, since the row is in the same txn).
+            "_feature_level",
+        )
+        saved = {name: copy.copy(getattr(self, name)) for name in names}
+        if pipeline_id in saved["_pipelines"]:
+            saved["_pipelines"][pipeline_id] = copy.deepcopy(saved["_pipelines"][pipeline_id])
+        try:
+            yield
+        except BaseException:
+            for name, value in saved.items():
+                setattr(self, name, value)
+            raise
+
+    def visit_state(self, pipeline_id: str) -> dict[str, Any] | None:
+        return copy.deepcopy(self._visits.get(pipeline_id))
+
+    def feature_level(self) -> str:
+        """Same vocabulary as ``SqliteStore``, for tests and callers that do not special-case it.
+
+        Nothing durable needs protecting in memory, so this is reported for parity only: the level
+        follows the in-process traversal exactly as the SQLite marker follows the durable one.
+        """
+        return self._feature_level
+
+    def _visit_mark_revisit(self) -> None:
+        self._feature_level = FEATURE_VISITS
+
+    def _visit_abandon_running_tasks(self, pipeline_id: str) -> None:
+        """Same rule as ``SqliteStore``: replace the records, never mutate them in place.
+
+        ``_visit_atomic`` snapshots the task mapping with a shallow copy, so mutating a record would
+        survive a rollback; replacing the entry keeps the rollback exact.
+        """
+        for task_run_id, task in list(self._tasks.items()):
+            if task.pipeline_id == pipeline_id and task.state == "running":
+                self._tasks[task_run_id] = dataclasses.replace(task, state="interrupted")
+
+    def _visit_observed_counters(self, pipeline_id: str, n_tasks_total: int) -> dict[str, int]:
+        """Same reconstruction as ``SqliteStore``, over the rows this store holds (see ``visits.py``)."""
+        observed: dict[str, int] = {}
+        rows: list[Any] = [
+            *self._occurrences.values(), *self._artifacts.values(), *self._tasks.values()
+        ]
+        for row in rows:
+            if row.pipeline_id == pipeline_id and 0 <= row.seq < n_tasks_total:
+                key = str(row.seq)
+                observed[key] = max(observed.get(key, -1), row.visit)
+        return observed
+
+    def _visit_save(self, pipeline_id, state):
+        self._visits[pipeline_id] = copy.deepcopy(state)
+
+    def _visit_pipeline(self, record):
+        self.upsert_pipeline(copy.deepcopy(record))
+
+    def _visit_task(self, record):
+        self.record_task(copy.deepcopy(record))
+
+    def _visit_attempt(self, record):
+        self.record_attempt(copy.deepcopy(record))
+
+    def _visit_artifact(self, artifact):
+        stored = _persist_form(artifact, self.journal, self.backend)
+        self._occurrences[stored.id] = stored
+        return _hydrate(stored, self.backend)
+
+    def _visit_handoff(self, record, task, attempt, payload, cursor, final):
+        stored = self.commit_handoff(record, task=copy.deepcopy(task), attempt=copy.deepcopy(attempt),
+                                     payload=payload, cursor=cursor, final=final)
+        if final:
+            self._visit_final(record.pipeline_id, record.entry_artifact_id)
+        return stored
+
+    def _visit_final(self, pipeline_id, artifact_id):
+        for key, row in list(self._artifacts.items()):
+            if row.pipeline_id == pipeline_id:
+                self._artifacts[key] = dataclasses.replace(row, is_final=row.id == artifact_id)
+        for key, row in list(self._occurrences.items()):
+            if row.pipeline_id == pipeline_id:
+                self._occurrences[key] = dataclasses.replace(row, is_final=row.id == artifact_id)
+
+    def get_artifact_by_id(self, artifact_id):
+        artifact = self._occurrences.get(artifact_id)
+        if artifact is None:
+            artifact = next((a for a in self._artifacts.values() if a.id == artifact_id), None)
+        return None if artifact is None else _hydrate(artifact, self.backend)
 
     # ------------------------------------------------------------------ runs
     def start_run(self, run: RunRecord) -> RunRecord:
@@ -79,14 +177,26 @@ class MemoryStore:
         return self._pipelines.get(pipeline_id)
 
     def reset_pipeline(self, record: PipelineRecord) -> None:
-        """Reset current slots, retaining append-only history and high-band payloads."""
+        """Reset current slots, retaining append-only history and high-band payloads.
+
+        Visit occurrences follow the same seq rule as the artifact slots, so this mirrors
+        ``SqliteStore.reset_pipeline``'s ``DELETE ... WHERE seq>=0 AND seq<n_tasks_total``: a store that
+        dropped the rows for one collection but not the other would answer ``artifacts()`` differently
+        depending on which backend produced it.
+        """
         self._tasks = {key: task for key, task in self._tasks.items()
                        if task.pipeline_id != record.pipeline_id}
         self._artifacts = {key: artifact for key, artifact in self._artifacts.items()
                            if key[0] != record.pipeline_id or not 0 <= key[1] < record.n_tasks_total}
+        self._occurrences = {key: artifact for key, artifact in self._occurrences.items()
+                             if artifact.pipeline_id != record.pipeline_id
+                             or not 0 <= artifact.seq < record.n_tasks_total}
         for key, artifact in list(self._artifacts.items()):
             if key[0] == record.pipeline_id:
                 self._artifacts[key] = dataclasses.replace(artifact, is_final=False)
+        for key, artifact in list(self._occurrences.items()):
+            if artifact.pipeline_id == record.pipeline_id:
+                self._occurrences[key] = dataclasses.replace(artifact, is_final=False)
         self.upsert_pipeline(record)
 
     def upsert_pipeline(self, record: PipelineRecord) -> None:
@@ -157,17 +267,29 @@ class MemoryStore:
         return stored
 
     def get_artifact(self, pipeline_id: str, seq: int) -> Artifact | None:
+        state = self.visit_state(pipeline_id)
+        if state is not None and 0 <= seq < self._pipelines[pipeline_id].n_tasks_total:
+            active = state["active"].get(str(seq))
+            return self.get_artifact_by_id(active["output"]) if active and active["output"] else None
         artifact = self._artifacts.get((pipeline_id, seq))
         return None if artifact is None else _hydrate(artifact, self.backend)
 
     def mark_final(self, pipeline_id: str, seq: int) -> None:
+        # Both collections, because `artifacts()`/`get_artifact_by_id` merge them: SqliteStore's single
+        # `UPDATE artifacts SET is_final=(artifact_id=?)` covers visit occurrences too, so leaving
+        # `_occurrences` untouched here would leave a second artifact flagged final in memory only.
         for key, artifact in list(self._artifacts.items()):
             if key[0] == pipeline_id:
                 self._artifacts[key] = dataclasses.replace(artifact, is_final=key[1] == seq)
+        for key, artifact in list(self._occurrences.items()):
+            if artifact.pipeline_id == pipeline_id:
+                self._occurrences[key] = dataclasses.replace(artifact, is_final=artifact.seq == seq)
 
     def artifacts(self, pipeline_id: str) -> list[Artifact]:
-        items = [a for (pid, _), a in self._artifacts.items() if pid == pipeline_id]
-        return [_hydrate(a, self.backend) for a in sorted(items, key=lambda a: a.seq)]
+        items = {a.id: a for (pid, _), a in self._artifacts.items() if pid == pipeline_id}
+        items.update({a.id: a for a in self._occurrences.values() if a.pipeline_id == pipeline_id})
+        items = list(items.values())
+        return [_hydrate(a, self.backend) for a in sorted(items, key=lambda a: (a.seq, a.created_at, a.id))]
 
     # ----------------------------------------------------------------- tasks
     def record_task(self, record: TaskRecord) -> None:
@@ -181,7 +303,7 @@ class MemoryStore:
             for t in self._tasks.values()
             if (pipeline_id is None or t.pipeline_id == pipeline_id) and (run_id is None or t.run_id == run_id)
         ]
-        items.sort(key=lambda t: (t.pipeline_id, t.seq))
+        items.sort(key=lambda t: (t.pipeline_id, t.seq, t.visit, t.task_run_id))
         return items[:limit] if limit else items
 
     def record_attempt(self, record: AttemptRecord) -> AttemptRecord:
@@ -224,6 +346,7 @@ class MemoryStore:
                     payload=payload.data,
                     created_at=time.time(),
                     is_final=final,
+                    visit=task.visit,
                 )
             )
             record.entry_seq = seq
@@ -232,7 +355,7 @@ class MemoryStore:
                 "commit_handoff: entry_seq is required when a handoff reuses an artifact (only a payload "
                 "handoff lets the store allocate the entry address)"
             )
-        record.entry_artifact_id = Artifact.build_id(record.pipeline_id, record.entry_seq)
+        record.entry_artifact_id = stored.id if stored is not None else (record.entry_artifact_id or Artifact.build_id(record.pipeline_id, record.entry_seq))
         self.record_task(task)
         attempt.attempt_id = len(self._attempts) + 1
         self._attempts.append(attempt)
@@ -390,7 +513,9 @@ class MemoryStore:
 
     def iter_artifacts(self, *, pipeline_id: str) -> Iterator[Artifact]:
         """``seq`` then ``artifact_id`` — the last one makes the cursor unique within a pipeline."""
-        items = [a for (pid, _), a in self._artifacts.items() if pid == pipeline_id]
+        items = {a.id: a for (pid, _), a in self._artifacts.items() if pid == pipeline_id}
+        items.update({a.id: a for a in self._occurrences.values() if a.pipeline_id == pipeline_id})
+        items = list(items.values())
         for artifact in sorted(items, key=lambda a: (a.seq, a.id)):
             yield _hydrate(artifact, self.backend)
 
@@ -448,7 +573,13 @@ class MemoryStore:
                 "duration_ms": {"p50": pct(0.5), "p95": pct(0.95), "max": pct(1.0)},
             },
             "tasks": {"by_name": task_counts, "attempts_by_name": attempts_by_task},
-            "attempts_total": sum(t.attempts_used for t in relevant),
+            # Counted from the attempt rows, exactly like SqliteStore's `SELECT COUNT(*) FROM
+            # attempts`: summing `TaskRecord.attempts_used` instead would double-count a pending
+            # visit that a resume rebinds to the new run (the row keeps its consumed numbering),
+            # so the two built-in stores would report different totals for the same history.
+            "attempts_total": sum(
+                1 for a in self._attempts if run_id is None or a.run_id == run_id
+            ),
             "handoffs_total": sum(
                 1 for h in self._handoffs if run_id is None or h.run_id == run_id
             ),
@@ -474,7 +605,7 @@ class MemoryStore:
 
     def export_rows(self, *, run_id: str | None = None) -> Iterator[dict[str, Any]]:
         for p in self.iter_pipelines(run_id=run_id):
-            yield {
+            row = {
                 "pipeline_id": p.pipeline_id,
                 "key": p.key,
                 "name": p.name,
@@ -525,6 +656,19 @@ class MemoryStore:
                 "handoffs": [handoff_row(h) for h in self.handoffs(pipeline_id=p.pipeline_id)],
             }
 
+            traversal = self.visit_state(p.pipeline_id)
+            if traversal is not None:
+                row["control"] = traversal
+                for item, task in zip(row["tasks"], self.tasks(p.pipeline_id), strict=True):
+                    item.update(task_run_id=task.task_run_id, visit=task.visit,
+                                active=traversal["active"].get(str(task.seq), {}).get("task_run_id") == task.task_run_id,
+                                input_artifact_id=task.input_artifact_id)
+                for item, artifact in zip(row["artifacts"], self.artifacts(p.pipeline_id), strict=True):
+                    item.update(artifact_id=artifact.id, visit=artifact.visit,
+                                active=artifact.id == traversal["terminal"] or any(
+                                    slot["output"] == artifact.id for slot in traversal["active"].values()))
+            yield row
+
     def close(self) -> None:
         return None
 
@@ -554,7 +698,7 @@ def _hydrate(artifact: Artifact, backend: Any) -> Artifact:
 def _decode_payload(artifact: Artifact) -> Any:
     if artifact.payload is None:
         return None
-    if artifact.codec == "json":
+    if artifact.codec in ("json", "history-v1"):
         try:
             return json.loads(artifact.payload.decode("utf-8"))
         except Exception:  # pragma: no cover - defensive

@@ -364,6 +364,10 @@ into a crash.
 
 ### 4.8 Advanced: Handoffs —— Declared Forward Jumps (Opt-In, Experimental)
 
+The forward-only contract below remains the v1 path. Backward-enabled declarations use the visit-aware
+contract in §4.8.8 and [the backward guide](backward.md); forward-only traversal still uses its existing
+ledger/cursor recovery without new identity or budget requirements.
+
 Everything above describes an ordinary pipeline: a chain walked one task at a time, each task returning the
 artifact the next one consumes. This section describes the one feature that changes the *traversal* of that
 chain: a step that can tell the rest of the chain no longer needs to run — the answer is good enough, the
@@ -376,9 +380,11 @@ lie). The feature is deliberately fenced off from the rest:
 * **advanced tier** — not because it is hard to call, but because it changes the execution model. It is
   documented under its own heading, released as a minor, and marked *experimental until 1.0*: the guarantees
   below are the stable part, while the spelling (`Handoff`, `control`) may still change;
-* **forward-only** — a handoff may only skip *ahead*. The motivating case for the capability is the opposite
-  one (a validator sends a bad model output **back** to the generator for another sample), and that model is
-  specified in §4.8.7 so that this first version does not foreclose it. It is not implemented here.
+* **forward-only in this model** — a handoff may only skip *ahead*: `control.edges` and `Handoff.to()` never
+  acquire implicit backward semantics. The motivating case for the capability is the opposite direction (a
+  validator sends a bad model output **back** to the generator for another sample). §4.8.7 specifies that
+  model and §4.8.8 implements it as a *separately declared* opt-in tier, so the forward contract described
+  in this section is unchanged rather than extended.
 
 #### 4.8.1 The transport is a return value, not a control-flow exception
 
@@ -524,7 +530,9 @@ silent jump, never a retry), and every declared edge is resolved and range-check
   seq (the error says which seqs matched);
 * a destination must be strictly later than its source (forward-only);
 * `"end"` is a valid destination, except from the last task, where it has no effect and is refused;
-* the block has no unknown keys — `mode` is deliberately absent, because this version has exactly one mode.
+* an `edges` block has no unknown keys — `mode` is deliberately absent, because there is exactly one forward
+  mode. Backward operations are separate keys (`rewind`, `retry_all`, `max_handoffs`), validated by the same
+  entry point and specified in §4.8.8.
 
 Validation is **structural only**. The handoff payload is an arbitrary argument, not the source's normal
 return type, so `source.returns -> target.accepts` is deliberately not checked: it would reject valid
@@ -563,12 +571,49 @@ the way they are, and it is the reason the model below is specified now rather t
 
 | Not included | Why, and what would be needed |
 |---|---|
-| Backward / revoke handoffs | The motivating case for the capability: a validator sends work **back** to the generator. It needs a visit model — `(seq, visit)` identity on tasks and attempts, a durable per-seq counter advanced in the same commit as the entry record, visit-aware RNG (`ctx.seed` is currently `digest(pipeline_id\|seq\|attempt)`, so a revisit would see identical randomness), a loop budget (termination is no longer structural), and progress reporting that does not present a visit count as completion. The record decisions here — the ledger, the entry-artifact address, the atomic commit, the position cursor — were chosen so that model can be added without changing them. |
+| Backward / revoke handoffs | The motivating case for the capability: a validator sends work **back** to the generator. It needs a visit model — `(seq, visit)` identity on tasks and attempts, a durable per-seq counter advanced in the same commit as the entry record, visit-aware RNG (`ctx.seed` is currently `digest(pipeline_id\|seq\|attempt)`, so a revisit would see identical randomness), a loop budget (termination is no longer structural), and progress reporting that does not present a visit count as completion. The record decisions here — the ledger, the entry-artifact address, the atomic commit, the position cursor — were chosen so that model can be added without changing them, and §4.8.8 adds it as a separately declared opt-in tier. |
 | Declared DAGs, joins, fan-in | The chain stays a chain. A handoff is a scheduling statement about one pipeline, not a graph edge. |
 | Cross-pipeline handoffs | Pipelines stay semantically independent; the only shared surface is still the resource pool. |
 | Runtime-invented targets | Edges are declared, so a typed or misspelled target fails loudly instead of silently reshaping the pipeline. |
 | Handoffs from `fanout` branches | A group is one step in the record (`fanout` runs its children inside one task), so a control transfer cannot be attributed to one of N concurrent branches. A returned directive fails the group with a clear `FatalError` instead of travelling inside a collected payload. |
 | Payload type checking | See §4.8.6: it has no sound definition without a declared payload contract of its own. |
+
+#### 4.8.8 Advanced v2: rewind, retry-all and optional payload history
+
+Implemented as a separate opt-in capability: `control.rewind` declares strictly earlier destinations,
+`control.retry_all` declares sources, and `control.max_handoffs` bounds traversal. Rewind requires explicit
+author-selected entry state; retry-all decodes the original seed captured at binding. History-bearing
+payloads are optional and never drive scheduling. The [backward guide](backward.md) describes the interface.
+
+A persisted traversal record owns per-seq counters, effective slot-to-visit mappings and pending entry,
+including its exact input occurrence. Every fresh entry allocates a visit; resume reuses the pending visit.
+Success commits output/task/attempt/effective mapping/cursor together. A control transition also commits
+suffix invalidation, budget consumption and target entry allocation. Cursor comparisons and historic
+completion rows cannot decide whether a backward transition is consumed. Resume at seq 0 is a real entry.
+
+Visits preserve task/artifact identities for visit 0, qualify subsequent IDs, and participate in RNG.
+Rewind/retry-all retain historic records. Budget count survives resume and missing-payload fallback.
+Completion and finality use exact occurrence identity. Backward requeue releases the worker.
+Snapshot history is application-managed JSON state with a versioned codec, not the execution ledger.
+
+Two rules keep the model honest at its edges. **Ownership:** recovering a backward pipeline continues an
+exact durable visit, so a `running` row is never taken over implicitly — `resume=True` is the operator's
+claim that the previous owner is gone, and without it the row is skipped and left untouched (the forward path
+keeps its older restart-from-zero rule, which is why this is not in the generic open path).
+**Discarding state is explicit:** `fresh_restart=True` is the only switch that drops a checkpoint or a
+traversal. It restarts from the bound seed, resets the control budget and invalidates the previous ledger
+watermark, settling any task row the discarded traversal left in flight as `interrupted`, while append-only
+history and (for a backward pipeline) the visit counters and occurrences survive — so historical occurrences
+stay addressable, and a store
+whose traversal was lost has its counters rebuilt from its own rows. `retry_succeeded` stays an eligibility
+switch ("also admit succeeded pipelines") and no longer implies discarding anything.
+
+The store records how far its on-disk model has come (`store/visits.py`): `base` until the first revisit is
+committed, then `visits-v1`, written in the same transaction as the occurrence that justifies it. An unknown
+level is refused on open instead of interpreted, and a SQLite store at `visits-v1` arms a writer guard that
+refuses writes from any connection which has not declared visit-lineage awareness — the marker exists so a
+lineage-unaware writer fails loudly rather than mutating the wrong occurrence. The migration stays additive
+for forward-only work, which never leaves `base`.
 
 ---
 
@@ -871,7 +916,7 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
 10. **A pipeline is a linear chain**: the kernel is implemented in terms of "nodes + dependency edges", so
     adding `Parallel/Gather` is just syntactic sugar, but it is deliberately not exposed. Use `fanout(...)`
     inside a task instead: branches stay one step in the record, at the cost of group-level retry granularity.
-    The one qualification is the opt-in, forward-only handoff of §4.8: it changes the *traversal* of the chain
+    The one qualification is the opt-in handoff of §4.8: it changes the *traversal* of the chain
     along declared edges, never its topology — there is still no join and no second entry point.
 11. **A `null` backend costs you recovery granularity**: dropping payloads means intermediate artifacts
     cannot be reused, so `resume` reruns the whole pipeline — the same tradeoff as `journal=summary`.
@@ -900,13 +945,13 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
     `asyncio` cannot send `CTRL_BREAK_EVENT` to a child's group), so only the direct child is terminated
     there and a descendant may outlive the task. The offline tests verify the descendant guarantee on POSIX
     and skip those two cases elsewhere with that reason stated.
-16. **Handoffs are opt-in, forward-only and fenced off** (§4.8). A pipeline that declares `control` trades
+16. **Handoffs are opt-in and fenced off** (§4.8). A pipeline that declares `control` trades
     one guarantee for another: its cursor becomes a *position* rather than a progress count (skipped slots
     have no task rows, and `n_tasks_done / n_tasks_total` is not a completion percentage for such a
     pipeline), and its recovery depends on the `handoffs` ledger being readable — which is why a store
     without the atomic `commit_handoff` capability is refused up front instead of being downgraded to a
     non-durable jump. The feature is marked experimental until 1.0: the guarantees above are the stable
-    part, the spelling may still change. Backward handoffs, joins and cross-pipeline transfers are not
+    part, the spelling may still change. The forward-only path has no revisits; joins and cross-pipeline transfers are not
     included; a pipeline that is mostly handoffs is a sign the problem wants a graph engine, which this is
     not.
 
@@ -1047,7 +1092,7 @@ entry-point plugins, external artifact backends, a fan-out helper, and a read-on
 
 * No HTTP client / provider SDK adapter layer (you write the tasks yourself; this is deliberate design, not a missing feature)
 * No DAG / multi-turn agent orchestration (pipelines stay linear; fan-out is implemented inside a task, and
-  the one exception is the opt-in, forward-only handoff of §4.8 — no declared graph, no joins, no
+  the one exception is the opt-in handoff of §4.8 — no declared graph, no joins, no
   cross-pipeline orchestration)
 * No semantic reduction (accuracy / pass@k / any cross-pipeline aggregation)
 * No service-ification / gateway / proxy

@@ -31,8 +31,33 @@ from .base import (
     TaskRecord,
     handoff_row,
 )
+from .visits import (
+    FEATURE_BASE,
+    FEATURE_VISITS,
+    VisitStore,
+    check_feature_level,
+)
 
 __all__ = ["SqliteStore"]
+
+WRITER_GUARD = "pyattacker_store_requires_visits_aware_writer"
+"""Name of the SQL function a writer must have registered to touch a revisit-aware store.
+
+A trigger cannot consult per-connection state directly (SQLite refuses a trigger that references
+``temp``), so the declaration is inverted: the guard triggers call this function, and a connection
+that never registered it cannot even *prepare* its own ``INSERT``/``UPDATE``/``DELETE``. That is
+what makes the marker below work against a lineage-unaware writer that has no idea the marker
+exists — see :meth:`SqliteStore._install_writer_guard`.
+"""
+
+GUARDED_TABLES = ("pipelines", "tasks", "artifacts")
+"""Seq-keyed tables whose rows a lineage-unaware writer would mutate as if occurrence identity were
+``(pipeline_id, seq)``. Append-only ledgers (``attempts``, ``handoffs``, ``events``) are not
+guarded: writing a row there is not itself destructive, and no such write is reachable without
+first touching one of these three."""
+
+META_TABLE = "store_meta"
+"""Key/value table holding the durable feature level (``store/visits.py``)."""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -196,7 +221,7 @@ def _dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
 
 
-class SqliteStore:
+class SqliteStore(VisitStore):
     """The default, file-backed :class:`~pyattacker.store.base.Store` implementation.
 
     Invariants: WAL + ``synchronous=NORMAL`` and a single writer connection (see module
@@ -233,13 +258,80 @@ class SqliteStore:
         else:
             self._conn = sqlite3.connect(path, check_same_thread=False, timeout=10.0)
         self._conn.row_factory = sqlite3.Row
-        if not read_only:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
+        # Declared on every connection this build opens, before any statement runs: the writer guard
+        # triggers installed on a revisit-aware store call it, so this is what distinguishes "a
+        # pyattacker that understands visit lineage" from "a writer that does not".
+        self._conn.create_function(WRITER_GUARD, 0, lambda: 1, deterministic=True)
+        try:
+            # Connection-local, and needed before the first query so a locked database still waits
+            # instead of failing immediately.
             self._conn.execute("PRAGMA busy_timeout=10000")
-            self._conn.executescript(SCHEMA)
-            self._migrate()
+            # The feature level is read and enforced *before* anything else runs. A store this build
+            # does not understand must not be touched at all -- not even by the additive migration,
+            # which would otherwise "repair" a schema whose semantics this build cannot see (and
+            # leave a half-upgraded database behind the refusal). `_read_feature_level` treats a
+            # missing `store_meta` as `base`, so an old store still passes and then gets migrated.
+            check_feature_level(
+                self._read_feature_level(), store=path or ":memory:", read_only=read_only
+            )
+            if not read_only:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=NORMAL")
+                self._conn.executescript(SCHEMA)
+                with self._visit_atomic(""):
+                    self._migrate()
+        except BaseException:
+            # A store this build refuses to open must not leave a connection (and its file handles)
+            # behind, since the caller only sees the exception.
+            self._conn.close()
+            raise
+
+    def visit_state(self, pipeline_id):
+        exists = self._conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='visit_state'").fetchone()
+        if not exists:
+            return None
+        row = self._conn.execute("SELECT state_json FROM visit_state WHERE pipeline_id=?", (pipeline_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    @contextlib.contextmanager
+    def _visit_atomic(self, pipeline_id):
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
             self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+
+    def _visit_save(self, pipeline_id, state):
+        self._conn.execute("INSERT INTO visit_state VALUES (?,?) ON CONFLICT(pipeline_id) DO UPDATE SET state_json=excluded.state_json",
+                           (pipeline_id, _dumps(state)))
+
+    def _visit_pipeline(self, record):
+        self._write_pipeline(record)
+
+    def _visit_task(self, record):
+        self._write_task(record)
+
+    def _visit_attempt(self, record):
+        record.attempt_id = self._write_attempt(record)
+
+    def _visit_artifact(self, artifact):
+        return _hydrate(self._write_artifact(artifact), self.backend)
+
+    def _visit_handoff(self, record, task, attempt, payload, cursor, final):
+        stored = self._commit_handoff(record, task=task, attempt=attempt, payload=payload, cursor=cursor, final=final)
+        if final:
+            self._visit_final(record.pipeline_id, record.entry_artifact_id)
+        return stored
+
+    def _visit_final(self, pipeline_id, artifact_id):
+        self._conn.execute("UPDATE artifacts SET is_final=(artifact_id=?) WHERE pipeline_id=?",
+                           (artifact_id or "", pipeline_id))
+
+    def get_artifact_by_id(self, artifact_id):
+        row = self._conn.execute("SELECT * FROM artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
+        return _hydrate(_to_artifact(row), self.backend) if row else None
 
     def _migrate(self) -> None:
         """Add columns that older stores do not have.
@@ -247,6 +339,18 @@ class SqliteStore:
         ``CREATE TABLE IF NOT EXISTS`` silently skips existing tables, so a schema addition needs
         an explicit upgrade step; without it, resuming an old store would fail at the first insert.
         """
+        self._conn.execute("CREATE TABLE IF NOT EXISTS visit_state (pipeline_id TEXT PRIMARY KEY, state_json TEXT NOT NULL)")
+        self._conn.execute(f"CREATE TABLE IF NOT EXISTS {META_TABLE} (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        for table, additions in {"artifacts": {"visit": "INTEGER NOT NULL DEFAULT 0"},
+                                 "tasks": {"visit": "INTEGER NOT NULL DEFAULT 0"},
+                                 "attempts": {"visit": "INTEGER NOT NULL DEFAULT 0"},
+                                 "handoffs": {"operation": "TEXT NOT NULL DEFAULT 'forward'",
+                                              "from_visit": "INTEGER NOT NULL DEFAULT 0",
+                                              "to_visit": "INTEGER", "transition_version": "INTEGER"}}.items():
+            present = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+            for column, declaration in additions.items():
+                if column not in present:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(artifacts)")}
         if "blob_ref" not in columns:
             self._conn.execute("ALTER TABLE artifacts ADD COLUMN blob_ref TEXT")
@@ -254,6 +358,89 @@ class SqliteStore:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(pipelines)")}
         if "handoff_floor" not in columns:
             self._conn.execute("ALTER TABLE pipelines ADD COLUMN handoff_floor INTEGER NOT NULL DEFAULT 0")
+
+    # ------------------------------------------------- compatibility marker
+    def _read_feature_level(self) -> str:
+        """The store's durable feature level, or :data:`FEATURE_BASE` when it was never marked."""
+        if not self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (META_TABLE,)
+        ).fetchone():
+            return FEATURE_BASE  # a store old enough to predate the marker
+        row = self._conn.execute(f"SELECT value FROM {META_TABLE} WHERE key='feature_level'").fetchone()
+        return row[0] if row else FEATURE_BASE
+
+    def feature_level(self) -> str:
+        return self._read_feature_level()
+
+    def _visit_observed_counters(self, pipeline_id: str, n_tasks_total: int) -> dict[str, int]:
+        """Rebuild visit counters from the durable rows when the traversal record is gone.
+
+        Both tables are consulted because allocation writes the task row first (with its visit
+        already assigned) and the artifact afterwards: a task killed in between must still keep its
+        visit reserved, or the next allocation would reuse an ID a task row already carries. The
+        chain bound keeps handoff payloads (addressed at ``n_tasks_total + k``) out of the result.
+        """
+        rows = self._conn.execute(
+            "SELECT seq, MAX(visit) AS visit FROM ("
+            "  SELECT seq, visit FROM artifacts WHERE pipeline_id=? AND seq>=0 AND seq<?"
+            "  UNION ALL"
+            "  SELECT seq, visit FROM tasks WHERE pipeline_id=? AND seq>=0 AND seq<?"
+            ") GROUP BY seq",
+            (pipeline_id, n_tasks_total, pipeline_id, n_tasks_total),
+        )
+        return {str(row["seq"]): row["visit"] for row in rows}
+
+    def _visit_abandon_running_tasks(self, pipeline_id: str) -> None:
+        """Move every in-flight task row of a discarded traversal to ``interrupted`` (``visits.py``).
+
+        Only ``running`` rows are touched: a row that already finished, failed or was settled by an
+        earlier abandonment keeps the state that describes what actually happened to it.
+        """
+        self._conn.execute(
+            "UPDATE tasks SET state='interrupted' WHERE pipeline_id=? AND state='running'",
+            (pipeline_id,),
+        )
+
+    def _visit_mark_revisit(self) -> None:
+        """Enter :data:`FEATURE_VISITS`: mark the level and arm the writer guard.
+
+        Both land inside the caller's ``BEGIN IMMEDIATE`` transaction, together with the traversal
+        write that allocated the revisit, so a store can never contain a second occurrence without
+        the marker (or the marker without the occurrence). Deliberately **not** cached in Python
+        state: the marker is written in the same transaction that can still roll back, and a cache
+        surviving that rollback would let the next revisit skip the marking and commit an occurrence
+        into a store that still advertises ``base`` and carries no guard. Both statements are
+        idempotent, so re-running them on every revisit is the cheap, always-correct option.
+        """
+        self._conn.execute(
+            f"INSERT INTO {META_TABLE} (key, value) VALUES ('feature_level', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (FEATURE_VISITS,),
+        )
+        self._install_writer_guard()
+
+    def _install_writer_guard(self) -> None:
+        """Refuse writes from a connection that has not declared visit-lineage awareness.
+
+        The triggers are created here — only once the store actually holds revisit state — and are
+        part of the durable schema, so they also apply to a writer that predates them. They call
+        :data:`WRITER_GUARD`, which every connection opened by a visit-aware build registers. A
+        lineage-unaware writer fails loudly on its first ``INSERT``/``UPDATE``/``DELETE`` against a
+        seq-keyed table (``no such function: ...`` or the ``RAISE`` below) instead of silently
+        operating on the wrong artifact occurrence. The guard protects *state*, not access: raw or
+        legacy reads are not blocked, but interpreting revisit-aware lineage with a build that does
+        not understand it is unsupported — such a reader cannot tell which occurrence is effective.
+        An explicit migration is the only supported way back down a feature level.
+        """
+        for table in GUARDED_TABLES:
+            for event in ("INSERT", "UPDATE", "DELETE"):
+                self._conn.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS pyattacker_writer_guard_{table}_{event.lower()} "
+                    f"BEFORE {event} ON {table} "
+                    f"WHEN {WRITER_GUARD}() IS NOT 1 "
+                    "BEGIN SELECT RAISE(ABORT, 'store contains revisit-aware state (visits-v1); "
+                    "this writer does not understand visit lineage - upgrade pyattacker'); END"
+                )
 
     # ------------------------------------------------------------------ runs
     def start_run(self, run: RunRecord) -> RunRecord:
@@ -392,11 +579,11 @@ class SqliteStore:
         stored = _persist_form(artifact, self.journal, self.backend)
         self._conn.execute(
             "INSERT OR REPLACE INTO artifacts (artifact_id,pipeline_id,task_name,seq,type_name,codec,"
-            "digest,size,payload,created_at,is_final,blob_ref) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "digest,size,payload,created_at,is_final,blob_ref,visit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 stored.id, stored.pipeline_id, stored.task_name, stored.seq, stored.type_name,
                 stored.codec, stored.digest, stored.size, stored.payload, stored.created_at,
-                1 if stored.is_final else 0, stored.blob_ref,
+                1 if stored.is_final else 0, stored.blob_ref, stored.visit,
             ),
         )
         return stored
@@ -407,6 +594,11 @@ class SqliteStore:
         return stored
 
     def get_artifact(self, pipeline_id: str, seq: int) -> Artifact | None:
+        state = self.visit_state(pipeline_id)
+        pipeline = self.get_pipeline(pipeline_id) if state is not None else None
+        if state is not None and 0 <= seq < pipeline.n_tasks_total:
+            active = state["active"].get(str(seq))
+            return self.get_artifact_by_id(active["output"]) if active and active["output"] else None
         row = self._conn.execute(
             "SELECT * FROM artifacts WHERE pipeline_id=? AND seq=?", (pipeline_id, seq)
         ).fetchone()
@@ -420,7 +612,7 @@ class SqliteStore:
 
     def artifacts(self, pipeline_id: str) -> list[Artifact]:
         rows = self._conn.execute(
-            "SELECT * FROM artifacts WHERE pipeline_id=? ORDER BY seq", (pipeline_id,)
+            "SELECT * FROM artifacts WHERE pipeline_id=? ORDER BY seq,created_at,artifact_id", (pipeline_id,)
         ).fetchall()
         return [_hydrate(_to_artifact(r), self.backend) for r in rows]
 
@@ -430,13 +622,13 @@ class SqliteStore:
         self._conn.execute(
             "INSERT OR REPLACE INTO tasks (task_run_id,pipeline_id,run_id,name,seq,state,attempts_used,"
             "started_at,ended_at,duration_ms,input_artifact_id,output_artifact_id,error_class,error_type,"
-            "error_message,traceback,leases_json,metrics_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "error_message,traceback,leases_json,metrics_json,visit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 record.task_run_id, record.pipeline_id, record.run_id, record.name, record.seq,
                 record.state, record.attempts_used, record.started_at, record.ended_at,
                 record.duration_ms, record.input_artifact_id, record.output_artifact_id,
                 record.error_class, record.error_type, record.error_message, record.traceback,
-                _dumps(record.leases), _dumps(record.metrics),
+                _dumps(record.leases), _dumps(record.metrics), record.visit,
             ),
         )
 
@@ -449,13 +641,13 @@ class SqliteStore:
         cur = self._conn.execute(
             "INSERT INTO attempts (run_id,pipeline_id,task_run_id,task_name,seq,attempt_no,started_at,"
             "ended_at,duration_ms,outcome,error_class,error_type,error_message,traceback,retry_delay_s,"
-            "decision_json,leases_json,metrics_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "decision_json,leases_json,metrics_json,visit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 record.run_id, record.pipeline_id, record.task_run_id, record.task_name, record.seq,
                 record.attempt_no, record.started_at, record.ended_at, record.duration_ms, record.outcome,
                 record.error_class, record.error_type, record.error_message, record.traceback,
                 record.retry_delay_s, _dumps(record.decision), _dumps(record.leases),
-                _dumps(record.metrics),
+                _dumps(record.metrics), record.visit,
             ),
         )
         return int(cur.lastrowid)
@@ -543,6 +735,7 @@ class SqliteStore:
                     payload=payload.data,
                     created_at=time.time(),
                     is_final=final,
+                    visit=task.visit,
                 )
             )
             record.entry_seq = seq
@@ -551,16 +744,17 @@ class SqliteStore:
                 "commit_handoff: entry_seq is required when a handoff reuses an artifact (only a payload "
                 "handoff lets the store allocate the entry address)"
             )
-        record.entry_artifact_id = Artifact.build_id(record.pipeline_id, record.entry_seq)
+        record.entry_artifact_id = stored.id if stored is not None else (record.entry_artifact_id or Artifact.build_id(record.pipeline_id, record.entry_seq))
         self._write_task(task)
         attempt.attempt_id = self._write_attempt(attempt)
         cur = self._conn.execute(
             "INSERT INTO handoffs (pipeline_id,run_id,from_seq,from_task,to_seq,to_task,entry_seq,"
-            "entry_artifact_id,entry_reused,reason,ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "entry_artifact_id,entry_reused,reason,ts,operation,from_visit,to_visit,transition_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 record.pipeline_id, record.run_id, record.from_seq, record.from_task, record.to_seq,
                 record.to_task, record.entry_seq, record.entry_artifact_id,
-                1 if record.entry_reused else 0, record.reason, record.ts,
+                1 if record.entry_reused else 0, record.reason, record.ts, record.operation, record.from_visit,
+                record.to_visit, record.transition_version,
             ),
         )
         record.handoff_id = int(cur.lastrowid)
@@ -831,7 +1025,7 @@ class SqliteStore:
         if run_id:
             sql += " AND run_id=?"
             args.append(run_id)
-        sql += " ORDER BY pipeline_id, seq"
+        sql += " ORDER BY pipeline_id, seq, visit, task_run_id"
         if limit:
             sql += " LIMIT ?"
             args.append(limit)
@@ -958,7 +1152,7 @@ class SqliteStore:
         for record in self.iter_pipelines(run_id=run_id):
             tasks = self.tasks(record.pipeline_id)
             arts = self.artifacts(record.pipeline_id)
-            yield {
+            row = {
                 "pipeline_id": record.pipeline_id,
                 "key": record.key,
                 "name": record.name,
@@ -1008,6 +1202,19 @@ class SqliteStore:
                 # Empty for an ordinary pipeline, and always present: one row shape for every pipeline.
                 "handoffs": [handoff_row(h) for h in self.handoffs(pipeline_id=record.pipeline_id)],
             }
+
+            traversal = self.visit_state(record.pipeline_id)
+            if traversal is not None:
+                row["control"] = traversal
+                for item, task in zip(row["tasks"], self.tasks(record.pipeline_id), strict=True):
+                    item.update(task_run_id=task.task_run_id, visit=task.visit,
+                                active=traversal["active"].get(str(task.seq), {}).get("task_run_id") == task.task_run_id,
+                                input_artifact_id=task.input_artifact_id)
+                for item, artifact in zip(row["artifacts"], self.artifacts(record.pipeline_id), strict=True):
+                    item.update(artifact_id=artifact.id, visit=artifact.visit,
+                                active=artifact.id == traversal["terminal"] or any(
+                                    slot["output"] == artifact.id for slot in traversal["active"].values()))
+            yield row
 
     def close(self) -> None:
         with contextlib.suppress(Exception):  # pragma: no cover - defensive
@@ -1068,6 +1275,7 @@ def _to_task(row: sqlite3.Row) -> TaskRecord:
         error_class=row["error_class"], error_type=row["error_type"],
         error_message=row["error_message"], traceback=row["traceback"],
         leases=json.loads(row["leases_json"]), metrics=json.loads(row["metrics_json"]),
+        visit=row["visit"] if "visit" in row.keys() else 0,  # noqa: SIM118
     )
 
 
@@ -1080,6 +1288,7 @@ def _to_attempt(row: sqlite3.Row) -> AttemptRecord:
         error_type=row["error_type"], error_message=row["error_message"], traceback=row["traceback"],
         retry_delay_s=row["retry_delay_s"], decision=json.loads(row["decision_json"]),
         leases=json.loads(row["leases_json"]), metrics=json.loads(row["metrics_json"]),
+        visit=row["visit"] if "visit" in row.keys() else 0,  # noqa: SIM118
     )
 
 
@@ -1098,6 +1307,10 @@ def _to_handoff(row: sqlite3.Row) -> HandoffRecord:
         to_task=row["to_task"], entry_seq=row["entry_seq"],
         entry_artifact_id=row["entry_artifact_id"], entry_reused=bool(row["entry_reused"]),
         reason=row["reason"], ts=row["ts"],
+        operation=row["operation"] if "operation" in row.keys() else "forward",  # noqa: SIM118
+        from_visit=row["from_visit"] if "from_visit" in row.keys() else 0,  # noqa: SIM118
+        to_visit=row["to_visit"] if "to_visit" in row.keys() else None,  # noqa: SIM118
+        transition_version=row["transition_version"] if "transition_version" in row.keys() else None,  # noqa: SIM118
     )
 
 
@@ -1110,6 +1323,7 @@ def _to_artifact(row: sqlite3.Row) -> Artifact:
         created_at=row["created_at"], is_final=bool(row["is_final"]),
         # `in row` would test *values* (sqlite3.Row iterates values), so keys() is the only way
         # to ask about a column name on an older row shape.
+        visit=row["visit"] if "visit" in row.keys() else 0,  # noqa: SIM118
         blob_ref=row["blob_ref"] if "blob_ref" in row.keys() else None,  # noqa: SIM118 (values vs keys)
     )
 
@@ -1139,7 +1353,7 @@ def _hydrate(artifact: Artifact, backend: Any) -> Artifact:
 def _decode_payload(artifact: Artifact) -> Any:
     if artifact.payload is None:
         return None
-    if artifact.codec == "json":
+    if artifact.codec in ("json", "history-v1"):
         try:
             return json.loads(artifact.payload.decode("utf-8"))
         except Exception:  # pragma: no cover - defensive
