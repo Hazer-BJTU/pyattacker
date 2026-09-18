@@ -416,6 +416,14 @@ class Store(Protocol):
     # ``record_attempt`` path. Probe it with :func:`supports_handoff`; the Runner fails fast when a
     # pipeline declares ``control`` on a store that lacks it, so a handoff is never silently
     # non-durable.
+    #
+    # The visit capability of ``store/visits.py`` (backward traversal) adds one durable obligation for a
+    # persistent backend: the store's *feature level*. It stays ``"base"`` until the first revisit-qualified
+    # occurrence is committed, then moves to ``"visits-v1"`` **in that same transaction** and never returns,
+    # so a later writer knows the rows can no longer be read by occurrence-blind ``seq`` lookups alone.
+    # ``feature_level()`` exposes it for callers; ``store/visits.py``'s ``check_feature_level`` is the refusal
+    # path for a level this build does not understand. A backend with no durable state has nothing to mark
+    # and keeps the inherited default.
 
     def pipelines(
         self, *, run_id: str | None = None, state: str | None = None, limit: int | None = None

@@ -47,7 +47,8 @@ pyattacker run -c config.yaml [options]
 | `--journal {full,summary}` | `full` (default) stores artifact payloads, which is what makes resume work at task granularity; `summary` keeps digests only |
 | `--label TEXT` | a label recorded on the run, for telling runs apart later |
 | `--resume` | skip finished pipelines, restart failed ones at their checkpoint |
-| `--retry-succeeded` | with `--resume`, rerun even the pipelines that succeeded |
+| `--retry-succeeded` | with `--resume`, rerun even the pipelines that succeeded. It only widens *which* pipelines are eligible; it never discards an unfinished one's checkpoint |
+| `--fresh-restart` | start admitted pipelines over from the seed: discard checkpoints/traversal, reset the control budget, keep visit counters and audit rows |
 | `--strict-leases` | a leaked lease fails its task (`LeaseLeakError`) instead of being reclaimed quietly. Worth turning on in CI |
 | `--stop-after-failures N` | stop admitting work once N pipelines have failed (best-effort: already-admitted pipelines still finish) |
 | `--no-signals` | do not install SIGINT/SIGTERM handlers |
@@ -80,6 +81,12 @@ that produced no artifact and everything after it. A task whose artifact is on d
 requests that already cost money are not re-sent. Two things defeat this and both leave a
 `pipeline.checkpoint_missing` event behind: `journal: summary` and the `null` artifact backend, neither of
 which keeps the payload a checkpoint needs.
+
+`--resume` is also what claims a pipeline whose row still says `running` — the shape a hard kill leaves. A
+backward-enabled pipeline is never taken over without it: the run skips that row (`pipeline.skipped` with
+`reason="owned_by_another_run"`) rather than forking a traversal another run may still own. A restart that
+should *discard* a checkpoint instead of resuming it is `--fresh-restart` (`fresh_restart=True`), which also
+resets a spent handoff budget; see [backward traversal](backward.md#recovery-and-ownership).
 
 ## `demo` — verify the install with zero config
 
@@ -280,7 +287,8 @@ source: { kind: jsonl, path: data.jsonl, limit: 100, key_field: id, repeats: 1 }
 
 The `run:` block accepts exactly the fields the CLI maps onto `RunConfig`: `store`, `journal`,
 `concurrency`, `label`, `heartbeat_s`, `grace_s`, `stale_after_s`, `strict_leases`,
-`stop_after_failures`, `stop_after_s`, `max_handoffs`, `retry_succeeded`, `seed`, `notes`, `write_behind`,
+`stop_after_failures`, `stop_after_s`, `max_handoffs`, `retry_succeeded`, `fresh_restart`, `seed`, `notes`,
+`write_behind`,
 `write_batch`, `flush_interval`, `artifact_backend` and `meta`. Anything else is a config error, not a
 quietly ignored line. Precedence is explicit: a flag on the command line wins over the `run:` block,
 which wins over the built-in default.

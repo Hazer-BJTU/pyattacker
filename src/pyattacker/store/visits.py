@@ -2,6 +2,9 @@
 
 The JSON traversal record owns counters, effective slots and the pending entry. Backends
 supply one atomic write boundary and low-level writes; it never relies on seq ordering.
+
+The module also owns the store's **feature level**, the durable compatibility marker that tells a
+lineage-unaware writer to stay away (see :func:`check_feature_level`).
 """
 
 from __future__ import annotations
@@ -12,8 +15,46 @@ import time
 from typing import Any
 
 from ..artifact import Artifact, Encoded
-from ..errors import FatalError, PyAttackerError
+from ..errors import FatalError, PyAttackerError, StoreFeatureUnsupported
 from .base import AttemptRecord, HandoffRecord, PipelineRecord, TaskRecord
+
+FEATURE_BASE = "base"
+"""No visit-qualified occurrence has ever been written: the store is an ordinary v1 store."""
+
+FEATURE_VISITS = "visits-v1"
+"""A second immutable occurrence for some station exists, or did at some point.
+
+Irreversible on purpose: audit rows are never deleted, so a store that has reached this level stays
+here even after the revisit that set it finished.
+"""
+
+FEATURE_LEVELS = (FEATURE_BASE, FEATURE_VISITS)
+"""Every level this build understands, oldest first. A store above the last entry is refused."""
+
+CURRENT_FEATURE_LEVEL = FEATURE_LEVELS[-1]
+"""The level this build writes: what a persistent backend marks when it commits a revisit."""
+
+
+def check_feature_level(level: str, *, store: str, read_only: bool = False) -> None:
+    """Refuse a store whose durable feature level this build does not understand.
+
+    The check runs when a store is opened, before any read or write. An unknown level means the
+    store was written by a newer pyattacker whose lineage model this build cannot interpret:
+    operating on it would mean selecting artifact occurrences by ``seq`` alone, which reads the
+    wrong payload and can delete the wrong rows. ``read_only`` is accepted so the message can name
+    the mode, but the level is refused there too — a lineage-unaware reader reports a lineage it
+    does not have.
+    """
+    if level in FEATURE_LEVELS:
+        return
+    mode = "read-only" if read_only else "write"
+    raise StoreFeatureUnsupported(
+        f"store {store} is at feature level {level!r}, which this build does not understand "
+        f"(it knows {', '.join(FEATURE_LEVELS)}); refusing {mode} access. Upgrade pyattacker to open "
+        "this store, and back it up by copying its files: a store at this level carries a writer "
+        "guard, so a SQL dump of it cannot be restored through a raw connection "
+        "(see docs/backward.md)"
+    )
 
 
 class VisitStore:
@@ -28,14 +69,53 @@ class VisitStore:
     commit would accept a rewind and then fail halfway through it.
     """
 
+    def feature_level(self) -> str:
+        """The durable feature level this store has reached (:data:`FEATURE_BASE` when unmarked).
+
+        Read by a later opener to decide whether it may touch the store at all; see
+        :func:`check_feature_level`. A backend that keeps no durable state (``MemoryStore``) still
+        answers, so callers and tests do not have to special-case it.
+        """
+        return FEATURE_BASE
+
+    def _visit_mark_revisit(self) -> None:
+        """Backend hook: record durably that a revisit-qualified occurrence now exists.
+
+        Called inside the transaction that allocates the first second occurrence for a station —
+        the exact moment a lineage-unaware writer stops being able to tell the occurrences apart —
+        so the marker can never be separated from the state it describes. A backend without durable
+        state has nothing to protect and keeps the default no-op.
+        """
+
+    def _visit_observed_counters(self, pipeline_id: str, n_tasks_total: int) -> dict[str, int]:
+        """The highest visit allocated per ``seq``, read back from durable rows.
+
+        Used only when the traversal record itself is missing (damage, or the explicit restart that
+        recovers from it), where it reconstructs the counters the lost record owned. Backends that
+        keep no durable rows return the empty mapping and keep the default.
+
+        Only real station slots (``0 <= seq < n_tasks_total``) count: handoff payloads are durable
+        artifacts too, but they are addressed beyond the chain (``n_tasks_total + k``), so treating
+        them as stations would invent counters for seqs that do not exist.
+        """
+        return {}
+
     def reset_visits(
         self, record: PipelineRecord, seed: Artifact, *, fresh_budget: bool = False
     ) -> PipelineRecord:
         with self._visit_atomic(record.pipeline_id):
             old = self.visit_state(record.pipeline_id)
+            # Visit counters are preserved across a reset -- that is what keeps every historical
+            # occurrence addressable -- and when the traversal itself is gone they are rebuilt from
+            # the durable rows instead of restarting at 0. Starting over at 0 would re-allocate
+            # occurrence IDs that earlier rows still carry, so the audit trail would silently lose
+            # the artifacts it points at.
+            counters = (old or {}).get("counters")
+            if counters is None:
+                counters = self._visit_observed_counters(record.pipeline_id, record.n_tasks_total)
             state = {
                 "version": (old or {}).get("version", 0) + 1,
-                "counters": (old or {}).get("counters", {}),
+                "counters": counters,
                 "active": {},
                 "pending": None,
                 "input": seed.id,
@@ -68,6 +148,11 @@ class VisitStore:
         key = str(task.seq)
         visit = state["counters"].get(key, -1) + 1
         state["counters"][key] = visit
+        if visit > 0:
+            # The first revisit is the moment this store stops being interpretable as a v1 store:
+            # one station now owns two immutable occurrences, and a writer that selects by `seq`
+            # alone reads or mutates the wrong one. Marked here, inside the caller's transaction.
+            self._visit_mark_revisit()
         task = dataclasses.replace(
             task, visit=visit, task_run_id=f"{pipeline_id}:{task.seq}" + (f"#{visit}" if visit else "")
         )

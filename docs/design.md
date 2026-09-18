@@ -596,6 +596,23 @@ Rewind/retry-all retain historic records. Budget count survives resume and missi
 Completion and finality use exact occurrence identity. Backward requeue releases the worker.
 Snapshot history is application-managed JSON state with a versioned codec, not the execution ledger.
 
+Two rules keep the model honest at its edges. **Ownership:** recovering a backward pipeline continues an
+exact durable visit, so a `running` row is never taken over implicitly — `resume=True` is the operator's
+claim that the previous owner is gone, and without it the row is skipped and left untouched (the forward path
+keeps its older restart-from-zero rule, which is why this is not in the generic open path).
+**Discarding state is explicit:** `fresh_restart=True` is the only switch that drops a checkpoint or a
+traversal. It restarts from the bound seed, resets the control budget and invalidates the previous ledger
+watermark, while visit counters and every audit row survive — so occurrences stay addressable, and a store
+whose traversal was lost has its counters rebuilt from its own rows. `retry_succeeded` stays an eligibility
+switch ("also admit succeeded pipelines") and no longer implies discarding anything.
+
+The store records how far its on-disk model has come (`store/visits.py`): `base` until the first revisit is
+committed, then `visits-v1`, written in the same transaction as the occurrence that justifies it. An unknown
+level is refused on open instead of interpreted, and a SQLite store at `visits-v1` arms a writer guard that
+refuses writes from any connection which has not declared visit-lineage awareness — the marker exists so a
+lineage-unaware writer fails loudly rather than mutating the wrong occurrence. The migration stays additive
+for forward-only work, which never leaves `base`.
+
 ---
 
 ## 5. Data Model (SQLite, WAL + `synchronous=NORMAL`)

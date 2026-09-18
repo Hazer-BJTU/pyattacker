@@ -66,6 +66,7 @@ from .errors import (
     ResourceUnavailable,
     RetryableError,
     RunInterrupted,
+    StoreFeatureUnsupported,
     StoreUnavailable,
     WorkerCrashed,
     error_class_of,
@@ -213,6 +214,7 @@ __all__ = [
     "BudgetExceeded",
     "RunInterrupted",
     "StoreUnavailable",
+    "StoreFeatureUnsupported",
     "WorkerCrashed",
     "error_class_of",
 ]

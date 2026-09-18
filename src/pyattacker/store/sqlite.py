@@ -31,9 +31,33 @@ from .base import (
     TaskRecord,
     handoff_row,
 )
-from .visits import VisitStore
+from .visits import (
+    FEATURE_BASE,
+    FEATURE_VISITS,
+    VisitStore,
+    check_feature_level,
+)
 
 __all__ = ["SqliteStore"]
+
+WRITER_GUARD = "pyattacker_store_requires_visits_aware_writer"
+"""Name of the SQL function a writer must have registered to touch a revisit-aware store.
+
+A trigger cannot consult per-connection state directly (SQLite refuses a trigger that references
+``temp``), so the declaration is inverted: the guard triggers call this function, and a connection
+that never registered it cannot even *prepare* its own ``INSERT``/``UPDATE``/``DELETE``. That is
+what makes the marker below work against a lineage-unaware writer that has no idea the marker
+exists — see :meth:`SqliteStore._install_writer_guard`.
+"""
+
+GUARDED_TABLES = ("pipelines", "tasks", "artifacts")
+"""Seq-keyed tables whose rows a lineage-unaware writer would mutate as if occurrence identity were
+``(pipeline_id, seq)``. Append-only ledgers (``attempts``, ``handoffs``, ``events``) are not
+guarded: writing a row there is not itself destructive, and no such write is reachable without
+first touching one of these three."""
+
+META_TABLE = "store_meta"
+"""Key/value table holding the durable feature level (``store/visits.py``)."""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -222,6 +246,9 @@ class SqliteStore(VisitStore):
         self.path = path
         self.journal = journal
         self.read_only = read_only
+        # Whether this connection has already armed the writer guard for a revisit-aware store; the
+        # triggers themselves are durable, so this only avoids repeating DDL on every later revisit.
+        self._guard_armed = False
         from ..backends import resolve_backend
 
         self.backend = resolve_backend(backend)
@@ -234,13 +261,24 @@ class SqliteStore(VisitStore):
         else:
             self._conn = sqlite3.connect(path, check_same_thread=False, timeout=10.0)
         self._conn.row_factory = sqlite3.Row
-        if not read_only:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA busy_timeout=10000")
-            self._conn.executescript(SCHEMA)
-            with self._visit_atomic(""):
-                self._migrate()
+        # Declared on every connection this build opens, before any statement runs: the writer guard
+        # triggers installed on a revisit-aware store call it, so this is what distinguishes "a
+        # pyattacker that understands visit lineage" from "a writer that does not".
+        self._conn.create_function(WRITER_GUARD, 0, lambda: 1, deterministic=True)
+        try:
+            if not read_only:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=NORMAL")
+                self._conn.execute("PRAGMA busy_timeout=10000")
+                self._conn.executescript(SCHEMA)
+                with self._visit_atomic(""):
+                    self._migrate()
+            check_feature_level(self._read_feature_level(), store=path or ":memory:", read_only=read_only)
+        except BaseException:
+            # A store this build refuses to open must not leave a connection (and its file handles)
+            # behind, since the caller only sees the exception.
+            self._conn.close()
+            raise
 
     def visit_state(self, pipeline_id):
         exists = self._conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='visit_state'").fetchone()
@@ -296,6 +334,7 @@ class SqliteStore(VisitStore):
         an explicit upgrade step; without it, resuming an old store would fail at the first insert.
         """
         self._conn.execute("CREATE TABLE IF NOT EXISTS visit_state (pipeline_id TEXT PRIMARY KEY, state_json TEXT NOT NULL)")
+        self._conn.execute(f"CREATE TABLE IF NOT EXISTS {META_TABLE} (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         for table, additions in {"artifacts": {"visit": "INTEGER NOT NULL DEFAULT 0"},
                                  "tasks": {"visit": "INTEGER NOT NULL DEFAULT 0"},
                                  "attempts": {"visit": "INTEGER NOT NULL DEFAULT 0"},
@@ -313,6 +352,77 @@ class SqliteStore(VisitStore):
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(pipelines)")}
         if "handoff_floor" not in columns:
             self._conn.execute("ALTER TABLE pipelines ADD COLUMN handoff_floor INTEGER NOT NULL DEFAULT 0")
+
+    # ------------------------------------------------- compatibility marker
+    def _read_feature_level(self) -> str:
+        """The store's durable feature level, or :data:`FEATURE_BASE` when it was never marked."""
+        if not self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (META_TABLE,)
+        ).fetchone():
+            return FEATURE_BASE  # a store old enough to predate the marker
+        row = self._conn.execute(f"SELECT value FROM {META_TABLE} WHERE key='feature_level'").fetchone()
+        return row[0] if row else FEATURE_BASE
+
+    def feature_level(self) -> str:
+        return self._read_feature_level()
+
+    def _visit_observed_counters(self, pipeline_id: str, n_tasks_total: int) -> dict[str, int]:
+        """Rebuild visit counters from the durable rows when the traversal record is gone.
+
+        Both tables are consulted because allocation writes the task row first (with its visit
+        already assigned) and the artifact afterwards: a task killed in between must still keep its
+        visit reserved, or the next allocation would reuse an ID a task row already carries. The
+        chain bound keeps handoff payloads (addressed at ``n_tasks_total + k``) out of the result.
+        """
+        rows = self._conn.execute(
+            "SELECT seq, MAX(visit) AS visit FROM ("
+            "  SELECT seq, visit FROM artifacts WHERE pipeline_id=? AND seq>=0 AND seq<?"
+            "  UNION ALL"
+            "  SELECT seq, visit FROM tasks WHERE pipeline_id=? AND seq>=0 AND seq<?"
+            ") GROUP BY seq",
+            (pipeline_id, n_tasks_total, pipeline_id, n_tasks_total),
+        )
+        return {str(row["seq"]): row["visit"] for row in rows}
+
+    def _visit_mark_revisit(self) -> None:
+        """Enter :data:`FEATURE_VISITS`: mark the level and arm the writer guard.
+
+        Both land inside the caller's ``BEGIN IMMEDIATE`` transaction, together with the traversal
+        write that allocated the revisit, so a store can never contain a second occurrence without
+        the marker (or the marker without the occurrence). Once this connection has armed the guard
+        there is nothing left to do — every later revisit re-enters the same level — so the DDL stays
+        off the transition path.
+        """
+        if self._guard_armed:
+            return
+        self._conn.execute(
+            f"INSERT INTO {META_TABLE} (key, value) VALUES ('feature_level', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (FEATURE_VISITS,),
+        )
+        self._install_writer_guard()
+        self._guard_armed = True
+
+    def _install_writer_guard(self) -> None:
+        """Refuse writes from a connection that has not declared visit-lineage awareness.
+
+        The triggers are created here — only once the store actually holds revisit state — and are
+        part of the durable schema, so they also apply to a writer that predates them. They call
+        :data:`WRITER_GUARD`, which every connection opened by a visit-aware build registers. A
+        lineage-unaware writer fails loudly on its first ``INSERT``/``UPDATE``/``DELETE`` against a
+        seq-keyed table (``no such function: ...`` or the ``RAISE`` below) instead of silently
+        operating on the wrong artifact occurrence. Reads are untouched: the guard protects state,
+        and an explicit migration is the only supported way back down a feature level.
+        """
+        for table in GUARDED_TABLES:
+            for event in ("INSERT", "UPDATE", "DELETE"):
+                self._conn.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS pyattacker_writer_guard_{table}_{event.lower()} "
+                    f"BEFORE {event} ON {table} "
+                    f"WHEN {WRITER_GUARD}() IS NOT 1 "
+                    "BEGIN SELECT RAISE(ABORT, 'store contains revisit-aware state (visits-v1); "
+                    "this writer does not understand visit lineage - upgrade pyattacker'); END"
+                )
 
     # ------------------------------------------------------------------ runs
     def start_run(self, run: RunRecord) -> RunRecord:

@@ -26,7 +26,7 @@ from .base import (
     TaskRecord,
     handoff_row,
 )
-from .visits import VisitStore
+from .visits import FEATURE_BASE, FEATURE_VISITS, VisitStore
 
 __all__ = ["MemoryStore"]
 
@@ -58,10 +58,16 @@ class MemoryStore(VisitStore):
         self._event_id = 0
         self._visits: dict[str, dict[str, Any]] = {}
         self._occurrences: dict[str, Artifact] = {}
+        self._feature_level = FEATURE_BASE
 
     @contextmanager
     def _visit_atomic(self, pipeline_id):
-        names = ("_pipelines", "_tasks", "_attempts", "_artifacts", "_handoffs", "_visits", "_occurrences")
+        names = (
+            "_pipelines", "_tasks", "_attempts", "_artifacts", "_handoffs", "_visits", "_occurrences",
+            # The feature level is part of the same transaction: a rolled-back revisit must not leave
+            # the store marked as one (SQLite gets this for free, since the row is in the same txn).
+            "_feature_level",
+        )
         saved = {name: copy.copy(getattr(self, name)) for name in names}
         if pipeline_id in saved["_pipelines"]:
             saved["_pipelines"][pipeline_id] = copy.deepcopy(saved["_pipelines"][pipeline_id])
@@ -74,6 +80,29 @@ class MemoryStore(VisitStore):
 
     def visit_state(self, pipeline_id: str) -> dict[str, Any] | None:
         return copy.deepcopy(self._visits.get(pipeline_id))
+
+    def feature_level(self) -> str:
+        """Same vocabulary as ``SqliteStore``, for tests and callers that do not special-case it.
+
+        Nothing durable needs protecting in memory, so this is reported for parity only: the level
+        follows the in-process traversal exactly as the SQLite marker follows the durable one.
+        """
+        return self._feature_level
+
+    def _visit_mark_revisit(self) -> None:
+        self._feature_level = FEATURE_VISITS
+
+    def _visit_observed_counters(self, pipeline_id: str, n_tasks_total: int) -> dict[str, int]:
+        """Same reconstruction as ``SqliteStore``, over the rows this store holds (see ``visits.py``)."""
+        observed: dict[str, int] = {}
+        rows: list[Any] = [
+            *self._occurrences.values(), *self._artifacts.values(), *self._tasks.values()
+        ]
+        for row in rows:
+            if row.pipeline_id == pipeline_id and 0 <= row.seq < n_tasks_total:
+                key = str(row.seq)
+                observed[key] = max(observed.get(key, -1), row.visit)
+        return observed
 
     def _visit_save(self, pipeline_id, state):
         self._visits[pipeline_id] = copy.deepcopy(state)

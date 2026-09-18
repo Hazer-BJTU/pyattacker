@@ -481,7 +481,19 @@ def build_control(raw: Any, task_names: Sequence[str]) -> ControlPlan:
     sources = raw.get("retry_all", [])
     if not isinstance(sources, (list, tuple)) or ("retry_all" in raw and not sources):
         raise PipelineBuildError("control.retry_all: expected a nonempty source list")
-    retry = tuple(sorted({resolve(t, f"control.retry_all[{i}]", source=True) for i, t in enumerate(sources)}))
+    # Resolved first, deduplicated second — never the other way round. A set comprehension would
+    # silently collapse aliases that name the same station (`["b", 1]`, or the numeric-string form
+    # of an int), which is the same declaration error `rewind` already rejects for its sources.
+    resolved: list[int] = []
+    seen: set[int] = set()
+    for index, token in enumerate(sources):
+        path = f"control.retry_all[{index}]"
+        seq = resolve(token, path, source=True)
+        if seq in seen:
+            raise PipelineBuildError(f"{path}: duplicate source {token!r} (already declared as seq {seq})")
+        seen.add(seq)
+        resolved.append(seq)
+    retry = tuple(sorted(resolved))
     if not edges and not retry:
         raise PipelineBuildError("control: max_handoffs requires backward operations")
     return ControlPlan(names, forward.edges, edges, retry, raw.get("max_handoffs"))

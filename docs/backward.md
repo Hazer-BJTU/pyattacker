@@ -120,9 +120,9 @@ attempt rows, but cannot reuse its number. Framework recovery is at least once f
 it cannot guarantee exactly-once external side effects.
 
 Both built-in stores provide atomic `reset_visits`, `commit_entry`, `commit_visit_attempt`,
-`commit_visit_success`, `commit_control_transition` and `repair_visit_terminal`, plus `visit_state`
-and exact artifact lookup. `supports_visits` probes the capability, and a store offering exactly those
-eight names is refused: a control transfer also needs the v1 ledger capability
+`commit_visit_success`, `commit_control_transition` and `repair_visit_terminal`, plus `visit_state`,
+`feature_level()` and exact artifact lookup. `supports_visits` probes the capability, and a store
+offering exactly those names is refused: a control transfer also needs the v1 ledger capability
 (`commit_handoff`, `reset_pipeline`, `handoffs`), because the transition's ledger row and source task row
 land through it. Write-behind flushes before delegating these operations synchronously.
 A control transfer commits its source visit/attempt, entry occurrence, ledger, control count and allocated
@@ -139,16 +139,41 @@ and `0` are all rejected). The runtime ceiling
 The minimum is effective. Every nonterminal handoff in such a pipeline counts, including forward transfers;
 `END` can finish at the limit without consuming another transfer. Budget N permits exactly N transfers.
 The next fails before publishing a transition or invalidating results. Resume, retry-all and automatic
-missing-payload seed fallback retain the count. Only an explicit fresh execution (`retry_succeeded=True`)
-starts a new budget lifecycle; visit counters and audit records still survive. On a backward-enabled
-pipeline that flag is also the way out of a spent budget: a pipeline that failed *because* it consumed
-its budget has no progress left to resume, so without `retry_succeeded=True` every later run replays
-the same fatal error. Plain `resume=True` keeps the consumed budget and continues the current traversal.
+missing-payload seed fallback retain the count. Only an explicit fresh start (`fresh_restart=True`, or
+`retry_succeeded=True` on a pipeline that already succeeded) begins a new budget lifecycle; visit counters
+and audit records survive it. That is the way out of a spent budget: a pipeline that failed *because* it
+consumed its budget has no progress left to resume, so without it every later run replays the same fatal
+error. Plain `resume=True` keeps the consumed budget and continues the current traversal, and
+`retry_succeeded=True` on its own never restarts an unfinished traversal — it only admits pipelines that
+already succeeded (see *Recovery and ownership* below).
+
+### Recovery and ownership
+
+What an open does depends on the stored row, and the rules are meant to be explicit rather than emergent:
+
+| stored row | what this run does |
+| --- | --- |
+| `failed`, `interrupted` | ordinary checkpoint recovery: the exact durable visit — visit number, pending entry, consumed attempt numbering — continues |
+| `running`, `resume=True` | the operator's claim that the previous owner is gone. `interrupt_stale` reclaims heartbeat-stale rows first; the exact durable visit then continues |
+| `running`, no `resume` | **skipped**, never taken over. A durable pending visit can be continued after a crash, so a second writer would fork one traversal. The row is left exactly as it is, and `pipeline.skipped` carries `reason="owned_by_another_run"` plus the owner's run id |
+| rows durable, traversal gone | refused: `corrupt visit checkpoint: missing traversal state`. `fresh_restart=True` is the documented way to discard it and start over |
+| `succeeded` | skipped, unless `retry_succeeded=True`; a restart then runs from the bound seed with a fresh budget |
+
+`fresh_restart=True` is the one switch that discards durable progress: it clears the effective traversal and
+any pending entry, starts again from the immutable bound seed, resets the control budget and invalidates the
+previous ledger — while visit counters and audit rows (tasks, attempts, artifacts, visits) are kept, so
+historical occurrences stay addressable, and a store whose traversal was lost has its counters rebuilt from
+those rows. It applies to forward pipelines too, where it simply means "ignore the checkpoint, run the chain
+again"; combine it with `retry_succeeded=True` to restart a pipeline that already succeeded. A fresh start
+emits `pipeline.restarted` (with the discarded cursor), not `pipeline.checkpoint_missing`: nothing was lost.
 
 A missing/unavailable pending payload emits `pipeline.checkpoint_missing` and establishes a seed replay,
-preserving budget and counters. Summary journals and null backends can run loops in-process, but cannot
-resume their missing payloads. A pending rewind to seq 0 uses its chosen payload rather than triggering a
-seed reset. Backward transfers requeue through the timer pump to release the worker for other pipelines.
+preserving budget and counters. The first execution of a pipeline never takes that path: its input is the
+bound seed it already holds, so a `journal="summary"` store (whose written seed payload is intentionally
+dropped) does not report a checkpoint failure it never had. Summary journals and null backends can run loops
+in-process, but cannot resume their missing payloads. A pending rewind to seq 0 uses its chosen payload
+rather than triggering a seed reset. Backward transfers requeue through the timer pump to release the worker
+for other pipelines.
 
 ## Inspecting execution
 
@@ -162,8 +187,30 @@ A report is scoped to the run it covers and counts that run's repeated visits an
 resume it shows the new run's workload while the store and the export retain every earlier row. Those
 totals are workload, not completion percentages.
 
-SQLite upgrades older stores with visit columns defaulting to 0 and a traversal-state table. This is
-an additive upgrade for forward-only work. **Do not open a store containing revisits with an older writer**:
-older binaries cannot understand effective lineage. Take a backup before a downgrade. Simultaneous runners
-executing the same logical pipeline are not a supported scheduling mode; independent shard rows remain
-independent. See [#51](https://github.com/Hazer-BJTU/pyattacker/issues/51) for the design and review checklist.
+### Store compatibility
+
+SQLite upgrades older stores with visit columns defaulting to 0, a traversal-state table and a
+`store_meta` feature level. This is an additive upgrade for forward-only work: a store stays at level `base`
+until the first revisit is written.
+
+The level becomes `visits-v1` inside the *same transaction* that allocates the first second occurrence for a
+station, and it never goes back down — audit rows are not deleted, so neither is the fact that they exist.
+That is also the moment a lineage-unaware writer stops being able to interpret the store, so a SQLite store
+arms a **writer guard**: `INSERT`/`UPDATE`/`DELETE` on `pipelines`, `tasks` and `artifacts` from a connection
+that has not declared visit-lineage awareness fail loudly (`no such function:
+pyattacker_store_requires_visits_aware_writer`), while reads keep working. A writer released before this
+feature therefore cannot silently mutate the wrong occurrence: it fails on its first write. A build that
+opens a level it does not know refuses the store outright (`StoreFeatureUnsupported`, read-only included)
+rather than reporting a lineage it cannot see.
+
+Practical consequences:
+
+* back up a revisit-aware store by copying its files (the database plus any `-wal`/`-shm`); a SQL dump of a
+  guarded store cannot be restored through a raw connection;
+* writing to a guarded store from `sqlite3` needs the guard function registered on that connection (or the
+  triggers dropped) — both are outside the supported interface;
+* the only supported way back to `base` is a migration performed by a build that understands the level.
+
+Simultaneous runners executing the same logical pipeline are not a supported scheduling mode; independent
+shard rows remain independent (a `running` row is still never taken over without `resume`, see above).
+See [#51](https://github.com/Hazer-BJTU/pyattacker/issues/51) for the design and review checklist.

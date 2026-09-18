@@ -194,6 +194,7 @@ RUN_FIELDS = frozenset({
     "stop_after_s",
     "max_handoffs",
     "retry_succeeded",
+    "fresh_restart",
     "seed",
     "notes",
     "write_behind",
@@ -397,7 +398,7 @@ def _validate_run(raw: Any) -> None:
             _number(value, path, minimum=0)
         elif key in ("stop_after_failures", "write_batch", "max_handoffs"):
             _integer(value, path, minimum=1)
-        elif key in ("strict_leases", "retry_succeeded"):
+        elif key in ("strict_leases", "retry_succeeded", "fresh_restart"):
             _flag(value, path)
         elif key == "write_behind":
             if value is not None:  # null = auto (on for a file-backed store)

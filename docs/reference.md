@@ -526,7 +526,8 @@ Everything that shapes one run. Pass a `RunConfig`, or pass its fields as keywor
 | `label` | `""` | a label recorded on the run |
 | `run_id` | `None` | explicit run id; default is timestamp + digest |
 | `resume` | `False` | mark pipelines abandoned by dead runs as resumable before scheduling |
-| `retry_succeeded` | `False` | re-run pipelines already marked succeeded |
+| `retry_succeeded` | `False` | re-run pipelines already marked succeeded. Eligibility only: it never discards the checkpoint or traversal of a pipeline that has not succeeded |
+| `fresh_restart` | `False` | start admitted pipelines over from the bound seed: discard checkpoint/traversal, reset the control budget, keep visit counters and audit rows |
 | `heartbeat_s` | `5.0` | how often the run's heartbeat is written |
 | `grace_s` | `5.0` | how long a graceful shutdown waits before cancelling workers |
 | `stale_after_s` | `30.0` | a running pipeline from a run whose heartbeat is older than this is considered abandoned |
@@ -562,7 +563,7 @@ What `run()` returns.
 |---|---|
 | `run_id`, `status`, `duration_ms` | run identity and outcome |
 | `stats` | the full statistics dict, including `stats["pipelines"]["by_state"]` |
-| `skipped` | how many pipelines were skipped because they had already succeeded |
+| `skipped` | how many pipelines were skipped because they had already succeeded, or (backward traversal) because a `running` row belongs to another run and `resume` did not claim it |
 | `leases_leaked` | how many leases had to be force-reclaimed |
 | `repair_failures` | pipelines this run could not settle out of a torn terminal state; run-local, so it is the only place such a failure is visible (the row keeps its original owner) |
 | `stop_reason` | why the run stopped early, if it did |
@@ -1156,7 +1157,8 @@ consumed by later forward progress, so the ordinary `artifact(cursor - 1)` rule 
 entry payload is gone (`journal=summary`, a null backend, a deleted blob) the pipeline restarts from the seed
 with `pipeline.checkpoint_missing`, exactly like a lost linear checkpoint.
 
-A restart from seq 0 (including `retry_succeeded` and an unusable checkpoint) durably advances
+A restart from seq 0 (an explicit `fresh_restart=True`, a pipeline that already succeeded under
+`retry_succeeded=True`, or an unusable checkpoint) durably advances
 `PipelineRecord.handoff_floor` to the latest ledger ID before task execution. Rows at or below that
 watermark remain in the append-only history and export, but cannot drive recovery for the new execution.
 For control-enabled pipelines, `reset_pipeline(record)` commits that cursor/watermark together with
@@ -1165,6 +1167,16 @@ payload artifacts and append-only attempts/events/handoffs remain; retained arti
 cleared. Thus `tasks()` and chain artifact exports describe the current execution, including skipped
 stations having no rows. Historical reused-entry addresses may reference deleted/replaced chain slots;
 the ledger preserves provenance, not immutable snapshots of those slots.
+
+`fresh_restart=True` is the only switch that discards a checkpoint on purpose, for backward and forward
+pipelines alike: the pipeline runs again from its bound seed, `resume`/repair rules are skipped for that
+open, and the open records `pipeline.restarted` (with the cursor it discarded) instead of
+`pipeline.checkpoint_missing`, because nothing was lost. Everything append-only survives — attempts, events,
+handoffs and, for a backward pipeline, the visit counters, so historical occurrences stay addressable. A
+checkpoint that the framework can no longer use is therefore never a dead end, and neither is a spent
+backward-traversal budget; see [recovery and ownership](backward.md#recovery-and-ownership). By contrast
+`retry_succeeded=True` only widens *which* pipelines are eligible to run again — it never discards the state
+of one that has not succeeded.
 
 The watermark survives subsequent resumes and process restarts; filtering by the current `run_id` would
 incorrectly discard a valid handoff after a second interrupted resume. Custom stores offering handoffs
@@ -1295,6 +1307,14 @@ budget unit and allocates the target entry. `supports_visits(store)` is the prob
 methods **plus** `commit_handoff`, `reset_pipeline` and `handoffs`, because a backward transition lands its
 ledger row and source task through that same commit. A store that fails the probe is refused with a
 `ConfigError` when a backward-enabled pipeline is opened, never downgraded to a non-durable loop.
+
+The same capability owns the store's **feature level** (`feature_level()`, `store/visits.py`): `base` until
+the first revisit is committed, then `visits-v1`, written in the same transaction as the occurrence that
+justifies it. Opening an unknown (newer) level raises `StoreFeatureUnsupported` instead of reading a lineage
+this build cannot see, and a SQLite store at `visits-v1` carries a writer guard that refuses
+`INSERT`/`UPDATE`/`DELETE` on `pipelines`/`tasks`/`artifacts` from any connection that has not declared
+visit-lineage awareness — so a binary released before the marker existed cannot silently mutate the wrong
+occurrence (see [store compatibility](backward.md#store-compatibility)).
 
 ---
 

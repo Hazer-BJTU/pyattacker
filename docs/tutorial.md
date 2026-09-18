@@ -915,7 +915,10 @@ round 2: {'succeeded': 3} | requests sent: {'ask': 3, 'judge': 9} | skipped: 0
 The rules, in the order they are applied:
 
 1. The pipeline already `succeeded` → skipped entirely. Pass `retry_succeeded=True` / `--retry-succeeded` to
-   re-run it anyway.
+   re-run it anyway (it then starts from the seed, since a finished pipeline has no checkpoint left to
+   continue). To *discard* the checkpoint of a pipeline that has not succeeded, use `fresh_restart=True` /
+   `--fresh-restart` — the same switch resets a spent backward-traversal budget, and it never deletes the
+   audit rows of the execution it replaces.
 2. The pipeline is `failed` or `interrupted` with `n_tasks_done > 0` → load the artifact at `n_tasks_done - 1`
    and continue at the next `seq`. **This is why `ask` sent nothing in round 2**: the judge was the first task
    with no artifact, so only the judge ran.
@@ -947,9 +950,10 @@ Three things to note:
   be enumerated.
 * Every attempt keeps its `run_id`, so the record shows which run did which work.
 
-Events worth alerting on: `pipeline.resumed`, `pipeline.skipped`, `pipeline.checkpoint_missing`,
-`pipeline.checkpoint_unusable`, `pipeline.deferred_interrupted`, `pipeline.terminal_repaired`,
-`pipeline.terminal_repair_failed`, `pipeline.terminal_cleanup_failed`, `pipeline.corrupt_cursor`.
+Events worth alerting on: `pipeline.resumed`, `pipeline.skipped`, `pipeline.restarted`,
+`pipeline.checkpoint_missing`, `pipeline.checkpoint_unusable`, `pipeline.deferred_interrupted`,
+`pipeline.terminal_repaired`, `pipeline.terminal_repair_failed`, `pipeline.terminal_cleanup_failed`,
+`pipeline.corrupt_cursor`.
 
 Two run-level events deserve the same treatment. `runner.internal_error` is a framework-level surprise
 recorded against one pipeline while the run carries on. `runner.worker_crashed` is heavier: a worker died
@@ -1177,7 +1181,7 @@ Config sections:
 
 | Section | Keys |
 |---|---|
-| `run` | `store`, `concurrency`, `journal` (`full` keeps payloads, `summary` keeps only digests), `label`, `strict_leases`, `stop_after_failures`, `stop_after_s`, `retry_succeeded`, `heartbeat_s`, `grace_s`, `stale_after_s`, `notes` |
+| `run` | `store`, `concurrency`, `journal` (`full` keeps payloads, `summary` keeps only digests), `label`, `strict_leases`, `stop_after_failures`, `stop_after_s`, `retry_succeeded`, `fresh_restart`, `heartbeat_s`, `grace_s`, `stale_after_s`, `notes` |
 | `pools.<name>` | `kind`, `algorithm`, `capacity` (default for its resources), `degrade_after`, `dead_after`, `cooldown_s`, `deadlock_warn_s`, `resources: [{id, kind, capacity, options, tags}]` |
 | `pipeline` | `name`, `tags`, `include_code`, and `tasks: [{use, name, resource, algorithm, timeout_s, retry, args, kwargs}]` |
 | `source` | `kind: range` (`n`) or `kind: jsonl` (`path`, `limit`), plus `repeats`, `key_field` |
@@ -1729,8 +1733,9 @@ What is worth knowing before you use it:
   Both built-in stores can commit a handoff; a custom store that cannot is refused up front with a
   `ConfigError` rather than writing a jump that would not survive a crash.
 
-A whole-pipeline restart (for example `retry_succeeded=True` or a lost entry payload) keeps previous
-handoffs, attempts and events as history, but atomically clears current task/chain artifact state
+A whole-pipeline restart (an explicit `fresh_restart=True`, a pipeline that already succeeded under
+`retry_succeeded=True`, or a lost entry payload) keeps previous handoffs, attempts and events as history, but
+atomically clears current task/chain artifact state
 with the durable ledger watermark before restarting at seq 0. A later failure
 therefore cannot resume an old jump or recover an old END result. Subsequent target resumes preserve the
 current watermark, so repeated interruptions still use the active handoff. Completion leaves one final
@@ -1750,6 +1755,7 @@ artifact. See the [store recovery contract](reference.md#tables-and-readers) whe
 | see why it was slow | `store.attempts(pipeline_id=...)` → `duration_ms`, `decision`, `leases` |
 | resume after a crash | `runner.run(specs, resume=True)` or `pyattacker resume -c cfg.yaml` |
 | re-run results I do not trust | `retry_succeeded=True` / `--retry-succeeded` |
+| start a pipeline over from the seed, keeping its audit rows | `fresh_restart=True` / `--fresh-restart` |
 | bound the blast radius | `stop_after_failures=N`, `stop_after_s=T`, `--limit N` |
 | cap concurrency per endpoint | `Resource.create(..., capacity=N)` |
 | fail fast instead of queueing | `algorithm="immediate"` + `Retrying(retry_unknown=True)` |
@@ -1917,6 +1923,12 @@ What is worth knowing before you use it:
   backward plan, and `RunConfig.max_handoffs` (default 1000, `run.max_handoffs` in a config) can lower it:
   the effective limit is the minimum. `END` never consumes a transfer. The failing transition is refused
   *before* anything is invalidated, so the record still describes exactly what committed.
+* **Getting out of a spent budget, and out of a `running` row, is explicit.** `resume=True` keeps the
+  consumed budget and continues the current traversal, so a pipeline that failed *because* it ran out of
+  transfers needs `fresh_restart=True` / `--fresh-restart`: a new budget lifecycle, a restart from the bound
+  seed, and visit counters plus audit rows preserved. And a row that still says `running` — the shape a hard
+  kill leaves — is only claimed with `resume=True`; without it the run skips it instead of forking a
+  traversal another run may still own.
 * **A crash cannot lose the lineage.** Entry, visit allocation, effective slots and the pending input commit
   atomically, so a resume continues the same visit with its chosen payload rather than replaying the whole
   pipeline. What the framework does not give you is exactly-once external side effects — include `ctx.visit`

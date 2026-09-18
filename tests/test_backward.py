@@ -158,12 +158,14 @@ def test_budget_is_durable_and_cannot_be_reset_by_resume(store):
     assert store.attempts()[-1].outcome == "failed"
 
 
-def test_explicit_fresh_execution_resets_an_exhausted_budget(store):
-    """A failed loop must not be unresumable: `retry_succeeded=True` starts a new budget lifecycle.
+def test_explicit_fresh_restart_resets_an_exhausted_budget(store):
+    """A failed loop must not be unresumable: `fresh_restart=True` starts a new budget lifecycle.
 
     Without the reset, a pipeline that failed *because* it spent its budget replays the same fatal
     error on every later open -- there is no durable checkpoint left that can make progress -- and
-    the operator has no documented way back short of abandoning the store.
+    the operator has no documented way back short of abandoning the store. The escape hatch is the
+    explicit `fresh_restart`, and *only* that: `retry_succeeded` is an eligibility switch for
+    succeeded pipelines, not a licence to replay an unfinished traversal from its seed.
     """
     visits = []
 
@@ -191,14 +193,411 @@ def test_explicit_fresh_execution_resets_an_exhausted_budget(store):
     assert run(store, spec, resume=True).stats["pipelines"]["by_state"] == {"failed": 1}
     assert store.visit_state(spec.pipeline_id)["handoffs"] == 1
 
+    # `retry_succeeded` must not become a second, implicit meaning: the durable traversal (and its
+    # spent budget) is exactly what it must keep. The pipeline still resumes at its durable cursor
+    # -- seq 1, where the exhausted loop stopped -- and fails there on the same spent budget.
     visits.clear()
-    fresh = run(store, spec, retry_succeeded=True)
+    assert run(store, spec, retry_succeeded=True).stats["pipelines"]["by_state"] == {"failed": 1}
+    assert visits == [("b", 1)]
+    assert store.visit_state(spec.pipeline_id)["handoffs"] == 1
+    assert store.visit_state(spec.pipeline_id)["counters"] == {"0": 1, "1": 1}
+
+    visits.clear()
+    fresh = run(store, spec, fresh_restart=True)
     assert fresh.stats["pipelines"]["by_state"] == {"succeeded": 1}
     assert visits == [("a", 2), ("b", 2)]
     # Counters and audit records survive the reset; only the budget starts a new lifecycle.
     assert store.visit_state(spec.pipeline_id)["counters"] == {"0": 2, "1": 2}
     assert store.visit_state(spec.pipeline_id)["handoffs"] == 0
     assert len(store.handoffs(pipeline_id=spec.pipeline_id)) == 1
+    assert any(
+        e.kind == "pipeline.restarted" and e.data == {
+            "reason": "fresh_restart", "via": "visits", "discarded_cursor": 1,
+            "budget_reset": True, "counters_preserved": True, "audit_preserved": True,
+        }
+        for e in store.events(run_id=fresh.run_id)
+    )
+
+
+def test_retry_succeeded_does_not_replay_an_unfinished_backward_pipeline(store):
+    """`resume=True + retry_succeeded=True` must not turn a recoverable visit into a seed replay.
+
+    This is the operator's everyday combination ("finish what is unfinished, redo what succeeded").
+    A *failed* backward pipeline still owns a durable pending entry, so the only correct behaviour
+    is to continue that exact visit: replaying the seed would repeat external side effects the
+    checkpoint was about to continue, and would do it silently.
+    """
+    seen = []
+    failures = {"on": True}
+
+    @task("a")
+    def a(value, ctx):
+        seen.append(("a", ctx.visit))
+        if failures["on"] and ctx.visit == 1:
+            raise RuntimeError("flaky endpoint")
+        return value
+
+    @task("b")
+    def b(value, ctx):
+        seen.append(("b", ctx.visit))
+        return Handoff.rewind("a", {"selected": True}) if ctx.visit == 0 else value
+
+    spec = pipeline("unfinished", a | b, control={"rewind": {"b": ["a"]}, "max_handoffs": 2}).bind({"seed": True})
+    first = run(store, spec)
+    assert first.stats["pipelines"]["by_state"] == {"failed": 1}
+    # The rewind is durable: the pending entry of visit 1 is exactly what recovery must continue.
+    state = store.visit_state(spec.pipeline_id)
+    assert state["counters"] == {"0": 1, "1": 0}
+    assert state["pending"]["visit"] == 1 and state["cursor"] == 0
+
+    failures["on"] = False
+    seen.clear()
+    second = run(store, spec, resume=True, retry_succeeded=True)
+    assert second.stats["pipelines"]["by_state"] == {"succeeded": 1}
+    assert seen == [("a", 1), ("b", 1)]  # no replay of visit 0, no seed reset
+    assert [e.kind for e in store.events(run_id=second.run_id) if e.kind in
+            ("pipeline.checkpoint_missing", "pipeline.restarted")] == []
+    # The consumed budget and the visit counters are preserved, not reset.
+    assert store.visit_state(spec.pipeline_id)["handoffs"] == 1
+    assert store.visit_state(spec.pipeline_id)["counters"] == {"0": 1, "1": 1}
+
+
+def test_running_backward_pipeline_is_skipped_without_resume(store):
+    """A `running` row is someone else's traversal: skipped, not taken over, unless `resume` claims it.
+
+    The durable shape here is the one a hard kill leaves behind -- a `running` pipeline row plus a
+    committed pending visit -- so both halves of the contract are exercised: refusing to take over,
+    and continuing the exact visit once the operator says the previous owner is gone.
+    """
+    seen = []
+    failures = {"on": True}
+
+    @task("a")
+    def a(value, ctx):
+        seen.append(("a", ctx.visit))
+        if failures["on"] and ctx.visit == 1:
+            raise RuntimeError("flaky endpoint")
+        return value
+
+    @task("b")
+    def b(value, ctx):
+        seen.append(("b", ctx.visit))
+        return Handoff.rewind("a", {"selected": True}) if ctx.visit == 0 else value
+
+    spec = pipeline("owned", a | b, control={"rewind": {"b": ["a"]}, "max_handoffs": 2}).bind({"seed": True})
+    assert run(store, spec).stats["pipelines"]["by_state"] == {"failed": 1}
+    # Simulate the killed owner: the row still says running, owned by a run that is not ours.
+    row = store.get_pipeline(spec.pipeline_id)
+    store.upsert_pipeline(dataclasses.replace(row, state="running", run_id="run-killed", finished_at=None))
+
+    before = store.visit_state(spec.pipeline_id)
+    seen.clear()
+    skipped = run(store, spec, retry_succeeded=True, fresh_restart=True)
+    assert skipped.stats["pipelines"]["by_state"] == {}  # nothing ran, nothing failed
+    assert skipped.skipped == 1
+    assert seen == []
+    assert store.visit_state(spec.pipeline_id) == before
+    assert store.get_pipeline(spec.pipeline_id).state == "running"
+    assert store.get_pipeline(spec.pipeline_id).run_id == "run-killed"
+    assert any(
+        e.kind == "pipeline.skipped" and e.data["reason"] == "owned_by_another_run"
+        and e.data["owner_run_id"] == "run-killed"
+        for e in store.events(run_id=skipped.run_id)
+    )
+
+    failures["on"] = False
+    resumed = run(store, spec, resume=True)
+    assert resumed.stats["pipelines"]["by_state"] == {"succeeded": 1}
+    assert seen == [("a", 1), ("b", 1)]  # the exact durable visit, not a replay
+    assert store.visit_state(spec.pipeline_id)["counters"] == {"0": 1, "1": 1}
+    assert store.get_pipeline(spec.pipeline_id).resume_of == "run-killed"
+
+
+def test_fresh_restart_recovers_a_traversal_the_framework_cannot_open(store):
+    """The escape hatch also covers a corrupted checkpoint, which otherwise has no way out.
+
+    With durable rows but no traversal, every later open -- `resume=True` included -- refuses with
+    "corrupt visit checkpoint: missing traversal state". `fresh_restart=True` is the documented,
+    explicit way to discard that state and start over instead of abandoning the pipeline id.
+    """
+    @task("a")
+    def a(value, ctx):
+        return value
+
+    @task("b")
+    def b(value, ctx):
+        return Handoff.rewind("a", {"selected": True}) if ctx.visit == 0 else value
+
+    spec = pipeline("lost", a | b, control={"rewind": {"b": ["a"]}, "max_handoffs": 1}).bind({"seed": True})
+    assert run(store, spec).stats["pipelines"]["by_state"] == {"succeeded": 1}
+    # A terminal row is not the corruption case: only an unfinished one reaches the missing-traversal
+    # check, exactly like a store damaged between the pipeline write and the traversal write.
+    store.finish_pipeline(spec.pipeline_id, "interrupted", n_tasks_done=0)
+    inner = getattr(store, "inner", store)
+    if isinstance(inner, MemoryStore):
+        inner._visits.pop(spec.pipeline_id)
+    else:
+        inner._conn.execute("DELETE FROM visit_state WHERE pipeline_id=?", (spec.pipeline_id,))
+        inner._conn.commit()
+
+    broken = run(store, spec, resume=True, retry_succeeded=True)
+    assert broken.stats["pipelines"]["by_state"] == {"failed": 1}
+    assert "missing traversal state" in store.get_pipeline(spec.pipeline_id).error_message
+
+    restarted = run(store, spec, resume=True, fresh_restart=True)
+    assert restarted.stats["pipelines"]["by_state"] == {"succeeded": 1}
+    assert store.visit_state(spec.pipeline_id)["counters"] == {"0": 2, "1": 2}
+
+
+def test_fresh_restart_applies_to_forward_pipelines(store):
+    """`fresh_restart` is not a backward-only flag: a forward checkpoint is discarded the same way.
+
+    The point of the option is "start this pipeline over", and that has to mean something for every
+    pipeline a run admits; a flag that silently did nothing for a forward chain would be worse than
+    no flag at all.
+    """
+    seen = []
+    failures = {"on": True}
+
+    @task("first")
+    def first(value, ctx):
+        seen.append("first")
+        return value
+
+    @task("second")
+    def second(value, ctx):
+        seen.append("second")
+        if failures["on"]:
+            raise RuntimeError("endpoint down")
+        return value
+
+    spec = pipeline("forward", first | second).bind(1)
+    assert run(store, spec).stats["pipelines"]["by_state"] == {"failed": 1}
+    assert seen == ["first", "second"]
+    assert store.get_pipeline(spec.pipeline_id).n_tasks_done == 1
+
+    # Without the flag, the good checkpoint is resumed: only the second task runs again.
+    seen.clear()
+    assert run(store, spec, resume=True).stats["pipelines"]["by_state"] == {"failed": 1}
+    assert seen == ["second"]
+
+    seen.clear()
+    restarted = run(store, spec, resume=True, fresh_restart=True)
+    assert restarted.stats["pipelines"]["by_state"] == {"failed": 1}
+    assert seen == ["first", "second"]  # the checkpoint was discarded, not resumed
+    assert any(
+        e.kind == "pipeline.restarted" and e.data["reason"] == "fresh_restart"
+        and e.data["via"] == "forward" and e.data["discarded_cursor"] == 1
+        for e in store.events(run_id=restarted.run_id)
+    )
+    assert not any(
+        e.kind == "pipeline.checkpoint_missing" for e in store.events(run_id=restarted.run_id)
+    )
+
+    failures["on"] = False
+    assert run(store, spec, resume=True, fresh_restart=True).stats["pipelines"]["by_state"] == {
+        "succeeded": 1
+    }
+    # Attempts are append-only in both traversal modes, so a restart never erases the audit trail of
+    # the execution it replaced: two attempts for the first run, then one, two and two more.
+    assert len(store.attempts(pipeline_id=spec.pipeline_id)) == 7
+
+
+@pytest.mark.parametrize("sources", [["b", 1], ["b", "1"], [1, "b"]])
+def test_retry_all_rejects_duplicate_source_aliases(sources):
+    """Aliases that resolve to one station are a declaration error, exactly as they are for `rewind`."""
+
+    @task("a")
+    def a(value, ctx):
+        return value
+
+    @task("b")
+    def b(value, ctx):
+        return value
+
+    with pytest.raises(PipelineBuildError, match="duplicate source"):
+        pipeline("dup", a | b, control={"retry_all": sources, "max_handoffs": 1})
+    # The valid spellings keep working, including a bare numeric token.
+    assert pipeline("ok", a | b, control={"retry_all": ["b", 0], "max_handoffs": 1})
+    assert pipeline("ok", a | b, control={"retry_all": [1], "max_handoffs": 1})
+
+
+@pytest.mark.parametrize("kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("journal", ["full", "summary"])
+def test_fresh_run_never_reports_a_missing_checkpoint(kind, journal, tmp_path):
+    """A brand-new run has nothing to recover, so it must not borrow the recovery event.
+
+    With `journal="summary"` the store drops the payload of the seed it has just written. Reading
+    that occurrence back made every *first* execution of a backward pipeline emit
+    `pipeline.checkpoint_missing` and reset the traversal it had only just created -- a checkpoint
+    failure that never happened. The genuine missing-payload fallback (a resumed run) keeps its
+    event, which `test_missing_entry_fallback_preserves_budget_and_counters` covers.
+    """
+    store = MemoryStore(journal=journal) if kind == "memory" else SqliteStore(
+        str(tmp_path / "fresh.db"), journal=journal
+    )
+    seen = []
+
+    @task("a")
+    def a(value, ctx):
+        seen.append(("a", ctx.visit))
+        return value
+
+    @task("b")
+    def b(value, ctx):
+        seen.append(("b", ctx.visit))
+        return Handoff.rewind("a", {"selected": True}) if ctx.visit == 0 else value
+
+    spec = pipeline("fresh", a | b, control={"rewind": {"b": ["a"]}, "max_handoffs": 1}).bind({"seed": True})
+    try:
+        report = run(store, spec)
+        assert report.stats["pipelines"]["by_state"] == {"succeeded": 1}
+        assert seen == [("a", 0), ("b", 0), ("a", 1), ("b", 1)]
+        assert [e.kind for e in store.events(run_id=report.run_id)
+                if e.kind == "pipeline.checkpoint_missing"] == []
+    finally:
+        store.close()
+
+
+def test_revisit_store_marks_its_level_and_refuses_an_unaware_writer(tmp_path):
+    """Downgrade protection: once a revisit exists, a lineage-unaware writer cannot write.
+
+    The marker is durable and part of the schema, so it also stops a writer that was released before
+    the marker existed: a connection that never declared visit-lineage awareness cannot prepare its
+    own `INSERT`/`UPDATE`/`DELETE` against a seq-keyed table. Reads stay available.
+    """
+    import sqlite3
+
+    path = str(tmp_path / "downgrade.db")
+    store = SqliteStore(path)
+    assert store.feature_level() == "base"
+
+    @task("a")
+    def a(value, ctx):
+        return value
+
+    @task("b")
+    def b(value, ctx):
+        return Handoff.rewind("a", {"selected": True}) if ctx.visit == 0 else value
+
+    spec = pipeline("guarded", a | b, control={"rewind": {"b": ["a"]}, "max_handoffs": 1}).bind({"seed": True})
+    try:
+        assert run(store, spec).stats["pipelines"]["by_state"] == {"succeeded": 1}
+        assert store.feature_level() == "visits-v1"
+        triggers = {
+            row[0] for row in store._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )
+        }
+        assert triggers == {
+            f"pyattacker_writer_guard_{table}_{event}"
+            for table in ("pipelines", "tasks", "artifacts")
+            for event in ("insert", "update", "delete")
+        }
+    finally:
+        store.close()
+
+    # A pyattacker that understands visit lineage reopens the store and keeps writing normally.
+    reopened = SqliteStore(path)
+    try:
+        assert reopened.feature_level() == "visits-v1"
+        assert reopened.upsert_pipeline(reopened.get_pipeline(spec.pipeline_id)) is None
+    finally:
+        reopened.close()
+
+    # An older writer -- any connection that has not declared itself -- is refused, loudly.
+    legacy = sqlite3.connect(path)
+    try:
+        legacy.execute("SELECT 1 FROM pipelines").fetchone()  # reads are untouched
+        with pytest.raises(sqlite3.OperationalError, match="pyattacker_store_requires_visits_aware_writer"):
+            legacy.execute("UPDATE pipelines SET state='running' WHERE pipeline_id=?", (spec.pipeline_id,))
+        with pytest.raises(sqlite3.OperationalError, match="pyattacker_store_requires_visits_aware_writer"):
+            legacy.execute("DELETE FROM artifacts WHERE pipeline_id=?", (spec.pipeline_id,))
+        with pytest.raises(sqlite3.OperationalError, match="pyattacker_store_requires_visits_aware_writer"):
+            legacy.execute(
+                "INSERT OR REPLACE INTO tasks (task_run_id, pipeline_id, run_id, name, seq, state) "
+                "VALUES ('x','y','z','t',0,'running')"
+            )
+    finally:
+        legacy.close()
+
+
+def test_store_level_is_irreversible_and_a_newer_level_refuses_to_open(tmp_path):
+    """The marker never goes back down, and an unknown (newer) level is refused on open."""
+    import sqlite3
+
+    from pyattacker.errors import StoreFeatureUnsupported
+
+    path = str(tmp_path / "level.db")
+    store = SqliteStore(path)
+
+    @task("a")
+    def a(value, ctx):
+        return value
+
+    @task("b")
+    def b(value, ctx):
+        return Handoff.rewind("a", {"selected": True}) if ctx.visit == 0 else value
+
+    spec = pipeline("level", a | b, control={"rewind": {"b": ["a"]}, "max_handoffs": 1}).bind({"seed": True})
+    try:
+        run(store, spec)
+        assert store.feature_level() == "visits-v1"
+        # An explicit restart discards traversal state but not the level: audit rows are still there,
+        # so the store must keep refusing writers that cannot tell the occurrences apart.
+        run(store, spec, fresh_restart=True)
+        assert store.feature_level() == "visits-v1"
+    finally:
+        store.close()
+
+    with sqlite3.connect(path) as raw:
+        raw.execute("UPDATE store_meta SET value='visits-v2' WHERE key='feature_level'")
+    for read_only in (False, True):
+        with pytest.raises(StoreFeatureUnsupported, match="visits-v2"):
+            SqliteStore(path, read_only=read_only)
+    # ...and the same guard is reachable through the public opener.
+    from pyattacker.store import open_store
+
+    with pytest.raises(StoreFeatureUnsupported):
+        open_store(path)
+
+
+def test_forward_only_store_stays_writable_by_an_unaware_writer(tmp_path):
+    """The version upgrade is additive until the first revisit: no marker, no guard, no refusal.
+
+    This is the other half of the downgrade contract — a store that never allocated a revisit is
+    still an ordinary v1 store, so an older binary keeps working on it and the migration costs
+    nothing for forward-only work.
+    """
+    import sqlite3
+
+    path = str(tmp_path / "plain.db")
+    store = SqliteStore(path)
+
+    @task("only")
+    def only(value, ctx):
+        return value
+
+    spec = pipeline("plain", only).bind(1)
+    try:
+        assert run(store, spec).stats["pipelines"]["by_state"] == {"succeeded": 1}
+        assert store.feature_level() == "base"
+        triggers = store._conn.execute("SELECT count(*) FROM sqlite_master WHERE type='trigger'").fetchone()[0]
+        assert triggers == 0
+    finally:
+        store.close()
+
+    legacy = sqlite3.connect(path)
+    try:
+        legacy.execute("UPDATE pipelines SET state='running' WHERE pipeline_id=?", (spec.pipeline_id,))
+        legacy.execute(
+            "INSERT OR REPLACE INTO artifacts (artifact_id,pipeline_id,task_name,seq,type_name,codec,"
+            "digest,size,payload,created_at,is_final,blob_ref) "
+            "VALUES ('x','y','t',0,'dict','json','d',2,'{}',1.0,0,NULL)"
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
 
 
 def test_resumed_visit_run_stats_match_across_stores(store):
@@ -795,7 +1194,10 @@ def b(value, ctx):
     return value
 
 spec = pipeline("kill", a | b, control={"rewind": {"b": ["a"]}, "max_handoffs": 1}).bind({"seed": True})
-report = Runner(store=sys.argv[1], handle_signals=False, write_behind=True).run([spec])
+# The recovery contract for a `running` row is explicit: only `resume=True` claims the traversal
+# back from the run that was killed (see `test_running_backward_pipeline_is_skipped_without_resume`).
+report = Runner(store=sys.argv[1], handle_signals=False, write_behind=True,
+                resume=sys.argv[2] == "resume").run([spec])
 assert report.stats["pipelines"]["by_state"] == {"succeeded": 1}, report.stats
 """)
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}

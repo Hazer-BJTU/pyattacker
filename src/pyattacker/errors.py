@@ -29,6 +29,7 @@ __all__ = [
     "BudgetExceeded",
     "RunInterrupted",
     "StoreUnavailable",
+    "StoreFeatureUnsupported",
     "WorkerCrashed",
     "ERROR_CLASSES",
     "error_class_of",
@@ -138,6 +139,18 @@ class StoreUnavailable(PyAttackerError):
     after a framework-level surprise) cannot reach the store: at that point the run's own
     durability guarantees can no longer be trusted, so the run stops instead of continuing on
     unrecorded state.
+    """
+
+
+class StoreFeatureUnsupported(PyAttackerError):
+    """The store was written by a newer pyattacker and this build cannot interpret it.
+
+    A store records the highest on-disk feature level it has reached (``store/visits.py``), and a
+    binary that does not know that level refuses to operate on it: reading or writing a
+    revisit-aware store with lineage-unaware code would silently operate on the wrong artifact
+    occurrence, not merely display incomplete data. Upgrade the package to open the store; back up
+    by copying the files, because a SQL dump of a guarded store cannot be restored by a raw
+    connection (see ``docs/backward.md``).
     """
 
 
