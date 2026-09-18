@@ -213,7 +213,8 @@ def test_explicit_fresh_restart_resets_an_exhausted_budget(store):
     assert any(
         e.kind == "pipeline.restarted" and e.data == {
             "reason": "fresh_restart", "via": "visits", "discarded_cursor": 1,
-            "budget_reset": True, "counters_preserved": True, "audit_preserved": True,
+            "budget_reset": True, "counters_preserved": True,
+            "visit_occurrences_preserved": True, "append_only_history_preserved": True,
         }
         for e in store.events(run_id=fresh.run_id)
     )
@@ -311,6 +312,57 @@ def test_running_backward_pipeline_is_skipped_without_resume(store):
     assert seen == [("a", 1), ("b", 1)]  # the exact durable visit, not a replay
     assert store.visit_state(spec.pipeline_id)["counters"] == {"0": 1, "1": 1}
     assert store.get_pipeline(spec.pipeline_id).resume_of == "run-killed"
+
+
+def test_fresh_restart_settles_a_pending_task_it_abandons(store):
+    """The occurrence a discarded traversal was waiting on must not stay `running` forever.
+
+    A hard kill leaves exactly this shape: a committed pending visit whose task row is still in
+    flight. Resume reuses that occurrence, but a fresh restart throws it away — so the row has to be
+    settled as abandoned. It stays in history; nothing points at it any more.
+    """
+    failures = {"on": True}
+
+    @task("a")
+    def a(value, ctx):
+        if failures["on"] and ctx.visit == 1:
+            raise RuntimeError("killed mid-visit")
+        return value
+
+    @task("b")
+    def b(value, ctx):
+        return Handoff.rewind("a", {"selected": True}) if ctx.visit == 0 else value
+
+    spec = pipeline("abandon", a | b, control={"rewind": {"b": ["a"]}, "max_handoffs": 1}).bind({"seed": True})
+    assert run(store, spec).stats["pipelines"]["by_state"] == {"failed": 1}
+    pending = store.visit_state(spec.pipeline_id)["pending"]
+    assert (pending["seq"], pending["visit"]) == (0, 1)
+
+    flush = getattr(store, "flush", None)
+    if callable(flush):  # a write-behind wrapper must not keep the flip in its buffer
+        flush()
+    inner = getattr(store, "inner", store)
+    # Simulate the kill: the pending occurrence's task row was left in flight.
+    if isinstance(inner, MemoryStore):
+        row = inner._tasks[pending["task_run_id"]]
+        inner._tasks[pending["task_run_id"]] = dataclasses.replace(row, state="running")
+    else:
+        inner._conn.execute(
+            "UPDATE tasks SET state='running' WHERE task_run_id=?", (pending["task_run_id"],)
+        )
+        inner._conn.commit()
+    running = next(t for t in store.tasks(pipeline_id=spec.pipeline_id)
+                   if t.task_run_id == pending["task_run_id"])
+    assert running.state == "running"
+
+    failures["on"] = False
+    assert run(store, spec, resume=True, fresh_restart=True).stats["pipelines"]["by_state"] == {
+        "succeeded": 1
+    }
+    abandoned = next(t for t in store.tasks(pipeline_id=spec.pipeline_id)
+                     if t.task_run_id == pending["task_run_id"])
+    assert abandoned.state == "interrupted"  # settled as abandoned, still in history
+    assert store.visit_state(spec.pipeline_id)["counters"] == {"0": 2, "1": 1}
 
 
 def test_fresh_restart_recovers_a_traversal_the_framework_cannot_open(store):
@@ -562,6 +614,66 @@ def test_store_level_is_irreversible_and_a_newer_level_refuses_to_open(tmp_path)
         open_store(path)
 
 
+def test_unknown_level_is_refused_before_anything_is_migrated(tmp_path):
+    """A store this build cannot interpret is not touched at all — not even by the additive migration.
+
+    The refusal has to happen before `executescript(SCHEMA)`/`_migrate()`: otherwise opening a
+    future store with an older build would "repair" a schema whose semantics it cannot see and leave
+    a half-upgraded database behind the error. The fixture is deliberately an *old-style* schema, so
+    every migration step the current build would normally add is observable afterwards.
+    """
+    import sqlite3
+
+    from pyattacker.errors import StoreFeatureUnsupported
+
+    path = str(tmp_path / "future.db")
+    raw = sqlite3.connect(path)
+    try:
+        raw.executescript(
+            """
+            CREATE TABLE pipelines (
+                pipeline_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, name TEXT NOT NULL, key TEXT NOT NULL,
+                state TEXT NOT NULL, tags_json TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL,
+                started_at REAL, finished_at REAL, n_tasks_total INTEGER NOT NULL DEFAULT 0,
+                n_tasks_done INTEGER NOT NULL DEFAULT 0, attempts_total INTEGER NOT NULL DEFAULT 0,
+                failed_task TEXT, error_type TEXT, error_message TEXT, traceback TEXT,
+                seed_digest TEXT NOT NULL DEFAULT '', spec_digest TEXT NOT NULL DEFAULT '', resume_of TEXT
+            );
+            CREATE TABLE artifacts (
+                artifact_id TEXT PRIMARY KEY, pipeline_id TEXT NOT NULL, task_name TEXT NOT NULL,
+                seq INTEGER NOT NULL, type_name TEXT NOT NULL, codec TEXT NOT NULL, digest TEXT NOT NULL,
+                size INTEGER NOT NULL, payload BLOB, created_at REAL NOT NULL,
+                is_final INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO store_meta VALUES ('feature_level', 'visits-v2');
+            INSERT INTO pipelines (pipeline_id, run_id, name, key, state, created_at)
+                VALUES ('p', 'r', 'n', 'k', 'running', 1.0);
+            """
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    for read_only in (False, True):
+        with pytest.raises(StoreFeatureUnsupported, match="visits-v2"):
+            SqliteStore(path, read_only=read_only)
+
+    check = sqlite3.connect(path)
+    try:
+        tables = {row[0] for row in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "visit_state" not in tables  # the traversal table was not created
+        assert "visit" not in {row[1] for row in check.execute("PRAGMA table_info(artifacts)")}
+        assert "handoff_floor" not in {row[1] for row in check.execute("PRAGMA table_info(pipelines)")}
+        assert check.execute("SELECT count(*) FROM sqlite_master WHERE type='trigger'").fetchone()[0] == 0
+        assert check.execute(
+            "SELECT value FROM store_meta WHERE key='feature_level'"
+        ).fetchone()[0] == "visits-v2"
+        assert check.execute("SELECT count(*) FROM pipelines").fetchone()[0] == 1
+    finally:
+        check.close()
+
+
 def test_forward_only_store_stays_writable_by_an_unaware_writer(tmp_path):
     """The version upgrade is additive until the first revisit: no marker, no guard, no refusal.
 
@@ -808,9 +920,28 @@ def test_control_transaction_rolls_back_all_facts_on_failure(store, monkeypatch)
     assert store.handoffs() == []
     assert len(store.artifacts(spec.pipeline_id)) == 2
     assert all(a.outcome != "handed_off" for a in store.attempts())
+    # The compatibility marker is written in that same transaction, so it has to roll back with it:
+    # a level (or a guard) that outlived the rollback would let the next revisit commit an occurrence
+    # into a store that still advertises `base`.
+    assert store.feature_level() == "base"
+    if not isinstance(inner, MemoryStore):
+        assert inner._conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='trigger'"
+        ).fetchone()[0] == 0
     monkeypatch.setattr(inner, "_visit_save", original)
     assert run(store, spec, resume=True).stats["pipelines"]["by_state"] == {"succeeded": 1}
     assert store.visit_state(spec.pipeline_id)["counters"] == {"0": 1, "1": 1}
+    # Only the successful revisit may enter the level, and it must also arm the guard.
+    assert store.feature_level() == "visits-v1"
+    if not isinstance(inner, MemoryStore):
+        triggers = {
+            row[0] for row in inner._conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
+        }
+        assert triggers == {
+            f"pyattacker_writer_guard_{table}_{event}"
+            for table in ("pipelines", "tasks", "artifacts")
+            for event in ("insert", "update", "delete")
+        }
 
 
 def test_terminal_repair_and_explicit_fresh_execution_keep_history(store):
@@ -908,6 +1039,13 @@ def test_missing_capability_is_not_hidden_by_wrapper():
     plain.commit_entry = None
     wrapped = WriteBehindStore(plain)
     assert not supports_visits(wrapped)
+    # The compatibility contract counts as part of the capability: a store that cannot declare how
+    # far its on-disk model has come cannot honour the downgrade rule either.
+    class NoLevelStore(MemoryStore):
+        feature_level = None  # type: ignore[assignment]
+
+    assert not supports_visits(NoLevelStore())
+    assert supports_visits(MemoryStore())
 
 
 class GenerationState(HistoryArtifact):

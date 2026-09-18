@@ -92,6 +92,16 @@ class MemoryStore(VisitStore):
     def _visit_mark_revisit(self) -> None:
         self._feature_level = FEATURE_VISITS
 
+    def _visit_abandon_task(self, task_run_id: str) -> None:
+        """Same rule as ``SqliteStore``: replace the record, never mutate it in place.
+
+        ``_visit_atomic`` snapshots the task mapping with a shallow copy, so mutating a record would
+        survive a rollback; replacing the entry keeps the rollback exact.
+        """
+        task = self._tasks.get(task_run_id)
+        if task is not None and task.state == "running":
+            self._tasks[task_run_id] = dataclasses.replace(task, state="interrupted")
+
     def _visit_observed_counters(self, pipeline_id: str, n_tasks_total: int) -> dict[str, int]:
         """Same reconstruction as ``SqliteStore``, over the rows this store holds (see ``visits.py``)."""
         observed: dict[str, int] = {}

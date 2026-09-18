@@ -87,6 +87,15 @@ class VisitStore:
         state has nothing to protect and keeps the default no-op.
         """
 
+    def _visit_abandon_task(self, task_run_id: str) -> None:
+        """Backend hook: mark a discarded occurrence's task row as no longer in flight.
+
+        ``reset_visits`` discards a traversal together with the entry it was waiting on, and a hard
+        kill can leave that entry's task row ``running`` with nothing left to ever move it. Backends
+        that keep task rows move it to ``interrupted`` — the state abandonment already uses — and a
+        backend without durable rows keeps the default no-op.
+        """
+
     def _visit_observed_counters(self, pipeline_id: str, n_tasks_total: int) -> dict[str, int]:
         """The highest visit allocated per ``seq``, read back from durable rows.
 
@@ -105,6 +114,12 @@ class VisitStore:
     ) -> PipelineRecord:
         with self._visit_atomic(record.pipeline_id):
             old = self.visit_state(record.pipeline_id)
+            if old is not None and old.get("pending") is not None:
+                # The entry this traversal was waiting on is being discarded, so the occurrence it
+                # left behind must not stay `running` in history forever: a hard kill leaves exactly
+                # that shape, and nothing else will ever move the row again (its traversal is gone).
+                # It is abandoned, not in flight, which is what `interrupted` already means here.
+                self._visit_abandon_task(old["pending"]["task_run_id"])
             # Visit counters are preserved across a reset -- that is what keeps every historical
             # occurrence addressable -- and when the traversal itself is gone they are rebuilt from
             # the durable rows instead of restarting at 0. Starting over at 0 would re-allocate
@@ -327,5 +342,9 @@ def supports_visits(store: Any) -> bool:
             "commit_handoff",
             "repair_visit_terminal",
             "handoffs",
+            # The compatibility contract is part of the capability, not an extra: a store that cannot
+            # declare how far its on-disk model has come cannot honour the downgrade rule the visit
+            # model depends on, so it is refused here rather than trusted and checked later.
+            "feature_level",
         )
     )

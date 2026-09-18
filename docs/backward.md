@@ -121,10 +121,13 @@ it cannot guarantee exactly-once external side effects.
 
 Both built-in stores provide atomic `reset_visits`, `commit_entry`, `commit_visit_attempt`,
 `commit_visit_success`, `commit_control_transition` and `repair_visit_terminal`, plus `visit_state`,
-`feature_level()` and exact artifact lookup. `supports_visits` probes the capability, and a store
-offering exactly those names is refused: a control transfer also needs the v1 ledger capability
-(`commit_handoff`, `reset_pipeline`, `handoffs`), because the transition's ledger row and source task row
-land through it. Write-behind flushes before delegating these operations synchronously.
+`get_artifact_by_id` and `feature_level()`. `supports_visits` probes exactly that set *plus* the v1 ledger
+capability (`commit_handoff`, `reset_pipeline`, `handoffs`), because a control transition lands its ledger row
+and source task row through it; a store missing any of them is refused with a `ConfigError` when a
+backward-enabled pipeline is opened, never downgraded to a non-durable loop. `feature_level()` is part of the
+probe on purpose: a store that cannot declare how far its on-disk model has come cannot honour the
+[compatibility rule](#store-compatibility) either. Write-behind flushes before delegating these operations
+synchronously.
 A control transfer commits its source visit/attempt, entry occurrence, ledger, control count and allocated
 target entry together, and additionally invalidates the active suffix for `rewind`/`retry_all` (a forward
 transfer in such a pipeline consumes budget without moving the cursor backwards).
@@ -160,12 +163,15 @@ What an open does depends on the stored row, and the rules are meant to be expli
 | `succeeded` | skipped, unless `retry_succeeded=True`; a restart then runs from the bound seed with a fresh budget |
 
 `fresh_restart=True` is the one switch that discards durable progress: it clears the effective traversal and
-any pending entry, starts again from the immutable bound seed, resets the control budget and invalidates the
-previous ledger — while visit counters and audit rows (tasks, attempts, artifacts, visits) are kept, so
-historical occurrences stay addressable, and a store whose traversal was lost has its counters rebuilt from
-those rows. It applies to forward pipelines too, where it simply means "ignore the checkpoint, run the chain
-again"; combine it with `retry_succeeded=True` to restart a pipeline that already succeeded. A fresh start
-emits `pipeline.restarted` (with the discarded cursor), not `pipeline.checkpoint_missing`: nothing was lost.
+any pending entry (settling an in-flight occurrence it abandons as `interrupted`), starts again from the
+immutable bound seed, resets the control budget and invalidates the previous ledger — while visit counters
+and visit-qualified audit rows (tasks, attempts, artifacts, visits) are kept, so historical occurrences stay
+addressable, and a store whose traversal was lost has its counters rebuilt from those rows. It applies to
+forward pipelines too, where it means "ignore the checkpoint, run the chain again": there the append-only
+history survives as well, but task and chain-artifact addresses are reused by design rather than kept as
+separate occurrences (the [reference](reference.md#recovery) spells that difference out). Combine it with
+`retry_succeeded=True` to restart a pipeline that already succeeded. A fresh start emits
+`pipeline.restarted` (with the discarded cursor), not `pipeline.checkpoint_missing`: nothing was lost.
 
 A missing/unavailable pending payload emits `pipeline.checkpoint_missing` and establishes a seed replay,
 preserving budget and counters. The first execution of a pipeline never takes that path: its input is the
@@ -198,10 +204,13 @@ station, and it never goes back down — audit rows are not deleted, so neither 
 That is also the moment a lineage-unaware writer stops being able to interpret the store, so a SQLite store
 arms a **writer guard**: `INSERT`/`UPDATE`/`DELETE` on `pipelines`, `tasks` and `artifacts` from a connection
 that has not declared visit-lineage awareness fail loudly (`no such function:
-pyattacker_store_requires_visits_aware_writer`), while reads keep working. A writer released before this
-feature therefore cannot silently mutate the wrong occurrence: it fails on its first write. A build that
-opens a level it does not know refuses the store outright (`StoreFeatureUnsupported`, read-only included)
-rather than reporting a lineage it cannot see.
+pyattacker_store_requires_visits_aware_writer`). Raw and legacy reads are not blocked — the guard protects
+state, not access — but interpretation of revisit-aware lineage by a build that does not understand it is
+unsupported: such a reader cannot resolve which occurrence is effective, so its output describes the rows,
+not the execution. What the guard guarantees is the destructive half: a writer released before this feature
+cannot silently mutate the wrong occurrence, because it fails on its first write. A build that opens a level
+it does not know refuses the store outright (`StoreFeatureUnsupported`, read-only included) rather than
+reporting a lineage it cannot see.
 
 Practical consequences:
 

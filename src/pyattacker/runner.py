@@ -121,12 +121,15 @@ class RunConfig:
             switch only: it never discards the durable state of a pipeline that has not succeeded.
         fresh_restart: When true, an admitted pipeline starts over from its bound seed instead of
             resuming: durable checkpoints and the effective traversal are discarded, a spent
-            control budget is reset, and the previous ledger is invalidated. Audit rows (tasks,
-            attempts, artifacts, visits) are never deleted, and visit counters keep counting, so
-            historical occurrences stay addressable. This is the operator escape hatch for a
-            backward pipeline that failed *because* it exhausted ``max_handoffs``, and for a
-            checkpoint the framework can no longer open; combine it with ``retry_succeeded`` to
-            restart a pipeline that already succeeded.
+            control budget is reset, and the previous ledger is invalidated. Append-only history
+            (attempts, events, handoffs, retained high-band payloads) is never deleted; a
+            backward-enabled pipeline additionally keeps its visit-qualified task/artifact
+            occurrences and its visit counters, so historical occurrences stay addressable. A
+            forward pipeline reuses its task/artifact addresses by design (that is the v1 identity),
+            so its *current* task rows and chain artifacts are replaced rather than duplicated. This
+            is the operator escape hatch for a backward pipeline that failed *because* it exhausted
+            ``max_handoffs``, and for a checkpoint the framework can no longer open; combine it with
+            ``retry_succeeded`` to restart a pipeline that already succeeded.
         heartbeat_s: How often the run's heartbeat is written; drives ``stale_after_s`` staleness
             detection for other runners sharing the same store.
         grace_s: How long a graceful shutdown waits for in-flight workers before cancelling them.
@@ -1333,7 +1336,9 @@ class Runner:
 
         if restart:
             # A fresh start is not a checkpoint failure, so it does not borrow that event: the
-            # previous cursor is discarded on purpose, not lost.
+            # previous cursor is discarded on purpose, not lost. The event claims only what is true
+            # for a forward pipeline -- append-only history survives; the current task rows and chain
+            # artifacts are replaced by `reset_pipeline` below, which is what a fresh start means.
             self._emit(
                 "pipeline.restarted",
                 pipeline_id=spec.pipeline_id,
@@ -1341,7 +1346,7 @@ class Runner:
                     "reason": "fresh_restart",
                     "via": "forward",
                     "discarded_cursor": record.n_tasks_done if record is not None else 0,
-                    "audit_preserved": True,
+                    "append_only_history_preserved": True,
                 },
             )
 
@@ -1519,7 +1524,8 @@ class Runner:
                         "discarded_cursor": discarded,
                         "budget_reset": True,
                         "counters_preserved": True,
-                        "audit_preserved": True,
+                        "visit_occurrences_preserved": True,
+                        "append_only_history_preserved": True,
                     },
                 )
         if traversal["terminal"] is not None:

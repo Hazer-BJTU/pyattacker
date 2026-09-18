@@ -917,8 +917,9 @@ The rules, in the order they are applied:
 1. The pipeline already `succeeded` → skipped entirely. Pass `retry_succeeded=True` / `--retry-succeeded` to
    re-run it anyway (it then starts from the seed, since a finished pipeline has no checkpoint left to
    continue). To *discard* the checkpoint of a pipeline that has not succeeded, use `fresh_restart=True` /
-   `--fresh-restart` — the same switch resets a spent backward-traversal budget, and it never deletes the
-   audit rows of the execution it replaces.
+   `--fresh-restart` — the same switch resets a spent backward-traversal budget. Append-only history
+   (attempts, events, handoffs) survives; a backward pipeline additionally keeps its visit occurrences
+   and counters, while a forward pipeline reuses its task/artifact addresses by design.
 2. The pipeline is `failed` or `interrupted` with `n_tasks_done > 0` → load the artifact at `n_tasks_done - 1`
    and continue at the next `seq`. **This is why `ask` sent nothing in round 2**: the judge was the first task
    with no artifact, so only the judge ran.

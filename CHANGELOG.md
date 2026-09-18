@@ -16,7 +16,7 @@ All notable changes to this project are documented here. The format follows
   detached snapshots, restoration, explicit pruning and registered-subclass codec round trips. Exports
   and `/pipelines` expose visit-aware lineage. Restarting is explicit: `RunConfig.fresh_restart` /
   `--fresh-restart` discards a checkpoint or traversal from the bound seed, resets the control budget and
-  keeps every audit row, and a store that has committed its first revisit records a `base` → `visits-v1`
+  keeps the append-only history, and a store that has committed its first revisit records a `base` → `visits-v1`
   feature level (`store.feature_level()`, `StoreFeatureUnsupported`) so lineage-unaware writers are refused
   rather than silently mutating the wrong occurrence. See [the backward guide](docs/backward.md).
 
@@ -61,8 +61,11 @@ All notable changes to this project are documented here. The format follows
   owns a recoverable traversal, so replaying it from the seed would repeat external side effects the durable
   checkpoint was about to continue. The operator escape hatch is the new `RunConfig.fresh_restart` /
   `--fresh-restart` / `run.fresh_restart`: it discards the checkpoint or traversal, restarts from the bound
-  seed, resets the control budget and invalidates the previous ledger, while visit counters and every audit
-  row survive — it is also the documented recovery for a pipeline whose traversal is gone. Reopening a
+  seed, resets the control budget and invalidates the previous ledger: append-only history (attempts,
+  events, handoffs, retained payloads) survives, and a backward pipeline additionally keeps its
+  visit-qualified occurrences and counters. It is also the documented recovery for a pipeline whose
+  traversal is gone, and it settles an in-flight occurrence it abandons as `interrupted` instead of leaving
+  it `running` forever. Reopening a
   `running` backward pipeline is now explicit: without `resume=True` the row is skipped
   (`pipeline.skipped`, `reason="owned_by_another_run"`) instead of silently taking over a traversal another
   run may still own; `resume=True` reclaims it and continues the exact durable visit. A fresh run no longer

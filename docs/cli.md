@@ -48,7 +48,7 @@ pyattacker run -c config.yaml [options]
 | `--label TEXT` | a label recorded on the run, for telling runs apart later |
 | `--resume` | skip finished pipelines, restart failed ones at their checkpoint |
 | `--retry-succeeded` | with `--resume`, rerun even the pipelines that succeeded. It only widens *which* pipelines are eligible; it never discards an unfinished one's checkpoint |
-| `--fresh-restart` | start admitted pipelines over from the seed: discard checkpoints/traversal, reset the control budget, keep visit counters and audit rows |
+| `--fresh-restart` | start admitted pipelines over from the seed: discard checkpoints/traversal, reset the control budget. Append-only history (attempts/events/handoffs) survives; a backward pipeline additionally keeps its visit occurrences and counters |
 | `--strict-leases` | a leaked lease fails its task (`LeaseLeakError`) instead of being reclaimed quietly. Worth turning on in CI |
 | `--stop-after-failures N` | stop admitting work once N pipelines have failed (best-effort: already-admitted pipelines still finish) |
 | `--no-signals` | do not install SIGINT/SIGTERM handlers |

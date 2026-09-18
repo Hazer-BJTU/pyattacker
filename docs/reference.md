@@ -527,7 +527,7 @@ Everything that shapes one run. Pass a `RunConfig`, or pass its fields as keywor
 | `run_id` | `None` | explicit run id; default is timestamp + digest |
 | `resume` | `False` | mark pipelines abandoned by dead runs as resumable before scheduling |
 | `retry_succeeded` | `False` | re-run pipelines already marked succeeded. Eligibility only: it never discards the checkpoint or traversal of a pipeline that has not succeeded |
-| `fresh_restart` | `False` | start admitted pipelines over from the bound seed: discard checkpoint/traversal, reset the control budget, keep visit counters and audit rows |
+| `fresh_restart` | `False` | start admitted pipelines over from the bound seed: discard checkpoint/traversal, reset the control budget. Append-only history survives; a backward pipeline additionally keeps its visit occurrences and counters |
 | `heartbeat_s` | `5.0` | how often the run's heartbeat is written |
 | `grace_s` | `5.0` | how long a graceful shutdown waits before cancelling workers |
 | `stale_after_s` | `30.0` | a running pipeline from a run whose heartbeat is older than this is considered abandoned |
@@ -1304,9 +1304,11 @@ per-seq visit counter and records the pending input, ordinary success writes the
 effective slot together, and a control transition additionally invalidates the active suffix, consumes one
 budget unit and allocates the target entry. `supports_visits(store)` is the probe; it unwraps
 `WriteBehindStore` (which flushes before delegating these operations synchronously) and requires the visit
-methods **plus** `commit_handoff`, `reset_pipeline` and `handoffs`, because a backward transition lands its
-ledger row and source task through that same commit. A store that fails the probe is refused with a
-`ConfigError` when a backward-enabled pipeline is opened, never downgraded to a non-durable loop.
+methods, `feature_level()` **plus** `commit_handoff`, `reset_pipeline` and `handoffs`, because a backward
+transition lands its ledger row and source task through that same commit. `feature_level()` is required
+rather than optional: the compatibility rule below is part of the capability, not an extra. A store that
+fails the probe is refused with a `ConfigError` when a backward-enabled pipeline is opened, never downgraded
+to a non-durable loop.
 
 The same capability owns the store's **feature level** (`feature_level()`, `store/visits.py`): `base` until
 the first revisit is committed, then `visits-v1`, written in the same transaction as the occurrence that

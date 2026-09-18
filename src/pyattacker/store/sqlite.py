@@ -246,9 +246,6 @@ class SqliteStore(VisitStore):
         self.path = path
         self.journal = journal
         self.read_only = read_only
-        # Whether this connection has already armed the writer guard for a revisit-aware store; the
-        # triggers themselves are durable, so this only avoids repeating DDL on every later revisit.
-        self._guard_armed = False
         from ..backends import resolve_backend
 
         self.backend = resolve_backend(backend)
@@ -266,14 +263,23 @@ class SqliteStore(VisitStore):
         # pyattacker that understands visit lineage" from "a writer that does not".
         self._conn.create_function(WRITER_GUARD, 0, lambda: 1, deterministic=True)
         try:
+            # Connection-local, and needed before the first query so a locked database still waits
+            # instead of failing immediately.
+            self._conn.execute("PRAGMA busy_timeout=10000")
+            # The feature level is read and enforced *before* anything else runs. A store this build
+            # does not understand must not be touched at all -- not even by the additive migration,
+            # which would otherwise "repair" a schema whose semantics this build cannot see (and
+            # leave a half-upgraded database behind the refusal). `_read_feature_level` treats a
+            # missing `store_meta` as `base`, so an old store still passes and then gets migrated.
+            check_feature_level(
+                self._read_feature_level(), store=path or ":memory:", read_only=read_only
+            )
             if not read_only:
                 self._conn.execute("PRAGMA journal_mode=WAL")
                 self._conn.execute("PRAGMA synchronous=NORMAL")
-                self._conn.execute("PRAGMA busy_timeout=10000")
                 self._conn.executescript(SCHEMA)
                 with self._visit_atomic(""):
                     self._migrate()
-            check_feature_level(self._read_feature_level(), store=path or ":memory:", read_only=read_only)
         except BaseException:
             # A store this build refuses to open must not leave a connection (and its file handles)
             # behind, since the caller only sees the exception.
@@ -384,24 +390,34 @@ class SqliteStore(VisitStore):
         )
         return {str(row["seq"]): row["visit"] for row in rows}
 
+    def _visit_abandon_task(self, task_run_id: str) -> None:
+        """Move a discarded occurrence's in-flight task row to ``interrupted`` (see ``visits.py``).
+
+        Only a ``running`` row is touched: a row the pipeline already finished (or that an earlier
+        abandonment settled) keeps the state that describes what actually happened to it.
+        """
+        self._conn.execute(
+            "UPDATE tasks SET state='interrupted' WHERE task_run_id=? AND state='running'",
+            (task_run_id,),
+        )
+
     def _visit_mark_revisit(self) -> None:
         """Enter :data:`FEATURE_VISITS`: mark the level and arm the writer guard.
 
         Both land inside the caller's ``BEGIN IMMEDIATE`` transaction, together with the traversal
         write that allocated the revisit, so a store can never contain a second occurrence without
-        the marker (or the marker without the occurrence). Once this connection has armed the guard
-        there is nothing left to do — every later revisit re-enters the same level — so the DDL stays
-        off the transition path.
+        the marker (or the marker without the occurrence). Deliberately **not** cached in Python
+        state: the marker is written in the same transaction that can still roll back, and a cache
+        surviving that rollback would let the next revisit skip the marking and commit an occurrence
+        into a store that still advertises ``base`` and carries no guard. Both statements are
+        idempotent, so re-running them on every revisit is the cheap, always-correct option.
         """
-        if self._guard_armed:
-            return
         self._conn.execute(
             f"INSERT INTO {META_TABLE} (key, value) VALUES ('feature_level', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (FEATURE_VISITS,),
         )
         self._install_writer_guard()
-        self._guard_armed = True
 
     def _install_writer_guard(self) -> None:
         """Refuse writes from a connection that has not declared visit-lineage awareness.
@@ -411,8 +427,10 @@ class SqliteStore(VisitStore):
         :data:`WRITER_GUARD`, which every connection opened by a visit-aware build registers. A
         lineage-unaware writer fails loudly on its first ``INSERT``/``UPDATE``/``DELETE`` against a
         seq-keyed table (``no such function: ...`` or the ``RAISE`` below) instead of silently
-        operating on the wrong artifact occurrence. Reads are untouched: the guard protects state,
-        and an explicit migration is the only supported way back down a feature level.
+        operating on the wrong artifact occurrence. The guard protects *state*, not access: raw or
+        legacy reads are not blocked, but interpreting revisit-aware lineage with a build that does
+        not understand it is unsupported — such a reader cannot tell which occurrence is effective.
+        An explicit migration is the only supported way back down a feature level.
         """
         for table in GUARDED_TABLES:
             for event in ("INSERT", "UPDATE", "DELETE"):
