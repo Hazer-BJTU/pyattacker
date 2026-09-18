@@ -16,6 +16,7 @@ __all__ = [
     "ConfigError",
     "PipelineBuildError",
     "PipelineIdentityConflict",
+    "CorruptCheckpoint",
     "ArtifactCodecError",
     "PluginError",
     "ResourceError",
@@ -48,6 +49,18 @@ class PipelineBuildError(PyAttackerError):
 
 class PipelineIdentityConflict(ConfigError):
     """An existing pipeline key refers to a different task definition or seed."""
+
+
+class CorruptCheckpoint(PyAttackerError):
+    """A stored checkpoint contradicts the pipeline definition (for example ``n_tasks_done`` exceeds the
+    number of tasks in the chain).
+
+    The Runner never raises this out of a worker: it records it on the pipeline row so the corrupt value
+    stays visible for inspection instead of being repaired away, promoted to success, or surfacing as a
+    framework crash. It is classified ``fatal`` — retrying the same corrupt state cannot help.
+    """
+
+    error_class = "fatal"
 
 
 class PluginError(PyAttackerError):

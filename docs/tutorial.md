@@ -917,11 +917,24 @@ The rules, in the order they are applied:
 2. The pipeline is `failed` or `interrupted` with `n_tasks_done > 0` → load the artifact at `n_tasks_done - 1`
    and continue at the next `seq`. **This is why `ask` sent nothing in round 2**: the judge was the first task
    with no artifact, so only the judge ran.
-3. The artifact row is gone, or its payload was not kept (`journal=summary`, `null` backend) → the pipeline
-   restarts from `seq=0` and records `pipeline.checkpoint_missing`.
-4. The artifact is there but cannot be decoded (a removed codec, a changed dataclass) → the same restart,
-   recorded as `pipeline.checkpoint_unusable` so the two causes stay distinguishable.
-5. Otherwise the pipeline is new, and the seed artifact is stored before the first task runs.
+3. The pipeline is `failed` or `interrupted` and its cursor already reached the end
+   (`n_tasks_done == n_tasks_total`) → every task is checkpointed, so the pipeline is repaired to `succeeded`
+   **without re-running anything**: the last artifact is verified (present, payload kept, decodable), marked
+   final, and `pipeline.terminal_repaired` carries the state, error and run the row was carrying. This is the
+   shape a store failure or a kill during the final write leaves behind. If the artifact cannot be verified,
+   rules 5 and 6 apply instead; if the repair itself fails — marking the artifact final or settling the row —
+   the row is left untouched (original failure included) and `pipeline.terminal_repair_failed` records the
+   attempt, so the next run still reports the original cause.
+4. The cursor is *past* the end (`n_tasks_done > n_tasks_total`) → not a state the Runner can create: the row
+   is recorded as `CorruptCheckpoint` and reported as `pipeline.corrupt_cursor`, never promoted to success,
+   and the stored cursor is left in place as the evidence.
+5. The artifact row is gone, or its payload was not kept (`journal=summary`, `null` backend) → the pipeline
+   restarts from `seq=0` and records `pipeline.checkpoint_missing` (this also covers rule 3 when the terminal
+   artifact's payload is gone).
+6. The artifact is there but cannot be decoded (a removed codec, a changed dataclass, a corrupted payload) →
+   the same restart, recorded as `pipeline.checkpoint_unusable` so the two causes stay distinguishable (this
+   also covers rule 3 when the terminal artifact is present but undecodable).
+7. Otherwise the pipeline is new, and the seed artifact is stored before the first task runs.
 
 Three things to note:
 
@@ -933,7 +946,8 @@ Three things to note:
 * Every attempt keeps its `run_id`, so the record shows which run did which work.
 
 Events worth alerting on: `pipeline.resumed`, `pipeline.skipped`, `pipeline.checkpoint_missing`,
-`pipeline.checkpoint_unusable`, `pipeline.deferred_interrupted`.
+`pipeline.checkpoint_unusable`, `pipeline.deferred_interrupted`, `pipeline.terminal_repaired`,
+`pipeline.terminal_repair_failed`, `pipeline.terminal_cleanup_failed`, `pipeline.corrupt_cursor`.
 
 ---
 

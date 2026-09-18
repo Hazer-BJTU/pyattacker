@@ -469,6 +469,7 @@ What `run()` returns.
 | `stats` | the full statistics dict, including `stats["pipelines"]["by_state"]` |
 | `skipped` | how many pipelines were skipped because they had already succeeded |
 | `leases_leaked` | how many leases had to be force-reclaimed |
+| `repair_failures` | pipelines this run could not settle out of a torn terminal state; run-local, so it is the only place such a failure is visible (the row keeps its original owner) |
 | `stop_reason` | why the run stopped early, if it did |
 | `summary()` | a human-readable multi-line report |
 | `to_dict()` | the same facts, machine-readable |
@@ -481,7 +482,8 @@ print(report.summary())                                  # for a human
 metrics = report.to_dict()                               # for a dashboard
 print(report.stats["pipelines"]["by_state"])             # {'succeeded': 98, 'failed': 2}
 
-if report.status != "completed" or report.stats["pipelines"]["by_state"].get("failed"):
+failed = report.stats["pipelines"]["by_state"].get("failed", 0) + report.repair_failures
+if report.status != "completed" or failed:
     report.export_jsonl("runs/failures.jsonl")
     raise SystemExit(1)                                  # fail your CI job
 ```
@@ -792,6 +794,7 @@ PyAttackerError
 ├── FatalError               you are declaring this failure final
 ├── BudgetExceeded           a run budget was spent
 ├── RunInterrupted           the run was stopped
+├── CorruptCheckpoint        a stored checkpoint contradicts the pipeline definition
 └── StoreUnavailable         the store became untrustworthy
 ```
 
@@ -991,6 +994,39 @@ Record types with typed fields: `PipelineRecord`, `AttemptRecord` and `EventReco
 resume — with no artifact to restore, a resumed pipeline starts over and records
 `pipeline.checkpoint_missing`.
 
+The stored cursor is also repaired rather than trusted blindly. A `failed`/`interrupted` pipeline whose
+`n_tasks_done` already equals `n_tasks_total` is a torn finalization (a store failure or a kill during the
+final write): every task is checkpointed, so the next run verifies the last artifact exactly as an ordinary
+resume does — present, payload kept, decodable — then marks it final and settles the terminal row (state,
+cursor, owning run and cleared failure fields, in one write where the store offers the optional
+`settle_pipeline` capability), records `pipeline.terminal_repaired` with the state/error/run the row was
+carrying, and finishes as `succeeded` without re-running anything. Two cases do **not** repair, and they are
+not the same thing: a *past-the-end* cursor is not a state the Runner can create, so it is reported as
+`CorruptCheckpoint` (`pipeline.corrupt_cursor`), never promoted to success, with the stored value left in
+place as the evidence; and a terminal artifact that is missing, payload-less or undecodable falls back to the
+ordinary restart-from-zero rule (`pipeline.checkpoint_missing` / `pipeline.checkpoint_unusable`). A repair
+that fails in **either** step of its finalization — the finality mark or the terminal settle — leaves the
+row untouched, original failure and owning run included, and records `pipeline.terminal_repair_failed` with
+the phase, so a later attempt still reports the original cause. Because such a row never belongs to the
+repairing run, that failure can never show up in the run-scoped `stats`; it is counted in
+`RunReport.repair_failures`, which is what makes the CLI exit `1` instead of reporting a clean run.
+
+A **post-hoc** `pyattacker report <store>` reconstructs its view from pipeline rows only, so it cannot say
+that a later run tried to repair such a pipeline and failed: the row still describes the original failure,
+and the repair attempt lives in the event stream (`pipeline.terminal_repair_failed`). Treat that command's
+output as the state of the pipelines, not as the history of every attempt; the live `run` exit code is the
+authoritative signal for the attempt it just made.
+`mark_final` is therefore contractually idempotent, and it is skipped outright when the artifact is already
+final.
+
+A store without the `settle_pipeline` capability does the same repair in two writes, and the two steps are
+classified differently on purpose: a failed **terminal transition** is a failed repair (retryable, as
+above), while a failed **metadata cleanup** is not — the row is already durably `succeeded`, so the pipeline
+is repaired and only its failure text is stale. That second case emits `pipeline.terminal_cleanup_failed`
+and is not counted as a failure, because a succeeded row is skipped forever and the cleanup can never be
+retried. Stale failure metadata on a succeeded row is the documented degraded guarantee of such a store; the
+built-in backends settle the row in one write and never see it.
+
 ### Paged reads and third-party stores
 
 The list methods above are the **required** interface, and they may materialize their result — that is
@@ -1051,6 +1087,15 @@ plugin layer is public API, and existing plugins were written against the list m
   with the memory profile of its list API. Implementing the five methods is what upgrades it;
 * `Store` remains the only protocol `open_store()` checks, so adding the extension breaks nothing.
   `WriteBehindStore` implements it and flushes before every paged read, like its other read views.
+
+**`settle_pipeline(pipeline_id, *, state, n_tasks_done, run_id)`** is the other optional capability, in the
+same "not part of the protocol" spirit as `resources()`: one write that moves a row to its terminal state,
+rebinds the owning run and clears the failure fields together. `Runner._settle_succeeded` uses it when the
+terminal-cursor repair finishes a pipeline (see § Stores above), because a torn write there could otherwise
+lose the original failure before the row was settled. `SqliteStore` and `MemoryStore` implement it, and
+`WriteBehindStore` passes it through because it is a state write, not a batched fact. A store without it still
+works: the Runner falls back to `finish_pipeline` (state and cursor, atomically) followed by a cleanup
+`upsert_pipeline`, whose worst case is a settled row that still carries the old failure text.
 
 ---
 

@@ -307,6 +307,23 @@ class SqliteStore:
         self._conn.execute(f"UPDATE pipelines SET {', '.join(fields)} WHERE pipeline_id=?", values)
         self._conn.commit()
 
+    def settle_pipeline(
+        self, pipeline_id: str, *, state: str, n_tasks_done: int, run_id: str
+    ) -> None:
+        """Terminal settle in one write: state, cursor, owning run and cleared failure fields together.
+
+        The optional capability the terminal-cursor repair uses (``store/base.py``): because a crash
+        before it leaves the original failure metadata untouched and a crash after it leaves a fully
+        settled row, there is no durable moment in which the row has lost its failure but is not yet
+        terminal.
+        """
+        self._conn.execute(
+            "UPDATE pipelines SET state=?, n_tasks_done=?, run_id=?, finished_at=?, error_type=NULL, "
+            "error_message=NULL, traceback=NULL, failed_task=NULL WHERE pipeline_id=?",
+            (state, n_tasks_done, run_id, time.time(), pipeline_id),
+        )
+        self._conn.commit()
+
     def interrupt_stale(self, *, stale_after_s: float = 30.0, keep_run_id: str | None = None) -> int:
         cutoff = time.time() - stale_after_s
         sql = (
