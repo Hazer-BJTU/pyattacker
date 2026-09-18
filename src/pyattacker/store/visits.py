@@ -51,9 +51,8 @@ def check_feature_level(level: str, *, store: str, read_only: bool = False) -> N
     raise StoreFeatureUnsupported(
         f"store {store} is at feature level {level!r}, which this build does not understand "
         f"(it knows {', '.join(FEATURE_LEVELS)}); refusing {mode} access. Upgrade pyattacker to open "
-        "this store, and back it up by copying its files: a store at this level carries a writer "
-        "guard, so a SQL dump of it cannot be restored through a raw connection "
-        "(see docs/backward.md)"
+        "this store; back it up with SQLite's own backup API (sqlite3 .backup) or a file copy while "
+        "no writer is active (see docs/backward.md)"
     )
 
 
@@ -87,13 +86,16 @@ class VisitStore:
         state has nothing to protect and keeps the default no-op.
         """
 
-    def _visit_abandon_task(self, task_run_id: str) -> None:
-        """Backend hook: mark a discarded occurrence's task row as no longer in flight.
+    def _visit_abandon_running_tasks(self, pipeline_id: str) -> None:
+        """Backend hook: settle every task row of this pipeline that is still in flight.
 
-        ``reset_visits`` discards a traversal together with the entry it was waiting on, and a hard
-        kill can leave that entry's task row ``running`` with nothing left to ever move it. Backends
-        that keep task rows move it to ``interrupted`` — the state abandonment already uses — and a
-        backend without durable rows keeps the default no-op.
+        ``reset_visits`` discards a traversal, and a hard kill can leave the occurrence it was waiting on
+        ``running`` with nothing left that will ever move it. The traversal record names that occurrence
+        exactly, but a damaged store may not have the record at all — so the invariant is expressed on the
+        rows instead: during an open (before this run begins its own task) no task of this pipeline can
+        legitimately be in flight, and any row that says otherwise is abandoned. Backends that keep task
+        rows move such rows to ``interrupted``, the state abandonment already uses; a backend without
+        durable rows keeps the default no-op.
         """
 
     def _visit_observed_counters(self, pipeline_id: str, n_tasks_total: int) -> dict[str, int]:
@@ -113,13 +115,13 @@ class VisitStore:
         self, record: PipelineRecord, seed: Artifact, *, fresh_budget: bool = False
     ) -> PipelineRecord:
         with self._visit_atomic(record.pipeline_id):
+            # The traversal is about to be replaced, so nothing it still owns can be "in flight":
+            # every task row of this pipeline that says `running` is abandoned, and nothing else will
+            # ever move it (a hard kill leaves exactly that shape). Done before the new traversal is
+            # written, and keyed by the pipeline rather than by the record's pending entry, so a
+            # damaged store with no traversal left is covered by the same rule.
+            self._visit_abandon_running_tasks(record.pipeline_id)
             old = self.visit_state(record.pipeline_id)
-            if old is not None and old.get("pending") is not None:
-                # The entry this traversal was waiting on is being discarded, so the occurrence it
-                # left behind must not stay `running` in history forever: a hard kill leaves exactly
-                # that shape, and nothing else will ever move the row again (its traversal is gone).
-                # It is abandoned, not in flight, which is what `interrupted` already means here.
-                self._visit_abandon_task(old["pending"]["task_run_id"])
             # Visit counters are preserved across a reset -- that is what keeps every historical
             # occurrence addressable -- and when the traversal itself is gone they are rebuilt from
             # the durable rows instead of restarting at 0. Starting over at 0 would re-allocate

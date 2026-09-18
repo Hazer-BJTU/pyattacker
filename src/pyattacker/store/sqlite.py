@@ -390,15 +390,15 @@ class SqliteStore(VisitStore):
         )
         return {str(row["seq"]): row["visit"] for row in rows}
 
-    def _visit_abandon_task(self, task_run_id: str) -> None:
-        """Move a discarded occurrence's in-flight task row to ``interrupted`` (see ``visits.py``).
+    def _visit_abandon_running_tasks(self, pipeline_id: str) -> None:
+        """Move every in-flight task row of a discarded traversal to ``interrupted`` (``visits.py``).
 
-        Only a ``running`` row is touched: a row the pipeline already finished (or that an earlier
-        abandonment settled) keeps the state that describes what actually happened to it.
+        Only ``running`` rows are touched: a row that already finished, failed or was settled by an
+        earlier abandonment keeps the state that describes what actually happened to it.
         """
         self._conn.execute(
-            "UPDATE tasks SET state='interrupted' WHERE task_run_id=? AND state='running'",
-            (task_run_id,),
+            "UPDATE tasks SET state='interrupted' WHERE pipeline_id=? AND state='running'",
+            (pipeline_id,),
         )
 
     def _visit_mark_revisit(self) -> None:

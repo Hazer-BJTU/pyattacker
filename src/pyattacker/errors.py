@@ -148,9 +148,9 @@ class StoreFeatureUnsupported(PyAttackerError):
     A store records the highest on-disk feature level it has reached (``store/visits.py``), and a
     binary that does not know that level refuses to operate on it: reading or writing a
     revisit-aware store with lineage-unaware code would silently operate on the wrong artifact
-    occurrence, not merely display incomplete data. Upgrade the package to open the store; back up
-    by copying the files, because a SQL dump of a guarded store cannot be restored by a raw
-    connection (see ``docs/backward.md``).
+    occurrence, not merely display incomplete data. Upgrade the package to open the store; back it
+    up with SQLite's own backup API (``sqlite3 .backup``) or a file copy taken while no writer is
+    active (see ``docs/backward.md``).
     """
 
 

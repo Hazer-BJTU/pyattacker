@@ -64,7 +64,7 @@ All notable changes to this project are documented here. The format follows
   seed, resets the control budget and invalidates the previous ledger: append-only history (attempts,
   events, handoffs, retained payloads) survives, and a backward pipeline additionally keeps its
   visit-qualified occurrences and counters. It is also the documented recovery for a pipeline whose
-  traversal is gone, and it settles an in-flight occurrence it abandons as `interrupted` instead of leaving
+  traversal is gone, and it settles every task row it leaves in flight as `interrupted` instead of leaving
   it `running` forever. Reopening a
   `running` backward pipeline is now explicit: without `resume=True` the row is skipped
   (`pipeline.skipped`, `reason="owned_by_another_run"`) instead of silently taking over a traversal another

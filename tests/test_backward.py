@@ -365,6 +365,50 @@ def test_fresh_restart_settles_a_pending_task_it_abandons(store):
     assert store.visit_state(spec.pipeline_id)["counters"] == {"0": 2, "1": 1}
 
 
+def test_fresh_restart_settles_a_running_task_when_the_traversal_is_gone(store):
+    """The abandoned-row rule cannot depend on the traversal naming the occurrence.
+
+    If the traversal record itself is lost, `fresh_restart` has no pending entry to point at — but a
+    task row still marked `running` is abandoned either way, and leaving it that way would make the
+    store describe work that nobody owns and nothing can settle.
+    """
+    @task("a")
+    def a(value, ctx):
+        return value
+
+    @task("b")
+    def b(value, ctx):
+        return Handoff.rewind("a", {"selected": True}) if ctx.visit == 0 else value
+
+    spec = pipeline("orphan", a | b, control={"rewind": {"b": ["a"]}, "max_handoffs": 1}).bind({"seed": True})
+    assert run(store, spec).stats["pipelines"]["by_state"] == {"succeeded": 1}
+    # Damage the store the way the escape hatch exists to recover from, then leave an in-flight row
+    # behind (the shape a kill during a revisit produces).
+    store.finish_pipeline(spec.pipeline_id, "interrupted", n_tasks_done=0)
+    flush = getattr(store, "flush", None)
+    if callable(flush):
+        flush()
+    inner = getattr(store, "inner", store)
+    orphan = next(t for t in store.tasks(pipeline_id=spec.pipeline_id) if t.visit == 1)
+    if isinstance(inner, MemoryStore):
+        inner._visits.pop(spec.pipeline_id)
+        inner._tasks[orphan.task_run_id] = dataclasses.replace(orphan, state="running")
+    else:
+        inner._conn.execute("DELETE FROM visit_state WHERE pipeline_id=?", (spec.pipeline_id,))
+        inner._conn.execute(
+            "UPDATE tasks SET state='running' WHERE task_run_id=?", (orphan.task_run_id,)
+        )
+        inner._conn.commit()
+
+    assert run(store, spec, resume=True, fresh_restart=True).stats["pipelines"]["by_state"] == {
+        "succeeded": 1
+    }
+    settled = next(t for t in store.tasks(pipeline_id=spec.pipeline_id)
+                   if t.task_run_id == orphan.task_run_id)
+    assert settled.state == "interrupted"
+    assert store.visit_state(spec.pipeline_id)["counters"] == {"0": 2, "1": 2}
+
+
 def test_fresh_restart_recovers_a_traversal_the_framework_cannot_open(store):
     """The escape hatch also covers a corrupted checkpoint, which otherwise has no way out.
 

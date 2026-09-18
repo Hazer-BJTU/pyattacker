@@ -602,8 +602,9 @@ claim that the previous owner is gone, and without it the row is skipped and lef
 keeps its older restart-from-zero rule, which is why this is not in the generic open path).
 **Discarding state is explicit:** `fresh_restart=True` is the only switch that drops a checkpoint or a
 traversal. It restarts from the bound seed, resets the control budget and invalidates the previous ledger
-watermark, while append-only history and (for a backward pipeline) the visit counters and occurrences
-survive — so historical occurrences stay addressable, and a store
+watermark, settling any task row the discarded traversal left in flight as `interrupted`, while append-only
+history and (for a backward pipeline) the visit counters and occurrences survive — so historical occurrences
+stay addressable, and a store
 whose traversal was lost has its counters rebuilt from its own rows. `retry_succeeded` stays an eligibility
 switch ("also admit succeeded pipelines") and no longer implies discarding anything.
 

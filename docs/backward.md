@@ -163,7 +163,7 @@ What an open does depends on the stored row, and the rules are meant to be expli
 | `succeeded` | skipped, unless `retry_succeeded=True`; a restart then runs from the bound seed with a fresh budget |
 
 `fresh_restart=True` is the one switch that discards durable progress: it clears the effective traversal and
-any pending entry (settling an in-flight occurrence it abandons as `interrupted`), starts again from the
+any pending entry (settling every task row it leaves in flight as `interrupted`), starts again from the
 immutable bound seed, resets the control budget and invalidates the previous ledger — while visit counters
 and visit-qualified audit rows (tasks, attempts, artifacts, visits) are kept, so historical occurrences stay
 addressable, and a store whose traversal was lost has its counters rebuilt from those rows. It applies to
@@ -214,9 +214,12 @@ reporting a lineage it cannot see.
 
 Practical consequences:
 
-* back up a revisit-aware store by copying its files (the database plus any `-wal`/`-shm`); a SQL dump of a
-  guarded store cannot be restored through a raw connection;
-* writing to a guarded store from `sqlite3` needs the guard function registered on that connection (or the
+* **Backups.** For a live database use SQLite's own backup API (`sqlite3 <store> ".backup <copy>"`, or
+  `Connection.backup()`), which is safe while a writer is running; copying an active database file together
+  with its `-wal`/`-shm` side files is only reliable when no writer is active. A SQL dump restores fine as
+  well — `sqlite3 <store> .dump | sqlite3 <copy>` writes table data before creating the guard triggers, so an
+  unaware connection can replay it, and the copy inherits the guard and the feature level with it.
+* Writing to a guarded store from `sqlite3` needs the guard function registered on that connection (or the
   triggers dropped) — both are outside the supported interface;
 * the only supported way back to `base` is a migration performed by a build that understands the level.
 
