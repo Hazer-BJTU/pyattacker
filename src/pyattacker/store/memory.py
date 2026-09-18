@@ -150,10 +150,9 @@ class MemoryStore:
         return None if artifact is None else _hydrate(artifact, self.backend)
 
     def mark_final(self, pipeline_id: str, seq: int) -> None:
-        key = (pipeline_id, seq)
-        artifact = self._artifacts.get(key)
-        if artifact is not None:
-            self._artifacts[key] = dataclasses.replace(artifact, is_final=True)
+        for key, artifact in list(self._artifacts.items()):
+            if key[0] == pipeline_id:
+                self._artifacts[key] = dataclasses.replace(artifact, is_final=key[1] == seq)
 
     def artifacts(self, pipeline_id: str) -> list[Artifact]:
         items = [a for (pid, _), a in self._artifacts.items() if pid == pipeline_id]

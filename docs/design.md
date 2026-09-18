@@ -138,7 +138,7 @@ resume(spec):
     if rec exists and (rec.spec_digest != spec.spec_digest or rec.seed_digest != spec.seed_digest):
         → PipelineIdentityConflict; preserve existing pipeline and checkpoint
     if rec.state == succeeded and not retry_succeeded:  → skip (counted as skipped)
-    if rec.state in (failed, interrupted) and spec declares control and the newest handoff row is an END:
+    if rec.state in (failed, interrupted) and spec declares control and the newest active handoff row is an END:
         → mark_final(entry artifact) + settle succeeded   # before the linear rule below, which cannot
           decide it: an early END left no artifact at n_tasks - 1; an unusable entry instead rewinds
           the cursor to 0 and emits checkpoint_missing (§4.8.4)
@@ -155,7 +155,7 @@ resume(spec):
                           # the ordinary restart rule below applies
     start = 0
     if rec.state in (failed, interrupted) and rec.n_tasks_done > 0:
-        h = newest handoff row for pid
+        h = newest handoff row for pid with handoff_id > rec.handoff_floor
         if h is not None and h.to_seq is not None and h.to_seq >= rec.n_tasks_done:
             entry = store.get_artifact(pid, h.entry_seq)      # the ledger names the entry state (§4.8.3)
             if entry.available: start = h.to_seq; prev_value = decode(entry)
@@ -164,10 +164,12 @@ resume(spec):
             prev = store.get_artifact(pid, rec.n_tasks_done - 1)
             if prev.available:  start = rec.n_tasks_done; prev_value = decode(prev)
             else:               start = 0   # journal=summary stores no payload → the whole pipeline must be rerun (an event is left behind)
+    if start == 0 and spec declares control:
+        rec.handoff_floor = newest ledger ID (or 0); persist with the reset cursor before tasks
     for seq in range(start, n_tasks):  ...
 ```
 
-The handoff branch is consulted first and is deliberately narrow: only the **newest** ledger row can be
+The handoff branch is consulted first and is deliberately narrow: only the **newest active** ledger row (`handoff_id > handoff_floor`) can be
 pending, because forward-only handoffs have strictly increasing targets, so a row whose `to_seq` is below the
 cursor has been consumed by later forward progress and the ordinary artifact rule applies. A consumed row
 therefore costs nothing, and a pending one resumes at the target without re-running the source task.
@@ -469,7 +471,7 @@ commit rather than through its buffer.)
 Recovery then has exactly one new branch, and it is consulted **before** the linear terminal rules:
 
 ```
-newest ledger row h for the pipeline
+newest ledger row h for the pipeline with handoff_id > rec.handoff_floor
 if rec.state in (failed, interrupted) and h is not None:
     if h.to_seq is None:                 # END that did not finish writing
         entry = artifact(h.entry_seq)
@@ -483,7 +485,13 @@ if rec.state in (failed, interrupted) and h is not None:
         the ordinary artifact(cursor - 1) rule
 ```
 
-Only the newest row can be pending, because forward-only handoffs have strictly increasing targets — a
+On every restart from the seed, persist `rec.handoff_floor = newest ledger ID` with the reset cursor
+before executing tasks. This excludes handoffs from an abandoned execution without deleting history;
+the watermark stays unchanged on a resumed target. SQLite migrates the column with a zero default and
+read-only readers tolerate its absence. A failed SQLite handoff transaction rolls back before any later
+event or cleanup write can commit. Completion selects one final artifact, clearing older final flags.
+
+Only the newest active row can be pending, because forward-only handoffs have strictly increasing targets — a
 `to_seq` below the cursor has necessarily been passed. The `END` branch has to be consulted first because an
 early `END` left no artifact at `n_tasks - 1` at all, so the linear terminal repair cannot even decide the
 case.

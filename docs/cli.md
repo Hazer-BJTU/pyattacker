@@ -331,7 +331,13 @@ A destination is a task name, a task's numeric seq, or `end`, and it must be str
 `end` from the *last* task is refused, because it would have no effect. Every problem is reported as a field
 path — `pipeline.control.edges['judge'][0]: destination 'fetch' (seq 0) is not later than the source
 'judge' (seq 2); v1 handoffs are forward-only` — under `validate` (exit 2) as well as `run`, because both go
-through the same validation entry. `control` is the only key; there is no `mode` in this version.
+through the same validation entry. `edges` is the only key inside `control`; there is no `mode` in this version.
+
+Numeric source keys work across YAML, JSON and TOML: JSON/TOML spell seq 0 as the key `"0"`
+(e.g. `"edges": {"0": [2]}`). An exact task name takes precedence over a numeric string. Numeric
+destinations remain integers. Declaring the same source twice through a name and a seq is an error,
+rather than silently replacing one list. Effective configuration uses numeric seqs for repeated or
+reserved (`end`) names instead of inventing a `name#N` syntax.
 
 The feature is **advanced**: it changes the execution model, so it is opt-in, marked experimental until 1.0,
 and needs a store that can commit a handoff atomically (both built-in backends can). Pipelines without the

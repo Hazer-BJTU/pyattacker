@@ -199,10 +199,15 @@ class ControlPlan:
         }
 
     def describe(self) -> dict[str, Any]:
-        """The declaration as the effective config shows it: task names, ``"end"`` for the terminal."""
+        """A reusable declaration, with numeric seqs for ambiguous or reserved names."""
+
+        def token(seq: int) -> str | int:
+            name = self.task_names[seq]
+            return seq if name == END or self.task_names.count(name) > 1 else name
+
         return {
             "edges": {
-                self.task_names[from_seq]: [self._render(target) for target in targets]
+                token(from_seq): [END if target is None else token(target) for target in targets]
                 for from_seq, targets in sorted(self.edges.items())
             }
         }
@@ -290,15 +295,22 @@ def build_control(raw: Any, task_names: Sequence[str]) -> ControlPlan:
             raise PipelineBuildError(
                 f"{path}: an edge source must be a task name or a seq, got {type(token).__name__}"
             )
-        if isinstance(token, int):
-            if not 0 <= token < len(names):
+        # JSON/TOML object keys are strings. Accept canonical seq keys when they
+        # do not name an actual task, so numeric disambiguation works in every format.
+        source_seq = token
+        if isinstance(token, str) and token not in names and token.isascii() and token.isdecimal():
+            source_seq = int(token) if str(int(token)) == token else token
+        if isinstance(source_seq, int):
+            if not 0 <= source_seq < len(names):
                 raise PipelineBuildError(
-                    f"{path}: no task at seq {token}; the chain has {len(names)} task(s) "
+                    f"{path}: no task at seq {source_seq}; the chain has {len(names)} task(s) "
                     f"(seq 0..{len(names) - 1})"
                 )
-            from_seq = token
+            from_seq = source_seq
         else:
             from_seq = _lookup_name(token, names, where=path, kind="source")
+        if from_seq in edges:
+            raise PipelineBuildError(f"{path}: duplicate source for seq {from_seq}; use one name or seq entry")
         if not isinstance(destinations, (list, tuple)):
             raise PipelineBuildError(
                 f"{path}: destinations must be a list, got {type(destinations).__name__}"

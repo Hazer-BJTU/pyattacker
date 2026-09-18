@@ -751,11 +751,13 @@ def test_a_store_created_before_the_feature_stays_readable(tmp_path):
         assert report.stats["handoffs_total"] == 0
     raw = sqlite3.connect(db)
     raw.execute("DROP TABLE handoffs")
+    raw.execute("ALTER TABLE pipelines DROP COLUMN handoff_floor")
     raw.commit()
     raw.close()
 
     reopened = SqliteStore(db, read_only=True)
     try:
+        assert reopened.get_pipeline(pid).handoff_floor == 0
         assert reopened.handoffs() == []
         assert reopened.handoffs(pipeline_id=pid) == []
         assert reopened.stats()["handoffs_total"] == 0
@@ -763,6 +765,15 @@ def test_a_store_created_before_the_feature_stays_readable(tmp_path):
         assert row["handoffs"] == []
     finally:
         reopened.close()
+    upgraded = SqliteStore(db)
+    try:
+        record = upgraded.get_pipeline(pid)
+        assert record.handoff_floor == 0
+        record.handoff_floor = 7
+        upgraded.upsert_pipeline(record)
+        assert upgraded.get_pipeline(pid).handoff_floor == 7
+    finally:
+        upgraded.close()
 
 
 def test_a_capability_less_store_keeps_working_for_ordinary_pipelines(tmp_path):
@@ -1123,3 +1134,216 @@ def test_the_ledger_survives_a_reopened_store(tmp_path):
         assert reopened.get_artifact(pid, 3) is None
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize("sqlite", [False, True])
+@pytest.mark.parametrize("destination", ["target", "end"])
+@pytest.mark.parametrize("restart", ["forced", "missing_payload"])
+def test_old_handoff_is_not_reused_after_whole_pipeline_restart(tmp_path, sqlite, destination, restart):
+    store = SqliteStore(tmp_path / "restart.db") if sqlite else MemoryStore()
+    phase = ["handoff"]
+    calls = []
+
+    @task("source")
+    def source(value, ctx):
+        calls.append("source")
+        if phase[0] == "handoff":
+            return Handoff.to(destination, "old payload")
+        if phase[0] == "fail" and restart == "forced":
+            raise FatalError("new execution failed before its handoff")
+        return "fresh payload"
+
+    @task("middle")
+    def middle(value, ctx):
+        calls.append("middle")
+        if phase[0] == "fail":
+            raise FatalError("new execution checkpointed source, then failed")
+        return value
+
+    @task("target")
+    def target(value, ctx):
+        calls.append("target")
+        return value
+
+    template = pipeline("restart", source | middle | target,
+                        control={"edges": {"source": [destination]}})
+    spec = template.bind("seed")
+    runner = Runner(store=store, concurrency=1, handle_signals=False)
+    try:
+        assert runner.run([spec], run_id="old").stats["pipelines"]["by_state"]["succeeded"] == 1
+        phase[0] = "fail"
+        if restart == "forced":
+            runner.config = replace(runner.config, retry_succeeded=True)
+        else:
+            record = store.get_pipeline(spec.pipeline_id)
+            record.state = "interrupted"
+            record.n_tasks_done = 3 if destination == "end" else 2
+            store.upsert_pipeline(record)
+            entry_seq = store.handoffs()[0].entry_seq
+            if sqlite:
+                store._conn.execute("DELETE FROM artifacts WHERE pipeline_id=? AND seq=?",
+                                    (spec.pipeline_id, entry_seq))
+                store._conn.commit()
+            else:
+                store._artifacts.pop((spec.pipeline_id, entry_seq))
+        assert runner.run([spec], run_id="restart").stats["pipelines"]["by_state"]["failed"] == 1
+        phase[0] = "ordinary"
+        if sqlite:
+            runner.close()
+            store = SqliteStore(tmp_path / "restart.db")
+            runner = Runner(store=store, concurrency=1, handle_signals=False)
+        else:
+            runner.config = replace(runner.config, retry_succeeded=False)
+        calls.clear()
+        assert runner.run([spec], run_id="resume").stats["pipelines"]["by_state"]["succeeded"] == 1
+        assert calls == (["source", "middle", "target"] if restart == "forced" else ["middle", "target"])
+        assert store.get_pipeline(spec.pipeline_id).handoff_floor == store.handoffs()[0].handoff_id
+        assert len(store.handoffs()) == 1
+        finals = [a for a in store.artifacts(spec.pipeline_id) if a.is_final]
+        assert len(finals) == 1
+        assert finals[0].seq == 2
+    finally:
+        runner.close()
+
+
+@pytest.mark.parametrize("failure_stage", ["attempt", "cursor"])
+def test_sqlite_handoff_failure_rolls_back_before_cleanup_writes(tmp_path, monkeypatch, failure_stage):
+    store = SqliteStore(tmp_path / "atomic.db")
+
+    @task("source")
+    def source(value, ctx):
+        return Handoff.end("payload")
+
+    spec = pipeline("atomic", source | echo, control={"edges": {"source": ["end"]}}).bind("seed")
+    def fail_attempt(attempt):
+        raise RuntimeError("attempt insert failed")
+
+    if failure_stage == "attempt":
+        monkeypatch.setattr(store, "_write_attempt", fail_attempt)
+    else:
+        # Fail after artifact, task, attempt, ledger and finality writes have all happened.
+        store._conn.execute(
+            "CREATE TRIGGER fail_handoff_cursor BEFORE UPDATE ON pipelines "
+            "WHEN NEW.n_tasks_done > OLD.n_tasks_done BEGIN "
+            "SELECT RAISE(ABORT, 'cursor update failed'); END"
+        )
+        store._conn.commit()
+    runner = Runner(store=store, handle_signals=False)
+    try:
+        assert runner.run([spec]).stats["pipelines"]["by_state"]["failed"] == 1
+        assert store.handoffs() == []
+        assert store.attempts() == []
+        assert [a.seq for a in store.artifacts(spec.pipeline_id)] == [-1]
+        assert store.tasks(spec.pipeline_id)[0].state == "running"
+        assert store.get_pipeline(spec.pipeline_id).n_tasks_done == 0
+        # The Runner has already written failure events and finished the run. Reopening
+        # verifies those commits did not accidentally land the partial handoff.
+        probe = SqliteStore(tmp_path / "atomic.db", read_only=True)
+        try:
+            assert probe.handoffs() == []
+            assert [a.seq for a in probe.artifacts(spec.pipeline_id)] == [-1]
+        finally:
+            probe.close()
+    finally:
+        runner.close()
+
+
+def test_control_rejects_two_aliases_for_same_source():
+    with pytest.raises(PipelineBuildError, match="duplicate source"):
+        build_control({"edges": {"source": [1], 0: ["end"]}}, ["source", "target"])
+
+
+def test_effective_control_preserves_numeric_disambiguation():
+    plan = build_control({"edges": {0: [2, "end"], 1: [2]}}, ["repeat", "repeat", "end"])
+    assert plan.describe() == {"edges": {0: [2, "end"], 1: [2]}}
+    assert build_control(plan.describe(), plan.task_names).fingerprint() == plan.fingerprint()
+
+
+def test_handoff_escape_only_applies_to_return_union():
+    from typing import Literal
+
+    from pyattacker.pipeline import _compatible
+
+    assert not _compatible(int, Handoff)
+    assert not _compatible(Literal[Handoff], int)
+    assert _compatible(Handoff | int, int)
+
+
+@pytest.mark.parametrize("format", ["json", "toml", pytest.param("yaml", marks=pytest.mark.requires_yaml)])
+def test_numeric_control_sources_in_config_formats(tmp_path, format):
+    # All tasks repeat the same name, so only seqs can identify the source/target.
+    config = {"pipeline": {"name": "numeric", "tasks": [{"use": "pyattacker.tasks:echo"}] * 3,
+                           "control": {"edges": {"0": [2]}}}}
+    path = tmp_path / f"numeric.{format}"
+    if format == "json":
+        path.write_text(json.dumps(config))
+    elif format == "toml":
+        path.write_text('[pipeline]\nname = "numeric"\ntasks = [{use = "pyattacker.tasks:echo"}, {use = "pyattacker.tasks:echo"}, {use = "pyattacker.tasks:echo"}]\n'
+                        '[pipeline.control.edges]\n"0" = [2]\n')
+    else:
+        import yaml
+        path.write_text(yaml.safe_dump(config))
+    spec = load_spec(path)
+    assert spec.template.control.edges == {0: (2,)}
+    assert cli_main(["validate", "-c", str(path)]) == 0
+
+
+@pytest.mark.parametrize("sqlite", [False, True])
+def test_active_handoff_survives_multiple_failed_resumes(tmp_path, sqlite):
+    store = SqliteStore(tmp_path / "resumes.db") if sqlite else MemoryStore()
+    calls = []
+    failures = [2]
+
+    @task("source")
+    def source(value, ctx):
+        calls.append("source")
+        return Handoff.to("target", "checkpoint")
+
+    @task("target")
+    def target(value, ctx):
+        calls.append("target")
+        assert value == "checkpoint"
+        if failures[0]:
+            failures[0] -= 1
+            raise FatalError("target failure")
+        return value
+
+    spec = pipeline("resumes", source | echo | target,
+                    control={"edges": {"source": ["target"]}}).bind("seed")
+    runner = Runner(store=store, handle_signals=False)
+    try:
+        for index in range(3):
+            report = runner.run([spec], run_id=f"resume-{index}")
+            assert report.stats["pipelines"]["by_state"] == {"failed" if index < 2 else "succeeded": 1}
+        assert calls == ["source", "target", "target", "target"]
+        assert len(store.handoffs()) == 1
+        assert store.get_pipeline(spec.pipeline_id).handoff_floor == 0
+    finally:
+        runner.close()
+
+
+def test_numeric_source_key_prefers_exact_task_name():
+    assert build_control({"edges": {"0": [2]}}, ["a", "0", "b"]).edges == {1: (2,)}
+
+
+@pytest.mark.parametrize("sqlite", [False, True])
+def test_repeated_end_completion_has_one_final_artifact(tmp_path, sqlite):
+    store = SqliteStore(tmp_path / "final.db") if sqlite else MemoryStore()
+    payload = ["first"]
+
+    @task("source")
+    def source(value, ctx):
+        return Handoff.end(payload[0])
+
+    spec = pipeline("final", source | echo, control={"edges": {"source": ["end"]}}).bind("seed")
+    runner = Runner(store=store, retry_succeeded=True, handle_signals=False)
+    try:
+        runner.run([spec])
+        payload[0] = "second"
+        runner.run([spec])
+        finals = [a for a in store.artifacts(spec.pipeline_id) if a.is_final]
+        assert len(finals) == 1
+        assert json.loads(finals[0].payload) == "second"
+        assert len(store.handoffs()) == 2
+    finally:
+        runner.close()

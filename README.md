@@ -275,6 +275,11 @@ commit a handoff atomically is refused up front instead of writing a jump that w
 Walkthrough: [tutorial step 15](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md#step-15--advanced-skipping-stations-handoffs).
 Model and rules: [design §4.8](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/design.md#48-advanced-handoffs--declared-forward-jumps-opt-in-experimental).
 
+When a pipeline restarts from the seed, previous handoffs stay in its history but no longer act as
+checkpoints. A later resume follows only the current execution's handoffs, and completion selects one
+final artifact. Custom stores supporting handoffs must persist the durable `handoff_floor` watermark
+alongside the cursor; see the [recovery contract](docs/reference.md#tables-and-readers).
+
 ## Running It Across Processes (Sharding)
 
 SQLite takes one writer and the kernel is a single event loop, so scale means **processes with their own

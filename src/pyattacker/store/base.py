@@ -44,7 +44,7 @@ __all__ = [
 ]
 
 PIPELINE_STATES = ("pending", "running", "succeeded", "failed", "interrupted", "canceled")
-TASK_STATES = ("pending", "running", "succeeded", "failed", "interrupted", "canceled")
+TASK_STATES = ("pending", "running", "succeeded", "failed", "interrupted", "canceled", "handed_off")
 
 # Rows a paged store may hold in Python at once. One batch is a fixed, small working set, which is
 # what keeps an export's memory independent of the table's row count.
@@ -113,6 +113,9 @@ class PipelineRecord:
         spec_digest: Digest of the task chain's fingerprint (see ``pipeline.compute_spec_digest``);
             differs from ``seed_digest`` in scope — this changes when the *code* changes, not the data.
         resume_of: The run_id this pipeline was last resumed from, when it was; ``None`` otherwise.
+        handoff_floor: Durable ledger watermark. Rows with ``handoff_id <= handoff_floor`` are
+            historical and must not drive recovery after a restart from the seed. Custom stores
+            supporting handoffs must preserve this field on pipeline writes and reads.
         attempts_total: Cumulative attempts across every task in this pipeline (not just the
             current one), persisted synchronously so a crash mid-backoff does not lose the count.
     """
@@ -136,6 +139,8 @@ class PipelineRecord:
     spec_digest: str = ""
     resume_of: str | None = None
     attempts_total: int = 0
+    # Ledger rows at/below this durable watermark belong to an abandoned execution.
+    handoff_floor: int = 0
 
 
 @dataclass
@@ -327,6 +332,8 @@ class Store(Protocol):
 
     def mark_final(self, pipeline_id: str, seq: int) -> None:
         """Mark the last artifact of a pipeline as the final output.
+
+        Select this artifact as the sole final output, clearing prior final flags for the pipeline.
 
         **Idempotent by contract**: marking an artifact that is already final succeeds and performs no
         further side effect. Crash recovery can re-enter this call — a terminal repair that marked the

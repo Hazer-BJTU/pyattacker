@@ -1142,12 +1142,23 @@ and the repair attempt lives in the event stream (`pipeline.terminal_repair_fail
 output as the state of the pipelines, not as the history of every attempt; the live `run` exit code is the
 authoritative signal for the attempt it just made.
 A control-enabled pipeline adds one branch, consulted **before** those rules
-([handoffs](#advanced-handoffs-opt-in)): if the newest ledger row's target is at or ahead of the cursor, the
+([handoffs](#advanced-handoffs-opt-in)): if the newest active ledger row's target is at or ahead of the cursor, the
 run resumes *at that target* with the recorded entry artifact and never re-runs the source task, and a
 durable `END` row is settled from its own entry artifact. A row whose target is behind the cursor has been
 consumed by later forward progress, so the ordinary `artifact(cursor - 1)` rule applies instead. If the
 entry payload is gone (`journal=summary`, a null backend, a deleted blob) the pipeline restarts from the seed
 with `pipeline.checkpoint_missing`, exactly like a lost linear checkpoint.
+
+A restart from seq 0 (including `retry_succeeded` and an unusable checkpoint) durably advances
+`PipelineRecord.handoff_floor` to the latest ledger ID before task execution. Rows at or below that
+watermark remain in the append-only history and export, but cannot drive recovery for the new execution.
+The watermark survives subsequent resumes and process restarts; filtering by the current `run_id` would
+incorrectly discard a valid handoff after a second interrupted resume. Custom stores offering handoffs
+must persist this field on pipeline reads and writes. Writable SQLite opens migrate older databases with
+a default of zero; read-only tools treat a missing column as zero without migrating.
+
+Successful completion selects exactly one `is_final` artifact per pipeline, clearing old final flags
+from earlier executions. Historical payloads and ledger rows remain available for inspection.
 
 `mark_final` is therefore contractually idempotent, and it is skipped outright when the artifact is already
 final.
@@ -1233,6 +1244,10 @@ not expose the method, and opening a pipeline that declares `control` on such a 
 oldest first, and `limit` keeps the newest N (oldest first), like `events`/`attempts`. `supports_handoff(store)`
 is the probe: it unwraps `WriteBehindStore`, which forwards the capability with a flush of buffered
 attempts/events first, and writes the handed-off attempt through the commit rather than through its buffer.
+Failures must roll back database writes before any later event or cleanup write. An external blob backend
+may retain an unreferenced blob after failure; it must not make a partially committed checkpoint visible.
+Handoff-capable stores must also preserve `PipelineRecord.handoff_floor` across writes and reads (see the
+restart rule above).
 Both built-in backends implement it; a third-party store that does not simply cannot run control-enabled
 pipelines, while ordinary pipelines on it are untouched.
 

@@ -1229,6 +1229,8 @@ class Runner:
         if resumable and spec.control is not None and supports_handoff(self.store):
             assert record is not None  # narrowed by `resumable`; kept explicit for readers
             pending = self._latest_handoff(spec.pipeline_id)
+            if pending is not None and (pending.handoff_id or 0) <= record.handoff_floor:
+                pending = None
             if pending is not None and pending.to_seq is None:
                 if self._settle_terminal_cursor(spec, record, run_id, handoff=pending):
                     return None
@@ -1295,6 +1297,11 @@ class Runner:
             seed_digest=spec.seed_digest,
             spec_digest=spec.spec_digest,
         )
+        # Before any seed replay, durably invalidate the previous execution's ledger
+        # with the reset cursor. Keep the watermark unchanged on target resumes.
+        if start_index == 0 and spec.control is not None and supports_handoff(self.store):
+            latest = self._latest_handoff(spec.pipeline_id)
+            record.handoff_floor = (latest.handoff_id or 0) if latest is not None else 0
         record.run_id = run_id
         record.state = "running"
         record.started_at = record.started_at or time.time()

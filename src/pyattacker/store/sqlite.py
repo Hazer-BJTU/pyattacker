@@ -70,7 +70,8 @@ CREATE TABLE IF NOT EXISTS pipelines (
     traceback TEXT,
     seed_digest TEXT NOT NULL DEFAULT '',
     spec_digest TEXT NOT NULL DEFAULT '',
-    resume_of TEXT
+    resume_of TEXT,
+    handoff_floor INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_pipelines_run ON pipelines(run_id, state);
 CREATE INDEX IF NOT EXISTS idx_pipelines_state ON pipelines(state);
@@ -250,6 +251,10 @@ class SqliteStore:
         if "blob_ref" not in columns:
             self._conn.execute("ALTER TABLE artifacts ADD COLUMN blob_ref TEXT")
 
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(pipelines)")}
+        if "handoff_floor" not in columns:
+            self._conn.execute("ALTER TABLE pipelines ADD COLUMN handoff_floor INTEGER NOT NULL DEFAULT 0")
+
     # ------------------------------------------------------------------ runs
     def start_run(self, run: RunRecord) -> RunRecord:
         run.heartbeat_at = run.started_at
@@ -292,20 +297,20 @@ class SqliteStore:
         self._conn.execute(
             "INSERT INTO pipelines (pipeline_id,run_id,name,key,state,tags_json,created_at,started_at,"
             "finished_at,n_tasks_total,n_tasks_done,attempts_total,failed_task,error_type,error_message,"
-            "traceback,seed_digest,spec_digest,resume_of) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "traceback,seed_digest,spec_digest,resume_of,handoff_floor) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(pipeline_id) DO UPDATE SET run_id=excluded.run_id, state=excluded.state, "
             "started_at=excluded.started_at, finished_at=excluded.finished_at, "
             "n_tasks_total=excluded.n_tasks_total, n_tasks_done=excluded.n_tasks_done, "
             "attempts_total=excluded.attempts_total, failed_task=excluded.failed_task, "
             "error_type=excluded.error_type, error_message=excluded.error_message, "
-            "traceback=excluded.traceback, resume_of=excluded.resume_of",
+            "traceback=excluded.traceback, resume_of=excluded.resume_of, handoff_floor=excluded.handoff_floor",
             (
                 record.pipeline_id, record.run_id, record.name, record.key, record.state,
                 _dumps(record.tags), record.created_at, record.started_at, record.finished_at,
                 record.n_tasks_total, record.n_tasks_done, record.attempts_total, record.failed_task,
                 record.error_type, record.error_message, record.traceback, record.seed_digest,
-                record.spec_digest, record.resume_of,
+                record.spec_digest, record.resume_of, record.handoff_floor,
             ),
         )
         self._conn.commit()
@@ -395,7 +400,7 @@ class SqliteStore:
 
     def mark_final(self, pipeline_id: str, seq: int) -> None:
         self._conn.execute(
-            "UPDATE artifacts SET is_final=1 WHERE pipeline_id=? AND seq=?", (pipeline_id, seq)
+            "UPDATE artifacts SET is_final=(seq=?) WHERE pipeline_id=?", (seq, pipeline_id)
         )
         self._conn.commit()
 
@@ -472,6 +477,24 @@ class SqliteStore:
         cursor: int,
         final: bool = False,
     ) -> Artifact | None:
+        """Atomically commit a handoff; any database failure rolls back the transition."""
+        # Roll back every database write if any part fails. Later event/cleanup writes
+        # must never commit a partial transition left on this connection.
+        with self._conn:
+            return self._commit_handoff(
+                record, task=task, attempt=attempt, payload=payload, cursor=cursor, final=final
+            )
+
+    def _commit_handoff(
+        self,
+        record: HandoffRecord,
+        *,
+        task: TaskRecord,
+        attempt: AttemptRecord,
+        payload: Encoded | None = None,
+        cursor: int,
+        final: bool = False,
+    ) -> Artifact | None:
         """One transaction: task row + handed-off attempt + payload artifact + ledger row + cursor.
 
         See the capability contract in ``store/base.py``. The payload's ``seq`` is allocated here as
@@ -532,8 +555,8 @@ class SqliteStore:
             # mirrors settle_pipeline — a resumed pipeline that finishes here must not keep the previous
             # run's error text on a row that is now `succeeded`.
             self._conn.execute(
-                "UPDATE artifacts SET is_final=1 WHERE pipeline_id=? AND seq=?",
-                (record.pipeline_id, record.entry_seq),
+                "UPDATE artifacts SET is_final=(seq=?) WHERE pipeline_id=?",
+                (record.entry_seq, record.pipeline_id),
             )
             self._conn.execute(
                 "UPDATE pipelines SET state='succeeded', n_tasks_done=?, run_id=?, finished_at=?, "
@@ -546,7 +569,6 @@ class SqliteStore:
                 "UPDATE pipelines SET state='running', n_tasks_done=?, run_id=? WHERE pipeline_id=?",
                 (cursor, record.run_id, record.pipeline_id),
             )
-        self._conn.commit()
         return stored
 
     def handoffs(
@@ -1018,6 +1040,7 @@ def _to_pipeline(row: sqlite3.Row) -> PipelineRecord:
         attempts_total=row["attempts_total"], failed_task=row["failed_task"],
         error_type=row["error_type"], error_message=row["error_message"], traceback=row["traceback"],
         seed_digest=row["seed_digest"], spec_digest=row["spec_digest"], resume_of=row["resume_of"],
+        handoff_floor=row["handoff_floor"] if "handoff_floor" in row.keys() else 0,  # noqa: SIM118 (sqlite Row membership checks values)
     )
 
 

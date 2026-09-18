@@ -14,6 +14,7 @@ import functools
 import inspect
 import itertools
 import operator
+import types
 import typing
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -62,11 +63,13 @@ def _without_handoff(annotation: Any) -> Any:
 
     A task that may hand off declares it in its return type (``-> Handoff | Report``). The remaining
     members still have to chain into the next task; an annotation of exactly ``Handoff`` chains with
-    anything, because such a task produces no artifact at all on that path. The accepted side is
-    treated the same way for symmetry — a value passed across an edge is never a ``Handoff``.
+    anything, because such a task produces no artifact at all on that path. The accepted side
+    is not relaxed: the runner never passes a directive as an input value.
     """
     if annotation is Handoff:
         return Any
+    if typing.get_origin(annotation) not in (typing.Union, types.UnionType):
+        return annotation
     members = typing.get_args(annotation)
     if not members or Handoff not in members:
         return annotation
@@ -81,7 +84,6 @@ def _without_handoff(annotation: Any) -> Any:
 
 def _compatible(produced: Any, accepted: Any) -> bool:
     produced = _without_handoff(produced)
-    accepted = _without_handoff(accepted)
     if produced is Any or accepted is Any:
         return True
     if produced is inspect.Parameter.empty or accepted is inspect.Parameter.empty:

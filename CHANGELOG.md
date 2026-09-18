@@ -33,6 +33,14 @@ All notable changes to this project are documented here. The format follows
   the [API reference](docs/reference.md#advanced-handoffs-opt-in) and
   [tutorial step 15](docs/tutorial.md#step-15--advanced-skipping-stations-handoffs).
 
+### Fixed
+
+* Handoff follow-up: isolate historical ledger rows on whole-pipeline restarts with a durable
+  `handoff_floor` watermark (including old-store migration and read-only compatibility); roll back failed
+  SQLite handoff commits; select a single final artifact after reruns; reject duplicate source aliases;
+  preserve numeric source disambiguation in JSON/TOML/YAML and effective config; restrict the annotation
+  escape to return unions containing `Handoff`.
+
 ### Changed
 
 * **The sdist no longer ships the branding images.** `assets/` was in the sdist include list, and PNG
