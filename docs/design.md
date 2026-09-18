@@ -298,6 +298,46 @@ The panel shows: pipeline state distribution, p95/max latency, per-task counts, 
 `active/capacity`, `ready/degraded/dead`, `waiting`, throughput and leak counters, and recent errors.
 It is also usable programmatically: `monitor.render_snapshot(stats)` / `monitor.watch(store)`.
 
+### 4.7 Completion Is Counted, Worker Lifetime Is Supervised
+
+A run finishes when `pipelines_done` reaches `pipelines_admitted`. That invariant only holds if every admitted
+pipeline eventually reaches one of the worker's own terminal paths — and a `BaseException` that is not
+`CancelledError` (a custom subclass raised by a store hook, for instance) reaches none of them: it escapes the
+worker loop, the worker task ends, and the counter completion waits on can never advance. The run used to wait
+forever, silently: no error, no exit code, no terminal row, no event.
+
+Worker lifetime is therefore observed separately from pipeline accounting, through a done-callback on every
+worker task. It also sees a death *after* the handler chain (queue or worker housekeeping), and turns it into
+one run-level fault:
+
+* **stop first, account never.** The run is hard-stopped (`stop("worker_crashed")`, no new admissions) and
+  `pipelines_done` is deliberately *not* incremented to satisfy the counter invariant: the run is not
+  completing normally, and the stop is what releases the waiter.
+* **the pipeline is terminalized.** A `running` row that no live worker owns is the silent state this path
+  exists to remove, so the in-flight pipeline is recorded `failed` — or `interrupted` when the run was already
+  winding down — with the escaping exception on the row. A pipeline that was already terminal when the worker
+  died keeps the state it earned: history is not rewritten. **The persisted row decides, not the runner's
+  in-memory record** — a store is not required to write back into the `PipelineRecord` it was handed, and the
+  item can be a state that came back through the retry queue while a terminal write it already made is
+  durable, so trusting memory would rewrite a `succeeded` row (or an ordinary failure with its own
+  provenance) as the crash. If the row does not exist yet it is created, the same way the internal-error path
+  does it.
+* **the work queue is released.** A full queue is only ever drained by workers, so admission and the shutdown
+  sentinels hand items over through an abort-aware put that gives up as soon as a worker dies. Without it the
+  *producer* would park on the dead worker's queue and the run would hang one step earlier.
+* **the fault is explicit.** `runner.worker_crashed` names the pipeline, the exception and its traceback, and
+  `run_async` raises `WorkerCrashed` — original exception as `__cause__` — after the run record has been
+  closed as `interrupted`. If the store cannot record the crash either, the existing `StoreUnavailable` fatal
+  path is taken instead of retrying a broken store.
+
+`KeyboardInterrupt` and `SystemExit` are the boundary: asyncio re-raises them out of the task so the loop
+stops, which means no done-callback can run at all. A narrow guard inside the worker records the row and the
+event before they continue on their way, but the loop still tears down: the caller sees its own interrupt and
+the run record is not closed. A `BaseException` raised *by a task* is not involved in any of this — the task's
+own handling contains it, exactly like an ordinary exception. Cancellation is untouched too: a cancelled
+worker still marks its pipeline `interrupted` and re-raises, and supervision does not turn a deliberate cancel
+into a crash.
+
 ---
 
 ## 5. Data Model (SQLite, WAL + `synchronous=NORMAL`)

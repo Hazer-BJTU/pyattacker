@@ -867,3 +867,44 @@ def test_a_failed_terminal_repair_is_visible_to_the_caller_and_exits_non_zero(
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert payload["repair_failures"] == 1
     assert payload["pipelines"]["by_state"] == {}
+
+
+# ---------------------------------------------------------- worker liveness (#44)
+class _WorkerDied(BaseException):
+    """A direct ``BaseException``: nothing in the worker's own handler chain can contain it."""
+
+
+class _CrashingFinalStore(SqliteStore):
+    """A store whose final-write hook dies, like a broken third-party backend."""
+
+    def mark_final(self, pipeline_id, seq):  # type: ignore[override]
+        raise _WorkerDied("store hook died mid-pipeline")
+
+
+def _crashing_open_store(spec, **kwargs):
+    return _CrashingFinalStore(
+        str(spec), journal=kwargs.get("journal", "full"), backend=kwargs.get("backend")
+    )
+
+
+def test_a_worker_crash_exits_non_zero_with_a_named_error(tmp_path, monkeypatch, capsys):
+    """Before worker supervision existed this shape hung forever: no error, no exit code, no record.
+
+    The CLI now gets a named run-level error, and the pipeline that died keeps a terminal row.
+    """
+    db = tmp_path / "crash.db"
+    cfg = _write_config(tmp_path, "crash.json", REPAIR_CONFIG)
+
+    monkeypatch.setattr("pyattacker.runner.open_store", _crashing_open_store)
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 2
+
+    err = capsys.readouterr().err
+    assert "WorkerCrashed" in err
+    assert "_WorkerDied: store hook died mid-pipeline" in err
+
+    store = SqliteStore(str(db))
+    rows = store.pipelines()
+    assert [row.state for row in rows] == ["failed"]
+    assert rows[0].error_type == "WorkerCrashed"
+    assert "runner.worker_crashed" in [e.kind for e in store.events(limit=50)]
+    store.close()

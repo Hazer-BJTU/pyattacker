@@ -8,6 +8,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+* **A worker that dies outside its own handlers no longer hangs the run.** Run completion was tracked purely
+  by pipeline counters (`pipelines_done` against `pipelines_admitted`), so a `BaseException` that is not
+  `CancelledError` — a custom subclass raised by a store or backend hook, for example — escaped the worker's
+  handler chain, ended the task, and left the run waiting forever on a condition the dead worker could no
+  longer satisfy: no error, no exit code, no terminal row and no event (only asyncio's "Task exception was
+  never retrieved" on stderr). Worker lifetime is now supervised separately from pipeline accounting, by a
+  done-callback on every worker task that also sees a death *after* the handler chain (queue or worker
+  housekeeping). The run is hard-stopped (`stop_reason == "worker_crashed"`) without manufacturing
+  `pipelines_done`; the pipeline the dead worker was holding is recorded `failed` — or `interrupted` when the
+  run was already winding down — with the escaping exception on the row, or created if the crash happened
+  before its row existed, while a pipeline that was already terminal keeps the state it earned; admission and
+  the shutdown sentinels hand items over through an abort-aware put, so a producer parked on the full queue of
+  a dead worker is released instead of hanging one step earlier; `runner.worker_crashed` records the pipeline,
+  the exception and its traceback; and `run_async` raises the new `WorkerCrashed` (original exception as
+  `__cause__`) after closing the run record as `interrupted`, with the CLI exiting 2 on a named error. If the
+  store cannot record the crash either, the existing `StoreUnavailable` fatal path is taken instead of
+  retrying a broken store. `KeyboardInterrupt`/`SystemExit` still tear the loop down, so a narrow guard inside
+  the worker records the row and the event before they continue on their way. Cancellation and the ordinary
+  internal-`Exception` recovery path are unchanged.
 * **A pipeline whose cursor already reached the end can be resumed again.** The success path advanced the
   checkpoint cursor and wrote the terminal state as two separate store calls, so a store failure in the
   final write (or a kill between the two) could leave a `failed`/`interrupted` row with

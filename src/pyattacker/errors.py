@@ -29,6 +29,7 @@ __all__ = [
     "BudgetExceeded",
     "RunInterrupted",
     "StoreUnavailable",
+    "WorkerCrashed",
     "ERROR_CLASSES",
     "error_class_of",
     "retry_after_of",
@@ -138,6 +139,27 @@ class StoreUnavailable(PyAttackerError):
     durability guarantees can no longer be trusted, so the run stops instead of continuing on
     unrecorded state.
     """
+
+
+class WorkerCrashed(PyAttackerError):
+    """A worker task ended outside its own handlers, so the run could not finish normally.
+
+    The escaping exception — any ``BaseException`` that is not :class:`asyncio.CancelledError`,
+    raised by the framework's own code or by something it calls (a store hook, for example) — is
+    preserved as ``__cause__``. A ``BaseException`` raised *by a task* never reaches this path: the
+    task's own handling contains it, exactly like an ordinary exception.
+
+    Worker *lifetime* is supervised separately from pipeline *accounting*: a worker that died can
+    no longer advance either, so the run is stopped hard (no new admissions, no waiting on
+    in-flight work), the pipeline the dead worker was holding is given a terminal row, and that
+    fact is recorded as a ``runner.worker_crashed`` event before this error is raised. Ordinary
+    internal ``Exception`` handling is unaffected: this is for a worker that never reached the
+    worker's own error paths at all.
+    """
+
+    def __init__(self, message: str = "", *, pipeline_id: str | None = None) -> None:
+        super().__init__(message)
+        self.pipeline_id = pipeline_id
 
 
 # --------------------------------------------------------------------------

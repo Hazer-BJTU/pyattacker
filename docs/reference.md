@@ -23,7 +23,7 @@ shaped this way.
 |---|---|
 | [Tasks](#tasks) | `task`, `build_task_spec`, `TaskSpec`, `Retrying`, `TaskContext`, `with_retry` |
 | [Pipelines](#pipelines) | `pipeline`, `PipelineTemplate`, `PipelineSpec`, `Chain`, `compute_spec_digest` |
-| [Running](#running) | `Runner`, `RunConfig`, `RunReport` |
+| [Running](#running) | `Runner`, `RunConfig`, `RunReport`, worker liveness |
 | [Resources](#resources) | `Resource`, `Pool`, `Lease`, `PoolStats`, `Bus`, `ResourceState`, `ResourceEvent` |
 | [Acquire algorithms](#acquire-algorithms) | `Wait`, `Backoff`, `LeastBusy`, `Failover`, `Sticky`, `QuotaAware`, `Immediate`, `resolve_algorithm` |
 | [Errors](#errors) | the exception hierarchy, `error_class_of` |
@@ -488,6 +488,41 @@ if report.status != "completed" or failed:
     raise SystemExit(1)                                  # fail your CI job
 ```
 
+### Worker liveness
+
+Completion is counted, so a run needs every admitted pipeline to reach a terminal state. A worker that dies
+outside its own handlers — a `BaseException` that is not `CancelledError`, raised by the framework's own code
+or by something it calls, such as a third-party store hook — can no longer reach one, and the run would
+otherwise wait forever. Instead:
+
+* the run is hard-stopped (`stop_reason == "worker_crashed"`), so peer workers are cut off too and nothing
+  new is admitted;
+* the pipeline the dead worker was holding is recorded `failed` — or `interrupted` if the run was already
+  stopping — with the escaping exception on the row; a pipeline that was already terminal keeps its state,
+  which is read from the store rather than from the runner's in-memory record (a store need not write back
+  into the record it was handed, so the persisted row is the one that counts);
+* a `runner.worker_crashed` event carries the pipeline, the exception and its traceback;
+* `run_async` raises `WorkerCrashed` (after the run record is closed as `interrupted`), with the original
+  exception as `__cause__`. `run()` propagates it and the CLI exits 2 with a named error, so a crashed worker
+  cannot look like a completed run.
+
+```python
+from pyattacker import WorkerCrashed
+
+with Runner(store="runs/qa.db", pools=[pool]) as runner:
+    try:
+        report = runner.run(template.map(rows))
+    except WorkerCrashed as exc:
+        print(f"lost {exc.pipeline_id}: {exc.__cause__!r}")   # the run's record is already durable
+        raise
+```
+
+A `BaseException` raised *by a task* never reaches this path (the task's own handling contains it like an
+ordinary exception), and cancellation keeps its semantics: a cancelled worker records `interrupted` and
+re-raises. `KeyboardInterrupt` and `SystemExit` are the one boundary: asyncio stops the loop before any
+supervisor can run, so the worker records the row and the event itself and the interrupt still propagates
+unchanged — the caller sees its own interrupt, and only that run record is left unfinishable.
+
 ---
 
 ## Resources
@@ -795,7 +830,8 @@ PyAttackerError
 ├── BudgetExceeded           a run budget was spent
 ├── RunInterrupted           the run was stopped
 ├── CorruptCheckpoint        a stored checkpoint contradicts the pipeline definition
-└── StoreUnavailable         the store became untrustworthy
+├── StoreUnavailable         the store became untrustworthy
+└── WorkerCrashed            a worker died outside its own handlers
 ```
 
 ### Error classes
