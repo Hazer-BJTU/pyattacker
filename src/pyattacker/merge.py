@@ -24,8 +24,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from .errors import ConfigError
 from .export import write_rows
-from .store.base import Store
+from .store.base import Store, handoff_row
 
 __all__ = ["MergedReport", "merge_reports", "STATE_RANK"]
 
@@ -47,6 +48,16 @@ class MergedReport:
     # pretending to be a de-duplicated workload count.
     source_events_total: int = 0
     repair_failures: int = 0
+
+    @property
+    def events_total(self) -> int:
+        """Deprecated alias of :attr:`source_events_total`, removed at 1.0.
+
+        The old name is deliberately kept **off** ``stats()``: the point of the rename (issue #59) was that a
+        report cannot carry the de-duplicated counters and the raw event log under names that do not say which
+        is which. On the object it costs nothing and spares a caller a rename.
+        """
+        return self.source_events_total
 
     # ----------------------------------------------------------------- views
     def stats(self) -> dict[str, Any]:
@@ -133,6 +144,35 @@ class MergedReport:
         return write_rows(self.rows, path, fmt=fmt, title=f"merged from {len(self.sources)} stores")
 
 
+def _countable_row(store: Any, row: Mapping[str, Any], source: str) -> Mapping[str, Any]:
+    """Make one exported pipeline row countable, or say precisely why it is not.
+
+    De-duplicating first and counting from the surviving rows means two fields have to be readable off a row
+    (issue #59). They are not equally negotiable:
+
+    * ``attempts_total`` is a core part of a pipeline row — ``PipelineRecord.attempts_total``, which both
+      built-in stores export. A row without it cannot be counted, and quietly reporting ``0`` would be a
+      wrong number that looks like a real one, so this fails loudly and names the row and its source.
+    * the ``handoffs`` ledger is an **optional** capability: a store that predates handoffs has no ledger and
+      genuinely has no jumps. A row that does not nest the ledger is read through the store's own
+      ``handoffs()`` when it has one (the same capability the nesting comes from, serialized by the same
+      :func:`handoff_row`), and only a store with neither counts as zero.
+    """
+    if "attempts_total" not in row:
+        raise ConfigError(
+            f"merge_reports cannot count pipeline row {row.get('pipeline_id')!r} from {source!r}: it has no "
+            "'attempts_total'. A merged report recomputes its counters from the surviving rows instead of "
+            "summing store.stats() per source, so export_rows() must carry the field — both built-in stores "
+            "do. See docs/reference.md, 'Tables and readers'."
+        )
+    if "handoffs" in row:
+        return row
+    ledger = getattr(store, "handoffs", None)
+    if not callable(ledger):
+        return row  # no ledger capability: no ledger rows, which is the truth
+    return {**row, "handoffs": [handoff_row(hop) for hop in ledger(pipeline_id=row["pipeline_id"])]}
+
+
 def _winner(current: Mapping[str, Any], candidate: Mapping[str, Any]) -> Mapping[str, Any]:
     current_rank = STATE_RANK.get(str(current.get("state")), -1)
     candidate_rank = STATE_RANK.get(str(candidate.get("state")), -1)
@@ -182,6 +222,7 @@ def merge_reports(
             for row in store.export_rows(run_id=run_id):
                 key = row["pipeline_id"]
                 run_ids.append(row["run_id"])
+                row = _countable_row(store, row, paths[-1])
                 if key in rows_by_id:
                     duplicates += 1
                     rows_by_id[key] = _winner(rows_by_id[key], row)

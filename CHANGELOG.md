@@ -68,7 +68,11 @@ All notable changes to this project are documented here. The format follows
   `source_events=`. Regression tests cover the same store passed twice (as two paths and as two objects),
   one pipeline present in two shards, and the run-filtered handoff count; `tutorial.md` step 12 now shows
   the identical `attempts=` on both sides of a duplicated merge (whose printed transcript had also drifted
-  from what the program actually prints).
+  from what the program actually prints). Counting from rows strengthens what a custom store must export,
+  so the two fields it reads are now explicit: `attempts_total` is required and a row without it raises a
+  `ConfigError` naming the row and source instead of quietly counting `0`, while a row that does not nest
+  the optional `handoffs` ledger is read through the store's own `handoffs()` capability when it has one
+  (a store with neither has no jumps, which is a true `0`).
 
 * Backward-traversal follow-up: an explicit fresh start now resets a backward pipeline's control budget
   while preserving durable visit counters and audit history (the counters were never reset — reusing visit
@@ -115,7 +119,11 @@ All notable changes to this project are documented here. The format follows
 * **`MergedReport.events_total` is renamed `source_events_total`** (issue #59). The old name sat in the same
   report as the de-duplicated counters without saying that it was the one number which was not de-duplicated;
   the new name states the scope, `stats()` carries it under the same key, and `summary()` labels it
-  `source_events=`. Nothing else on `MergedReport` changed name.
+  `source_events=`. Nothing else on `MergedReport` changed name. `MergedReport.events_total` survives as a
+  deprecated read-only alias (removed at 1.0) so an attribute read keeps working, but it is deliberately not a
+  second key in `stats()`: the point is that the JSON a report emits names one scope per number. Note that
+  `store.stats()["events_total"]` is untouched and is not the asymmetry it looks like — for a single store it
+  is the same measurement as the merged report's `source_events_total`, which the new test pins.
 
 * **The backward-traversal guide is merged into the tutorial and the reference.** `docs/backward.md` was a
   seventh document that a reader had to find before they could use the feature; its usage now lives where

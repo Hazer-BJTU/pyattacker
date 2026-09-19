@@ -1036,6 +1036,107 @@ def test_merged_handoff_count_is_de_duplicated_and_follows_the_report_scope():
     assert merge_reports([source]).stats()["source_events_total"] == 1
 
 
+def test_a_custom_store_without_the_nested_ledger_is_read_through_its_handoffs_capability():
+    """The ledger is an optional capability. A store that has ``handoffs()`` but does not nest it in its
+    pipeline rows still gets its jumps counted — recomputing from rows must not require a shape only the
+    built-ins happen to produce."""
+    from pyattacker import HandoffRecord
+
+    row = {"pipeline_id": "pipe-1", "run_id": "run-1", "state": "succeeded", "attempts_total": 2}
+    records = [
+        HandoffRecord(pipeline_id="pipe-1", run_id="run-1", from_seq=0, from_task="a", to_seq=2,
+                      to_task="b", entry_seq=0, entry_artifact_id="art-1", reason="skip"),
+        HandoffRecord(pipeline_id="pipe-1", run_id="run-2", from_seq=0, from_task="a", to_seq=2,
+                      to_task="b", entry_seq=0, entry_artifact_id="art-1", reason="an earlier run"),
+    ]
+
+    class _LedgerOnly:
+        path = "ledger.db"
+
+        def stats(self, run_id=None):
+            return {"events_total": 0}
+
+        def export_rows(self, *, run_id=None):
+            return [row]
+
+        def handoffs(self, *, pipeline_id=None, run_id=None, limit=None):
+            return [hop for hop in records if hop.pipeline_id == pipeline_id]
+
+        def events(self, **kwargs):
+            return []
+
+    merged = merge_reports([_LedgerOnly()])
+    assert merged.stats()["handoffs_total"] == 2  # both runs, because the report is not run-filtered
+    assert merge_reports([_LedgerOnly()], run_id="run-2").stats()["handoffs_total"] == 1
+    assert merged.rows[0]["handoffs"][0]["from_task"] == "a"
+
+
+def test_a_pipeline_row_without_attempts_total_is_refused_not_counted_as_zero():
+    """The field is required now that the counters come off the rows: an incomplete row must not produce a
+    wrong number that looks like a real one."""
+    row = {"pipeline_id": "pipe-7", "run_id": "run-1", "state": "succeeded"}
+
+    class _NoAttempts:
+        path = "incomplete.db"
+
+        def stats(self, run_id=None):
+            return {"events_total": 0, "attempts_total": 4}
+
+        def export_rows(self, *, run_id=None):
+            return [row]
+
+        def events(self, **kwargs):
+            return []
+
+    with pytest.raises(ConfigError) as excinfo:
+        merge_reports([_NoAttempts()])
+    message = str(excinfo.value)
+    assert "'pipe-7'" in message and "incomplete.db" in message and "attempts_total" in message
+
+
+def test_a_store_without_any_ledger_capability_simply_has_no_jumps():
+    """No nested ledger *and* no ``handoffs()``: a store that predates the feature, which is 0 — not an
+    error, because the absence is the truth about that store."""
+    row = {"pipeline_id": "pipe-1", "run_id": "run-1", "state": "succeeded", "attempts_total": 1}
+
+    class _Legacy:
+        path = "legacy.db"
+
+        def stats(self, run_id=None):
+            return {"events_total": 0}
+
+        def export_rows(self, *, run_id=None):
+            return [row]
+
+        def events(self, **kwargs):
+            return []
+
+    merged = merge_reports([_Legacy()])
+    assert merged.stats()["handoffs_total"] == 0
+    assert "handoffs=" not in merged.summary()
+
+
+def test_the_old_events_total_name_survives_on_the_object_only(tmp_path):
+    """A deprecated Python-level alias, deliberately not a second key in ``stats()``: the rename exists so
+    that a de-duplicated counter and a raw log total cannot be confused, and the JSON schema should say one
+    thing. The alias only spares a caller an attribute rename.
+
+    It also pins why the rename is *only* a rename: for one store, the merged report's raw total is that
+    store's ``stats()["events_total"]`` — the same measurement, under a name that says where it comes from."""
+    db = tmp_path / "alias.db"
+    _run(db, TWO_STEP, [{"n": 0}, {"n": 1}])
+    store = _open(db)
+    try:
+        per_store = store.stats()["events_total"]
+    finally:
+        store.close()
+
+    merged = merge_reports([str(db)])
+    assert per_store == EXPECTED_COUNTS["events"] == 7
+    assert merged.events_total == merged.source_events_total == per_store
+    assert "events_total" not in merged.stats()
+
+
 
 def test_merge_reports_deduplicates_repair_failures_across_stores(tmp_path):
     """Issue #46: merge_reports must not double-count a pipeline's repair failures across stores."""

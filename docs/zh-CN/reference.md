@@ -1346,7 +1346,7 @@ with closing(open_store("runs/qa.db")) as store:      # reopen a finished run, a
 |---|---|
 | `stats(run_id=None)` | 计数、状态分布、延迟百分位；`handoffs_total` 统计记下来的跳转次数（普通运行为 0） |
 | `errors(*, run_id=None, limit=20)` | 失败项，含任务名、错误类型和消息 |
-| `export_rows(*, run_id=None)` | 嵌套的流水线行：含任务、工件和交接 |
+| `export_rows(*, run_id=None)` | 嵌套的流水线行：含任务、工件和交接；每行都带 `attempts_total`，`merge_reports` 就是从它计数的 |
 | `attempts(*, pipeline_id=None, ...)` | 尝试历史 |
 | `events(*, pipeline_id=None, run_id=None, kind=None, limit=...)` | 事件流，可按事件类型过滤 |
 | `count_events(*, kind=None, run_id=None, pipeline_id=None)` | 匹配事件的精确计数，通过聚合查询（不物化日志） |
@@ -1671,9 +1671,13 @@ merge_reports(paths) -> MergedReport
 `source_events_total` 是刻意的例外，名字就说明了这一点：事件不挂在流水线行上，合并后的行里没有
 任何东西能说清两份副本里哪一份拥有某个事件。它是你传入那些源库的原始总数，重复的部分照样算。
 
-从行里读计数，也是 `merge_reports` 对自定义存储 `export_rows()` 的唯一额外要求：流水线行上的
-`attempts_total`，以及嵌套的 `handoffs` 账本（两个内置存储都会嵌套它，背后的能力是
-`store.handoffs(...)`）。
+从行里读计数，会加强对自定义存储 `export_rows()` 的要求，所以这两个字段值得说清楚：
+
+* **`attempts_total` 是必需的。** 它是流水线行的核心部分（`PipelineRecord.attempts_total`）；缺这个字段
+  的行会抛 `ConfigError`，并指明是哪一行、来自哪个源，而不是悄悄按 `0` 计数。
+* **嵌套的 `handoffs` 账本是可选的**，因为账本本身就是可选能力。行里没有嵌套它时，只要存储自己有
+  `handoffs(pipeline_id=...)`，就从那里读——嵌套本来就来自同一个能力；两样都没有的存储就是没有跳转，
+  记 `0`，这是实话。
 
 | `MergedReport` 成员 | 含义 |
 |---|---|
@@ -1682,6 +1686,7 @@ merge_reports(paths) -> MergedReport
 | `sources` | 哪些存储参与 |
 | `attempts_total`、`handoffs_total` | 从存活的行重算，已去重 |
 | `source_events_total` | 所给源库的原始事件日志行数，**未**去重 |
+| `events_total` | `source_events_total` 的废弃别名，只在对象上（1.0 移除） |
 | `stats()` | 同一批计数，外加重算的流水线与任务统计 |
 | `summary()` | 人类可读的摘要 |
 | `errors(limit=20)` | 所有分片的失败 |
