@@ -215,7 +215,7 @@ with Runner(store=":memory:", concurrency=4) as runner:
 
 * **边是显式声明的，不是猜的。** 走了没声明的边，或者一个没有 `control` 块的流水线里出现了 `Handoff`，都是致命配置错误——不重试，也不会静默跳转。目标步骤必须在来源步骤之后；最后一步发起 `end` 会被拒绝（因为没意义）。
 * **交接是一种处置结果，不是失败。** 它是个返回值，所以重试策略根本看不到它，任务里写的 `except Exception:` 也吞不掉它。租约的归还和成功时完全一样，被取消或超时的尝试压根走不到返回这一步。
-* **它是持久化的检查点。** 跳转是原子提交的（源任务、尝试、入口产物、账本记录、游标一起提交），进程被杀了会在目标步骤恢复，带着记录好的入口状态，不会重跑源任务。开了控制流的流水线里，`n_tasks_done` 是个*位置*，不是进度计数——被跳过的步骤没有任务记录。`report`/`watch` 统计选定范围内的提交数（过滤时是单次运行，否则是全部历史）；`/pipelines.handoffs` 统计活跃执行记录，`handoffs_historical` 统计全部账本记录。续跑时可以用之前某次运行的活跃交接，同时不记录新的交接。导出的流水线数据里会带上账本身份和水位标记，用来区分这些范围。
+* **它是持久化的检查点。** 跳转是原子提交的（源任务、尝试、入口产物、账本记录、游标一起提交），进程被杀了会在目标步骤恢复，带着记录好的入口状态，不会重跑源任务。开了控制流的流水线里，`n_tasks_done` 是个*位置*，不是进度计数——被跳过的步骤没有任务记录。`watch` 默认统计选定运行的提交数（`--run-id all` 查看全部历史）；`/pipelines.handoffs` 统计活跃执行记录，`handoffs_historical` 统计全部账本记录。续跑时可以用之前某次运行的活跃交接，同时不记录新的交接。导出的流水线数据里会带上账本身份和水位标记，用来区分这些范围。
 * **不开就完全没影响。** 没有 `control` 块的流水线，一行数据、一个计数器、`spec_digest` 的一个字节都不会变。
 * **往回跳需要单独声明。** `Handoff.rewind(target, value)` 把作者指定的状态送回更早的步骤；`Handoff.retry_all()` 从最初的种子重新开始。需要声明 `control.rewind` / `control.retry_all`，还要设一个有限的 `control.max_handoffs`。可选的 `HistoryArtifact` 载荷可以做显式快照和恢复；普通字典的控制权完全在作者手里。访问记录（visits）和精确的产物出现记录会保留历史，保证恢复安全。API、预算和恢复边界见 [reference → 进阶：反向遍历](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/reference.md#进阶反向遍历rewindretry-allvisits)，可运行的示例见 [tutorial 第 16–17 步](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/tutorial.md#第-16-步--高级用回退和全部重试重新生成)。
 
@@ -322,10 +322,12 @@ uv run pyattacker run -c examples/qa_eval.yaml --artifact-backend file:///data/b
 
 ```bash
 uv run pyattacker serve runs/qa.db        # http://127.0.0.1:8787
-# /  dashboard   /stats  /events  /pipelines  /resources  /errors   (JSON)
+# /  dashboard   /stats  /metrics  /events  /pipelines  /resources  /errors   (JSON)
 ```
 
 每个请求都新开一个只读连接，所以可以和正在跑的进程并存。**没有认证**，只绑回环地址——它没有 artifact 路由，但会暴露这次运行记下来的东西：事件的 `data`、存下来的错误信息。当调试工具用就好，别裸暴露到公网。
+应用可用 `runner.report_metric("accuracy", value, display="percent")` 汇报实时指标；框架只展示，
+不计算指标。参见 [`examples/live_metrics.py`](examples/live_metrics.py)。
 
 **步骤内分支**——`fanout(a, b)` 拿同一份输入并发跑多个任务，返回 `{task_name: value}`。重试粒度变成整个组，这是不把流水线做成 DAG 的代价。组是 Runner 看到的唯一规格，所以子任务们对 `resource`、`algorithm`、`timeout_s` 达成一致时，这些参数从子任务继承（此时 `timeout_s` 限制整个组）。
 

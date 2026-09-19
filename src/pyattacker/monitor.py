@@ -1,4 +1,4 @@
-"""Monitoring —— it cares about **traffic and blocking**, not semantic metrics (scoring is out of scope for the framework).
+"""Monitoring operational state and values explicitly reported by applications.
 
 * :func:`render_snapshot` renders Runner.stats() or store.stats() into a text panel.
 * :func:`watch` periodically reads the store (read-only connection), so it **works across processes** ——
@@ -12,7 +12,9 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
-__all__ = ["render_snapshot", "watch", "read_snapshot"]
+from .reported_metrics import read_reported_metrics
+
+__all__ = ["render_snapshot", "watch", "read_snapshot", "resolve_run_id"]
 
 _BAR = "█"
 _EMPTY = "·"
@@ -45,6 +47,13 @@ def render_snapshot(snapshot: Mapping[str, Any], *, width: int = 20) -> str:
     tasks = snapshot.get("tasks", {}).get("by_name", {})
     if tasks:
         lines.append("tasks       " + " ".join(f"{k}={v}" for k, v in sorted(tasks.items())))
+    metrics = snapshot.get("reported_metrics", [])
+    if metrics:
+        lines.append("experiment  " + " ".join(
+            f"{row['label'] or row['name']}="
+            + (f"{row['value']:.1%}" if row['display'] == 'percent' else str(row['value']))
+            for row in metrics
+        ))
     pools = snapshot.get("pools", {})
     for name, stats in pools.items():
         if not isinstance(stats, dict):
@@ -71,12 +80,28 @@ def render_snapshot(snapshot: Mapping[str, Any], *, width: int = 20) -> str:
     return "\n".join(lines)
 
 
+def resolve_run_id(store: Any, run_id: str | None = None) -> str | None:
+    """Resolve the default monitor scope to the latest run; ``'all'`` requests aggregates."""
+    if run_id == "all":
+        return None
+    if run_id is not None:
+        return run_id
+    latest = getattr(store, "latest_run_id", None)
+    return latest() if callable(latest) else None
+
+
 def read_snapshot(store: Any, run_id: str | None = None, *, errors: int = 3) -> dict[str, Any]:
     """Read a snapshot from any store (including a read-only connection)."""
+    aggregate = run_id == "all"
+    run_id = resolve_run_id(store, run_id)
     data = store.stats(run_id)
     snapshot = dict(data)
     snapshot["run_id"] = run_id
     snapshot["recent_errors"] = store.errors(run_id=run_id, limit=errors)
+    snapshot["reported_metrics"] = [
+        {"name": row.name, "value": row.value, "label": row.label, "display": row.display}
+        for row in read_reported_metrics(store, run_id=run_id)
+    ] if run_id is not None and not aggregate else []
     run = store.get_run(run_id) if run_id else None
     if run is not None:
         snapshot["elapsed_s"] = round((run.ended_at or time.time()) - run.started_at, 2)

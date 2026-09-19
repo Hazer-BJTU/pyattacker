@@ -5,7 +5,7 @@ Every test starts the server on ``port=0`` (the OS picks a free port, the real o
 real (small) run first, so the JSON assertions are about concrete values, not just shapes.
 
 Coverage
-* ``/`` (HTML, also ``/index.html``), ``/healthz``, ``/stats``, ``/events?limit=N``,
+* ``/`` (HTML, also ``/index.html``), ``/healthz``, ``/stats``, ``/metrics``, ``/events?limit=N``,
   ``/pipelines?state=&limit=``, ``/resources``, ``/errors`` and the 404 path
 * limit handling: honoured, defaulted (50) for a bad value, clamped to >= 1
 * run scoping: the configured ``run_id`` and a ``?run_id=`` override
@@ -28,7 +28,7 @@ from pyattacker import MemoryStore, Runner, SqliteStore, boom, echo, pipeline
 from pyattacker.server import StatsServer
 from pyattacker.tasks import delay
 
-_PATHS = ["/", "/stats", "/events", "/pipelines", "/resources", "/errors", "/healthz"]
+_PATHS = ["/", "/stats", "/metrics", "/events", "/pipelines", "/resources", "/errors", "/healthz"]
 
 # Seed layout (two runs, three pipelines, eight events):
 #   run A: 2 successful "srv-ok" pipelines (task.succeeded + pipeline.succeeded each) + run.finished
@@ -78,13 +78,16 @@ def test_endpoints_serve_html_and_concrete_json(seeded):
         html = raw.decode("utf-8")
         assert html.startswith("<!doctype html>")
         assert "<title>pyattacker</title>" in html
-        assert "fetch('stats')" in html  # the page is a real dashboard over the JSON endpoints
+        assert "fetch(statsPath)" in html  # the page resolves one run, then reuses its scope
+        assert "fetch('metrics?' + scope)" in html
+        assert "fetch('pipelines?limit=50&' + scope)" in html
+        assert "fetch('events?limit=40&' + scope)" in html
         assert _fetch(server, "/index.html")[2] == raw  # documented alias
 
         assert _fetch_json(server, "/healthz") == (200, {"ok": True})
         assert _fetch_json(server, "/health") == (200, {"ok": True})
 
-        status, stats = _fetch_json(server, "/stats")
+        status, stats = _fetch_json(server, "/stats?run_id=all")
         assert status == 200
         assert stats["run_id"] is None  # not scoped: the whole store
         assert "run_status" not in stats  # only present when a run_id is known
@@ -115,7 +118,7 @@ def test_endpoints_serve_html_and_concrete_json(seeded):
         assert row["run_id"] == _run_bad
         assert row["finished_at"] >= row["started_at"]
 
-        status, succeeded = _fetch_json(server, "/pipelines?state=succeeded")
+        status, succeeded = _fetch_json(server, "/pipelines?run_id=all&state=succeeded")
         assert status == 200
         assert succeeded["limit"] == 50  # the default when the query omits it
         assert [r["name"] for r in succeeded["rows"]] == ["srv-ok", "srv-ok"]
@@ -216,13 +219,13 @@ def test_events_limit_is_honoured_defaulted_and_clamped(seeded):
         status, defaulted = _fetch_json(server, "/events")
         assert status == 200
         assert defaulted["limit"] == 50
-        assert len(defaulted["rows"]) == _SEEDED_EVENTS  # the default limit does not truncate this store
+        assert len(defaulted["rows"]) == 3  # the latest run owns three events
 
         over = _fetch_json(server, "/events?limit=10000")[1]
-        assert (over["limit"], len(over["rows"])) == (10000, _SEEDED_EVENTS)
+        assert (over["limit"], len(over["rows"])) == (10000, 3)
 
         bad = _fetch_json(server, "/events?limit=not-a-number")[1]
-        assert (bad["limit"], len(bad["rows"])) == (50, _SEEDED_EVENTS)
+        assert (bad["limit"], len(bad["rows"])) == (50, 3)
 
         clamped = _fetch_json(server, "/events?limit=0")[1]
         assert (clamped["limit"], len(clamped["rows"])) == (1, 1)
@@ -331,8 +334,9 @@ def test_a_live_run_is_visible_through_a_fresh_connection(tmp_path):
             second.close()
 
         _, after = _fetch_json(server, "/stats")
-        assert after["pipelines"]["total"] == 3
-        assert after["pipelines"]["by_state"] == {"succeeded": 3}
+        assert after["run_id"] == report.run_id
+        assert after["pipelines"]["total"] == 2
+        assert after["pipelines"]["by_state"] == {"succeeded": 2}
 
         _, rows = _fetch_json(server, f"/pipelines?run_id={report.run_id}")
         assert [r["name"] for r in rows["rows"]] == ["live-ok-2", "live-ok-2"]

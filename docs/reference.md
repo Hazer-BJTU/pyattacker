@@ -232,6 +232,7 @@ A selector matching **no** resource waits forever under the default `wait` algor
 | `ctx.held_leases()` | leases this attempt currently holds |
 | `ctx.reclaim_now()` | force-release everything held; synchronous, uninterruptible |
 | `ctx.emit(kind, **data)` | write your own event into the run's event stream |
+| `ctx.report_metric(name, value, *, label="", display="number")` | publish a latest value scoped to this pipeline |
 
 ```python
 @task("adaptive", resource="apis")
@@ -739,6 +740,7 @@ the `with` block, or reopen the file afterwards with `open_store`.
 | `run(specs, *, resume=False, **overrides)` | run to completion, returns a `RunReport`. Wraps `run_async` in `asyncio.run` |
 | `await run_async(specs, *, resume=False, **overrides)` | same, inside an existing event loop |
 | `stats()` | live snapshot; safe to call mid-run |
+| `report_metric(name, value, *, label="", display="number", pipeline_id=None)` | publish an application-defined latest value |
 | `stop(reason="user")` | ask the run to stop gracefully: stop admitting, drain what is in flight |
 | `stopping` | whether a stop is in progress |
 | `run_id` | the current run's id |
@@ -2165,6 +2167,45 @@ runner.run(template.map(jsonl_source("dataset.jsonl", limit=500)))
 
 ## Monitoring
 
+### Application-reported metrics
+
+An application can publish its latest experiment values while a run is active. Pyattacker stores
+and displays the values; the application computes them. For a runnable accuracy example, see
+[`examples/live_metrics.py`](../examples/live_metrics.py).
+
+```python
+runner.report_metric("evaluated", completed, label="Evaluated")
+runner.report_metric("accuracy", correct / completed, label="Accuracy", display="percent")
+# Inside a task, ctx.report_metric("phase", "scoring", display="text")
+```
+
+`Runner(..., on_pipeline_finished=callback)` calls `callback(runner, record, artifact)` after a pipeline's
+terminal state is stored. `artifact` is its final `Artifact` for success and `None` for failure or
+interruption. The passed `runner` provides `report_metric()` and can decode a retained artifact with
+`runner.registry.load(artifact.encoded())`. The callback
+runs in the scheduler thread and should finish quickly. Exceptions in it are recorded as
+`monitor.callback_failed` and do not change the pipeline outcome. A process crash may miss or replay
+the callback, so applications should deduplicate by pipeline ID and rebuild from stored final
+artifacts when needed. Resumed runs have a new run ID and their reported values have a separate scope.
+
+`report_metric(name, value, *, label="", display="number", pipeline_id=None)` accepts a string,
+boolean, or finite number. `display` is `number`, `percent` (a numeric fraction, displayed as a
+percentage), or `text` (a string). Repeating the same name in the same run and scope replaces the
+previous value. `ctx.report_metric(...)` uses the current pipeline as its scope. Reports are
+synchronous state writes, including when event write-behind is enabled. The feature is optional for
+third-party stores: reporting on a store without it raises `StoreFeatureUnsupported`.
+
+`/metrics?run_id=...` returns `{"run_id": ..., "rows": [{"run_id", "pipeline_id", "name",
+"value", "label", "display", "updated_at"}, ...]}`. Add `pipeline_id=...` to read a pipeline's
+reported values; `/pipelines` also includes a `reported_metrics` array in each row. With no run ID,
+`read_snapshot()`, `watch`, and every `StatsServer` endpoint select the latest started run, including
+runs that reported only pipeline-scoped values. The HTML dashboard resolves that run through `/stats`
+and passes its ID to `/metrics`, `/pipelines`, and `/events` for a consistent refresh. Use
+`?run_id=all` (or `--run-id all` for `watch`/`serve`) for aggregate operational data; that view
+does not show application metrics from an arbitrarily chosen run. The HTML dashboard shows
+run-level values as cards; the terminal `watch` view shows them too. The HTTP server remains read-only,
+and metric writes use the active Runner's store connection.
+
 ### `runner.stats()`
 
 The in-process live snapshot. Safe to call mid-run.
@@ -2197,9 +2238,9 @@ with StatsServer("runs/qa.db", port=8787) as server:
 | Endpoint | Returns |
 |---|---|
 | `/` | a small auto-refreshing dashboard |
-| `/stats`, `/events`, `/pipelines`, `/resources`, `/errors` | JSON |
+| `/stats`, `/metrics`, `/events`, `/pipelines`, `/resources`, `/errors` | JSON |
 
-`/stats` carries `handoffs_total` (commits by the selected run, or all commits without a run filter), and each `/pipelines` row carries a
+`/stats` carries `handoffs_total` (commits by the selected run, or all commits with `run_id=all`), and each `/pipelines` row carries a
 `handoffs` count of active-execution records, `handoffs_historical` count of all records and
 `handoff_floor`, next to `n_tasks_done`/`n_tasks_total` — on a control-enabled pipeline those two are a
 **position** in the chain, not a count of tasks that ran, so a non-zero `handoffs` is what says "this
@@ -2227,4 +2268,3 @@ command line.
 | [`docs/cli.md`](cli.md) | commands, flags, exit codes, config file format |
 | [`docs/design.md`](design.md) | the model, the invariants, and the tradeoffs behind these APIs |
 | [`examples/`](../examples) | complete programs, including a measured comparison of pipeline shapes |
-

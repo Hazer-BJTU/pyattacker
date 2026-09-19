@@ -259,8 +259,8 @@ with Runner(store=":memory:", concurrency=4) as runner:
 * **It is a durable checkpoint.** The jump is committed atomically (source task, attempt, entry artifact,
   ledger row and cursor together), so a killed process resumes **at the target** with the recorded entry
   state and does not re-run the source task. On a control-enabled pipeline `n_tasks_done` is a *position*,
-  not a progress count: skipped stations have no task rows. `report`/`watch` count commits in the selected
-  scope (one run when filtered, all history otherwise); `/pipelines.handoffs` counts active execution records and `handoffs_historical` counts all ledger
+  not a progress count: skipped stations have no task rows. `watch` counts commits in the selected
+  run by default (`--run-id all` selects all history); `/pipelines.handoffs` counts active execution records and `handoffs_historical` counts all ledger
   records. A resume can use an earlier run's active handoff while recording no new handoffs. Pipeline
   exports include ledger identity and the watermark to distinguish the scopes.
 * **Opt-in and inert.** Without the `control` block nothing changes — not one row, not one counter, and not a
@@ -402,13 +402,15 @@ keeps everything in the store.
 
 ```bash
 uv run pyattacker serve runs/qa.db        # http://127.0.0.1:8787
-# /  dashboard   /stats  /events  /pipelines  /resources  /errors   (JSON)
+# /  dashboard   /stats  /metrics  /events  /pipelines  /resources  /errors   (JSON)
 ```
 
 It opens a fresh read-only connection per request, so it runs happily beside a live run. It has **no
 authentication** and binds to loopback: there is no artifact route, but it does expose what your run recorded —
 event `data` and stored error messages — so treat it as a debug view over your own data and do not put it on a
 public interface without your own proxy in front.
+Applications can publish live values with `runner.report_metric("accuracy", value, display="percent")`;
+the framework displays them without calculating the metric. See [`examples/live_metrics.py`](examples/live_metrics.py).
 
 **Branching inside a step** — `fanout(a, b)` runs several tasks on the same input concurrently and
 returns `{task_name: value}`. Retry granularity becomes the group, which is the honest price of not
@@ -554,4 +556,3 @@ extracted and executed by `tests/test_tutorial.py`, so documentation that rots f
 ## License
 
 MIT — see [LICENSE](https://github.com/Hazer-BJTU/pyattacker/blob/main/LICENSE).
-

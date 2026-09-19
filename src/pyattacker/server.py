@@ -10,7 +10,7 @@ Design notes:
   it again, so the server can run beside a live run without touching its writer.
 * **No authentication, binds to loopback by default.** It exposes your run's payloads; treat it
   as a debug view, not as a public API. Put it behind your own proxy if you need one.
-* **The JSON endpoints are the real interface** (``/stats``, ``/events``, ``/pipelines``,
+* **The JSON endpoints are the real interface** (``/stats``, ``/metrics``, ``/events``, ``/pipelines``,
   ``/resources``); the HTML page at ``/`` is a convenience built on top of them.
 """
 
@@ -23,7 +23,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import ConfigError
-from .monitor import read_snapshot
+from .monitor import read_snapshot, resolve_run_id
+from .reported_metrics import read_reported_metrics
 from .store.base import Store, open_store
 
 __all__ = ["StatsServer", "serve"]
@@ -41,18 +42,52 @@ _PAGE = """<!doctype html>
 </style></head><body>
 <h1>pyattacker <span id="run" class="k"></span></h1>
 <div class="row" id="cards"></div>
+<h2>Experiment metrics</h2><div class="row" id="metrics"></div>
+<h2>Pipeline reports (first 50)</h2>
+<table><thead><tr><th>pipeline</th><th>reported status</th></tr></thead><tbody id="pipeline-metrics"></tbody></table>
+<h2>Events</h2>
 <table><thead><tr><th>kind</th><th>pipeline</th><th>data</th></tr></thead><tbody id="events"></tbody></table>
 <script>
+function showMetrics(rows){
+  const root = document.getElementById('metrics');
+  root.replaceChildren();
+  for(const row of rows){
+    const card = document.createElement('div'); card.className = 'card';
+    const label = document.createElement('div'); label.className = 'k';
+    label.textContent = row.label || row.name;
+    const value = document.createElement('div'); value.className = 'v';
+    value.textContent = row.display === 'percent' ? `${(row.value * 100).toFixed(1)}%` : String(row.value);
+    card.append(label, value); root.append(card);
+  }
+}
 async function tick(){
-  const s = await (await fetch('stats')).json();
-  document.getElementById('run').textContent = s.run_id || '';
+  const requested = new URLSearchParams(location.search).get('run_id');
+  const statsPath = requested ? 'stats?run_id=' + encodeURIComponent(requested) : 'stats';
+  const s = await (await fetch(statsPath)).json();
+  const scope = 'run_id=' + encodeURIComponent(requested === 'all' ? 'all' : (s.run_id || 'all'));
+  document.getElementById('run').textContent = s.run_id || 'all runs';
   const states = (s.pipelines||{}).by_state||{};
   const cards = [['total',(s.pipelines||{}).total||0],
     ...Object.entries(states).map(([k,v])=>[k,v]),
     ['attempts', s.attempts_total||0], ['events', s.events_total||0]];
   document.getElementById('cards').innerHTML = cards.map(([k,v])=>
     `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
-  const ev = await (await fetch('events?limit=40')).json();
+  const metrics = await (await fetch('metrics?' + scope)).json();
+  showMetrics(metrics.rows);
+  const pipelines = await (await fetch('pipelines?limit=50&' + scope)).json();
+  const reports = document.getElementById('pipeline-metrics');
+  reports.replaceChildren();
+  for(const row of pipelines.rows){
+    if(!row.reported_metrics.length) continue;
+    const tr = document.createElement('tr');
+    const id = document.createElement('td'); id.textContent = row.pipeline_id.slice(0,12);
+    const details = document.createElement('td');
+    details.textContent = row.reported_metrics.map(item =>
+      `${item.label || item.name}: ${item.display === 'percent' ? (item.value * 100).toFixed(1) + '%' : item.value}`
+    ).join(' · ');
+    tr.append(id, details); reports.append(tr);
+  }
+  const ev = await (await fetch('events?limit=40&' + scope)).json();
   document.getElementById('events').innerHTML = ev.rows.map(r=>{
     const cls = r.kind.includes('failed')?'f':(r.kind.includes('succeeded')?'s':'');
     return `<tr><td class="${cls}">${r.kind}</td><td>${(r.pipeline_id||'').slice(0,12)}</td>`+
@@ -171,6 +206,22 @@ class StatsServer:
             snapshot.pop("buffered", None)
             return 200, snapshot
 
+        if path == "/metrics":
+            pipeline_id = (query.get("pipeline_id") or [None])[0]
+
+            def _metrics(store: Any) -> Any:
+                selected = resolve_run_id(store, run_id)
+                rows = read_reported_metrics(store, run_id=selected, pipeline_id=pipeline_id) if selected else []
+                return selected, [
+                    {"run_id": row.run_id, "pipeline_id": row.pipeline_id,
+                     "name": row.name, "value": row.value, "label": row.label,
+                     "display": row.display, "updated_at": row.updated_at}
+                    for row in rows
+                ]
+
+            selected, rows = self._read(_metrics)
+            return 200, {"run_id": selected, "rows": rows}
+
         if path == "/events":
             rows = self._read(
                 lambda store: [
@@ -183,7 +234,7 @@ class StatsServer:
                         "pool": event.pool,
                         "data": event.data,
                     }
-                    for event in store.events(run_id=run_id, limit=limit)
+                    for event in store.events(run_id=resolve_run_id(store, run_id), limit=limit)
                 ]
             )
             return 200, {"rows": rows, "limit": limit}
@@ -193,7 +244,8 @@ class StatsServer:
 
             def _pipelines(store: Any) -> Any:
                 rows = []
-                for record in store.pipelines(run_id=run_id, state=state, limit=limit):
+                selected = resolve_run_id(store, run_id)
+                for record in store.pipelines(run_id=selected, state=state, limit=limit):
                     # `handoffs` costs one small indexed read per returned row, and is how this view says
                     # "the cursor below is a position, not progress": a pipeline with handoffs skipped
                     # stations, so n_tasks_done is where it is, not how many tasks ran.
@@ -220,6 +272,13 @@ class StatsServer:
                             "error_message": record.error_message,
                             "started_at": record.started_at,
                             "finished_at": record.finished_at,
+                            "reported_metrics": [
+                                {"name": item.name, "value": item.value, "label": item.label,
+                                 "display": item.display, "updated_at": item.updated_at}
+                                for item in read_reported_metrics(
+                                    store, run_id=record.run_id, pipeline_id=record.pipeline_id
+                                )
+                            ],
                         }
                     )
                 return rows
@@ -244,12 +303,14 @@ class StatsServer:
             return 200, {"rows": rows}
 
         if path == "/errors":
-            return 200, {"rows": self._read(lambda store: store.errors(run_id=run_id, limit=limit))}
+            return 200, {"rows": self._read(lambda store: store.errors(
+                run_id=resolve_run_id(store, run_id), limit=limit
+            ))}
 
         return 404, {"error": f"unknown path {path!r}", "paths": _PATHS}
 
 
-_PATHS = ["/", "/stats", "/events", "/pipelines", "/resources", "/errors", "/healthz"]
+_PATHS = ["/", "/stats", "/metrics", "/events", "/pipelines", "/resources", "/errors", "/healthz"]
 
 
 def _int(values: list[str] | None, default: int) -> int:

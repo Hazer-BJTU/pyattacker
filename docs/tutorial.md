@@ -1603,11 +1603,14 @@ blobs on disk: 3 files, [11, 27, 1536] bytes
   [`examples/plugin_package/`](../examples/plugin_package/README.md).
 
 **Monitoring a run in progress.** `pyattacker watch runs/qa.db` gives you a terminal view from a second
-process, and `pyattacker serve runs/qa.db` an HTTP dashboard plus JSON at `/stats`, `/events`, `/pipelines`,
+process, and `pyattacker serve runs/qa.db` an HTTP dashboard plus JSON at `/stats`, `/metrics`, `/events`, `/pipelines`,
 `/resources` and `/errors`. Both open read-only connections, so they are safe beside a live run. The HTTP
 endpoint has no authentication and serves your payloads — keep it on loopback.
+For live experiment accuracy, run [`examples/live_metrics.py`](../examples/live_metrics.py). Its
+completion callback decodes final artifacts, deduplicates by pipeline ID, and reports the current
+accuracy through `runner.report_metric()`; the dashboard displays the value as it changes.
 * **Monitoring**: `pyattacker serve runs/qa.db` is a zero-dependency read-only HTTP view (`/`,
-  `/stats`, `/events`, `/pipelines`, `/resources`, `/errors`) that opens a fresh connection per request,
+  `/stats`, `/metrics`, `/events`, `/pipelines`, `/resources`, `/errors`) that opens a fresh connection per request,
   so it runs happily beside a live run. It binds to loopback and has no authentication — treat it as a
   debug view, not a dashboard.
 

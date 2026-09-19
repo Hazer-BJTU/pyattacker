@@ -143,7 +143,7 @@ class StoreUnavailable(PyAttackerError):
 
 
 class StoreFeatureUnsupported(PyAttackerError):
-    """The store was written by a newer pyattacker and this build cannot interpret it.
+    """The store lacks a requested optional feature, or uses a newer feature level.
 
     A store records the highest on-disk feature level it has reached (``store/visits.py``), and a
     binary that does not know that level refuses to operate on it: reading or writing a
@@ -151,6 +151,9 @@ class StoreFeatureUnsupported(PyAttackerError):
     occurrence, not merely display incomplete data. Upgrade the package to open the store; back it
     up with SQLite's own backup API (``sqlite3 .backup``) or a file copy taken while no writer is
     active (see ``docs/reference.md``, "Advanced: backward traversal").
+
+    An older third-party store also raises this error when a caller requests an optional
+    capability such as application-reported metrics that it does not implement.
     """
 
 

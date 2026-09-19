@@ -165,10 +165,13 @@ derives it from the event log, scoped to the pipelines in the report.
 pyattacker watch STORE [--run-id ID] [--interval S] [--iterations N] [--no-clear]
 ```
 
+Without `--run-id`, `watch` follows the latest started run. Use `--run-id all` for aggregate
+operational statistics across the store; application-reported metrics are omitted in that view.
+
 A read-only connection to the same SQLite file, so it runs beside a live run (WAL allows one writer and many
 readers). Shows the pipeline state distribution, latency percentiles, per-pool `active/capacity`,
 `ready/degraded/dead`, how many pipelines are waiting or parked, and recent errors. A run with handoffs also
-shows `handoffs=N` (commits in the selected scope, all history without a run filter; a resume may reuse earlier active handoffs) on its attempts line — on a control-enabled pipeline the cursor is a position, not a
+shows `handoffs=N` (commits in the selected run, or all history with `--run-id all`; a resume may reuse earlier active handoffs) on its attempts line — on a control-enabled pipeline the cursor is a position, not a
 progress count, so that number is what explains a short task list. `--iterations N` makes it
 exit on its own, which is what you want in a script.
 
@@ -201,7 +204,10 @@ an export of a store that is still being written does and does not guarantee.
 pyattacker serve STORE [--host HOST] [--port PORT] [--run-id ID]
 ```
 
-`/` is a small auto-refreshing dashboard; `/stats`, `/events`, `/pipelines`, `/resources`, `/errors` are JSON.
+Without `--run-id`, the dashboard follows the latest started run. Use `--run-id all` for an
+aggregate view, or open `/?run_id=ID` to inspect a specific run.
+
+`/` is a small auto-refreshing dashboard; `/stats`, `/metrics`, `/events`, `/pipelines`, `/resources`, `/errors` are JSON.
 A fresh read-only connection per request means it is safe beside a live run.
 
 **It has no authentication, and there is no artifact route.** What it exposes is what the run recorded —

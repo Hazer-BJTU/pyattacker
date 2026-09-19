@@ -54,7 +54,7 @@ def test_render_snapshot_includes_pipeline_bar_and_state_counts(tmp_path):
 
     store = SqliteStore(db, read_only=True)
     try:
-        snapshot = read_snapshot(store)
+        snapshot = read_snapshot(store, run_id="all")
         text = render_snapshot(snapshot)
     finally:
         store.close()

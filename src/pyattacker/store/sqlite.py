@@ -180,6 +180,18 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_pipeline ON events(pipeline_id, event_id);
 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, event_id);
 
+CREATE TABLE IF NOT EXISTS reported_metrics (
+    run_id TEXT NOT NULL,
+    pipeline_id TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    display TEXT NOT NULL DEFAULT 'number',
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (run_id, pipeline_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_reported_metrics_run ON reported_metrics(run_id, pipeline_id);
+
 -- Advanced control flow (docs/design.md §4.8): one append-only row per task-initiated handoff, the
 -- pipeline's control-flow history and the durable state recovery resumes at. `to_seq`/`to_task` are
 -- NULL for END; `entry_seq` is the entry artifact's position (the lookup key), `entry_artifact_id` the
@@ -472,6 +484,12 @@ class SqliteStore(VisitStore):
     def get_run(self, run_id: str) -> RunRecord | None:
         row = self._conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
         return _to_run(row) if row else None
+
+    def latest_run_id(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT run_id FROM runs ORDER BY started_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        return str(row["run_id"]) if row else None
 
     # ------------------------------------------------------------- pipelines
     def get_pipeline(self, pipeline_id: str) -> PipelineRecord | None:
@@ -816,6 +834,43 @@ class SqliteStore(VisitStore):
         )
         self._conn.commit()
         event.event_id = cur.lastrowid
+
+    def upsert_reported_metric(self, row: Any) -> None:
+        self._conn.execute(
+            "INSERT INTO reported_metrics (run_id,pipeline_id,name,value_json,label,display,updated_at) "
+            "VALUES (?,?,?,?,?,?,?) ON CONFLICT(run_id,pipeline_id,name) DO UPDATE SET "
+            "value_json=excluded.value_json,label=excluded.label,display=excluded.display,"
+            "updated_at=excluded.updated_at",
+            (row.run_id, row.pipeline_id or "", row.name, json.dumps(row.value), row.label,
+             row.display, row.updated_at),
+        )
+        self._conn.commit()
+
+    def reported_metrics(
+        self, *, run_id: str | None = None, pipeline_id: str | None = None
+    ) -> list[Any]:
+        from ..reported_metrics import ReportedMetric
+
+        # Older databases opened read-only have no table until a writer upgrades them.
+        if not self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reported_metrics'"
+        ).fetchone():
+            return []
+        sql = "SELECT * FROM reported_metrics WHERE pipeline_id=?"
+        args: list[Any] = [pipeline_id or ""]
+        if run_id is None:
+            sql += " AND run_id=(SELECT run_id FROM reported_metrics WHERE pipeline_id=? "
+            sql += "ORDER BY updated_at DESC LIMIT 1)"
+            args.append(pipeline_id or "")
+        else:
+            sql += " AND run_id=?"
+            args.append(run_id)
+        sql += " ORDER BY run_id, name"
+        return [
+            ReportedMetric(r["run_id"], r["name"], json.loads(r["value_json"]), r["label"],
+                           r["display"], r["pipeline_id"] or None, r["updated_at"])
+            for r in self._conn.execute(sql, args)
+        ]
 
     def upsert_resource(
         self,

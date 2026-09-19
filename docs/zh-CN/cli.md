@@ -128,7 +128,10 @@ pyattacker report STORE [STORE ...] [--run-id ID] [--errors N] [--json] [--artif
 pyattacker watch STORE [--run-id ID] [--interval S] [--iterations N] [--no-clear]
 ```
 
-对同一个 SQLite 文件开只读连接，所以能和正在跑的流水线并存（WAL 允许一个写入者多个读取者）。显示流水线状态分布、延迟百分位、每个资源池的 `active/capacity`、`ready/degraded/dead`、多少流水线在等待或挂起、最近的错误。开了交接的运行还会在 attempts 行显示 `handoffs=N`（选定范围内的提交数，不带 run 过滤就是全部历史；续跑可能复用更早的活跃交接）——开了控制流的流水线，游标是位置不是进度计数，所以任务列表很短的时候就是这个数字在起作用。`--iterations N` 让它自己退出，脚本里用很方便。
+不指定 `--run-id` 时，`watch` 跟随最近启动的运行。使用 `--run-id all` 可查看全库运行统计；
+该视图不显示某个运行的应用汇报指标。
+
+对同一个 SQLite 文件开只读连接，所以能和正在跑的流水线并存（WAL 允许一个写入者多个读取者）。显示流水线状态分布、延迟百分位、每个资源池的 `active/capacity`、`ready/degraded/dead`、多少流水线在等待或挂起、最近的错误。开了交接的运行还会在 attempts 行显示 `handoffs=N`（选定运行的提交数，使用 `--run-id all` 则是全部历史；续跑可能复用更早的活跃交接）——开了控制流的流水线，游标是位置不是进度计数，所以任务列表很短的时候就是这个数字在起作用。`--iterations N` 让它自己退出，脚本里用很方便。
 
 ## `export` —— 导出记录
 
@@ -154,7 +157,10 @@ pyattacker export STORE [STORE ...] OUTPUT [--rows SHAPE] [--format FMT] [--run-
 pyattacker serve STORE [--host HOST] [--port PORT] [--run-id ID]
 ```
 
-`/` 是个自动刷新的小仪表盘；`/stats`、`/events`、`/pipelines`、`/resources`、`/errors` 返回 JSON。每个请求都新开一个只读连接，所以和正在跑的流水线并存是安全的。
+不指定 `--run-id` 时，面板跟随最近启动的运行。使用 `--run-id all` 可查看全库视图，
+也可打开 `/?run_id=ID` 查看指定运行。
+
+`/` 是个自动刷新的小仪表盘；`/stats`、`/metrics`、`/events`、`/pipelines`、`/resources`、`/errors` 返回 JSON。每个请求都新开一个只读连接，所以和正在跑的流水线并存是安全的。
 
 **没有认证，也没有 artifact 路由。** 它暴露的是这次运行记下来的内容——事件的 `data` 原样呈现，存下来的 `error_message` 字段也在——所以默认只绑回环地址。要绑别的地址？前面自己加个代理。
 
