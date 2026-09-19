@@ -37,7 +37,6 @@ PAIRS: dict[str, str] = {
     "docs/design.md": "docs/zh-CN/design.md",
     "docs/cli.md": "docs/zh-CN/cli.md",
     "docs/benchmark.md": "docs/zh-CN/benchmark.md",
-    "docs/backward.md": "docs/zh-CN/backward.md",
     "docs/releasing.md": "docs/zh-CN/releasing.md",
     "examples/llm_eval/README.md": "examples/llm_eval/README.zh-CN.md",
     "examples/plugin_package/README.md": "examples/plugin_package/README.zh-CN.md",
@@ -46,7 +45,7 @@ PAIRS: dict[str, str] = {
 BLOB = "https://github.com/Hazer-BJTU/pyattacker/blob/main/"
 CJK = re.compile(r"[\u4e00-\u9fff]")
 LINK = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
-MARKER = re.compile(r"^# (?:tutorial|example)/(?P<name>[\w.\-]+\.(?:py|yaml))$")
+MARKER = re.compile(r"^# (?:tutorial|example|reference)/(?P<name>[\w.\-]+\.(?:py|yaml))$")
 
 
 def _read(relative: str) -> str:

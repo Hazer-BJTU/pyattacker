@@ -1,12 +1,15 @@
-"""README and CLI-reference examples are executable, not decoration.
+"""README, CLI-reference and API-reference examples are executable, not decoration.
 
 `docs/tutorial.md` already runs every block marked ``# tutorial/<name>.py`` (see
-``tests/test_tutorial.py``). This module applies the same contract to the two documents a reader
-copies from first, with the same kind of marker as the first line of the block:
+``tests/test_tutorial.py``). This module applies the same contract to the documents a reader copies
+from first, with the same kind of marker as the first line of the block:
 
 * ``# example/<name>.py`` — a complete program. It is written to a temporary directory and executed
   with the current interpreter and ``cwd`` set to that directory, so an undefined name, a relative
   store path that assumes the checkout, or a network call fails CI.
+* ``# reference/<name>.py`` — the same contract for the complete programs in ``docs/reference.md``:
+  the reference is where the advanced backward-traversal and ``HistoryArtifact`` interfaces are
+  specified, and a snippet there that no longer runs is worse than no snippet.
 * ``# example/<name>.yaml`` — a complete config. It is written out and passed to
   ``pyattacker validate`` through the CLI entry point, which is exactly what the document tells the
   reader to run. That is what catches copy-paste breakage such as a bare ``on:`` retry key (YAML 1.1
@@ -32,9 +35,10 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCUMENTS = {
     "README.md": ROOT / "README.md",
     "docs/cli.md": ROOT / "docs" / "cli.md",
+    "docs/reference.md": ROOT / "docs" / "reference.md",
 }
 BLOCK = re.compile(r"^```(?P<lang>python|yaml)\n(?P<body>.*?)^```$", re.MULTILINE | re.DOTALL)
-MARKER = re.compile(r"^# example/(?P<name>[\w.\-]+\.(?:py|yaml))$")
+MARKER = re.compile(r"^# (?P<kind>example|reference)/(?P<name>[\w.\-]+\.(?:py|yaml))$")
 TIMEOUT_S = 180
 
 
@@ -67,7 +71,8 @@ def test_the_key_examples_are_marked_for_execution():
 
 def test_marked_blocks_start_with_their_marker_and_are_complete_programs():
     for document, name, body in PYTHON_EXAMPLES:
-        assert body.startswith(f"# example/{name}"), name
+        match = MARKER.match(body.splitlines()[0])
+        assert match and match.group("name") == name, f"{document}: {name} must start with its own marker"
         assert 'if __name__ == "__main__"' not in body, f"{document}: {name} must run top to bottom"
         elided = [line for line in body.splitlines() if line.strip() in ("...", "# ...")]
         assert not elided, f"{document}: {name} cannot be executed with elided code in it"

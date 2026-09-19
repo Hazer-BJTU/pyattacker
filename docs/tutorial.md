@@ -43,7 +43,8 @@ Read the steps in order the first time. Afterwards, use this table.
 | store custom types or large payloads, ship a plugin | [Step 14](#step-14--your-own-types-blobs-plugins) | [Codecs](reference.md#codecregistry), [Backends](reference.md#artifact-backends), [Plugins](reference.md#plugins) |
 | monitor a run in progress | [Step 14](#step-14--your-own-types-blobs-plugins) | [Monitoring](reference.md#monitoring) |
 | skip the rest of a chain from inside a task (advanced) | [Step 15](#step-15--advanced-skipping-stations-handoffs) | [Handoffs](reference.md#advanced-handoffs-opt-in) |
-| send work back to an earlier station (advanced) | [Step 16](#step-16--advanced-regenerating-with-rewind-and-retry-all) | [Backward traversal](backward.md) |
+| send work back to an earlier station (advanced) | [Step 16](#step-16--advanced-regenerating-with-rewind-and-retry-all) | [Backward traversal](reference.md#advanced-backward-traversal-rewind-retry-all-visits) |
+| snapshot and restore state inside a payload (advanced) | [Step 17](#step-17--advanced-payloads-that-carry-their-own-history) | [`HistoryArtifact`](reference.md#historyartifact) |
 
 ---
 
@@ -1732,7 +1733,8 @@ What is worth knowing before you use it:
   wants a graph engine, which this is not.
 * **Advanced tier.** It is opt-in, it changes the execution model, and it is experimental until 1.0: the
   guarantees above are stable, the spelling may still change. Separately declared backward operations
-  use visits and finite budgets; see [rewind, retry-all and payload history](backward.md).
+  use visits and finite budgets; see [Step 16](#step-16--advanced-regenerating-with-rewind-and-retry-all)
+  and [reference → advanced: backward traversal](reference.md#advanced-backward-traversal-rewind-retry-all-visits).
   Both built-in stores can commit a handoff; a custom store that cannot is refused up front with a
   `ConfigError` rather than writing a jump that would not survive a crash.
 
@@ -1745,84 +1747,6 @@ current watermark, so repeated interruptions still use the active handoff. Compl
 artifact. See the [store recovery contract](reference.md#tables-and-readers) when implementing a backend.
 
 ---
-
-## Cheat sheet
-
-| I want to… | Do this |
-|---|---|
-| run one task over a dataset | `Runner(store=..., pools=[...]).run(template.map(rows))` |
-| k samples per row | `template.map(rows, repeats=k)` |
-| stable ids from my dataset | `template.map(rows, key_of=lambda r: r["qid"])` |
-| test without touching disk | `Runner(store=":memory:")` |
-| see what happened | `report.summary()`, `report.to_dict()`, `store.errors()` |
-| see why it was slow | `store.attempts(pipeline_id=...)` → `duration_ms`, `decision`, `leases` |
-| resume after a crash | `runner.run(specs, resume=True)` or `pyattacker resume -c cfg.yaml` |
-| re-run results I do not trust | `retry_succeeded=True` / `--retry-succeeded` |
-| start a pipeline over from the seed, keeping its audit rows | `fresh_restart=True` / `--fresh-restart` |
-| bound the blast radius | `stop_after_failures=N`, `stop_after_s=T`, `--limit N` |
-| cap concurrency per endpoint | `Resource.create(..., capacity=N)` |
-| fail fast instead of queueing | `algorithm="immediate"` + `Retrying(retry_unknown=True)` |
-| survive a 429 | `raise RetryableError(..., error_class="rate_limit", retry_after=...)` |
-| store big payloads out of the DB | `--artifact-backend file:///data/blobs` |
-| use four processes | `--shards 4 --jobs 4`, then `report`/`export` over the shard files |
-| branch inside a step | `fanout(task_a, task_b)` |
-| skip ahead / finish early, on the record | `return Handoff.to("report", v)` / `Handoff.end(v)` on a pipeline declared with `control={"edges": {...}}` |
-| make my code usable from YAML | no plugin: `use: my_pkg.tasks:my_task`; with an entry point in `pyattacker.tasks`: `use: my_task` |
-
-Every class and function, with signatures and parameter tables: [`docs/reference.md`](reference.md).
-
-## Troubleshooting
-
-**"My task takes three arguments."** Tasks are unary: `(value)` or `(value, ctx)`. Put extra state in a
-factory closure (`def make_task(model): @task(...) async def t(value, ctx): ...; return t`) — this is the
-same pattern Step 6 uses.
-
-**"Resume re-ran the whole pipeline."** The store was almost certainly written with `journal: summary`,
-which keeps digests but no payloads, so the checkpoint cannot be decoded. Look for a
-`pipeline.checkpoint_missing` event. Use `journal: full` (the default).
-
-**"Nothing ran, there are no rows."** Every pipeline was skipped because it had already succeeded — see
-`report.skipped`. That is the intended behaviour, including for a second identical run.
-
-**"A pipeline failed with `unknown`."** The exception was not classifiable (for example
-`ResourceUnavailable`, or a bare `Exception`). Either map it — `raise RetryableError(...)` — or set
-`retry_unknown=True` if you really want to retry anything.
-
-**"It hangs with no output."** A selector matches no resource and the algorithm is `wait`; or a task holds
-a lease from a pool while asking the same pool for another (look for an `acquire.suspected_deadlock`
-event); or an `await` in your own code never returns. `timeout_s=` on the task and `timeout=` on the
-acquire turn both become errors.
-
-**"My resource never comes back."** It does — check `leases_leaked` and the `lease.leaked` event: you used
-`await ctx.acquire_lease()` without releasing. Use `async with`, and set `strict_leases=True` in CI so this
-fails loudly.
-
-**"The store file is busy / one process is not enough."** SQLite allows one writer. Shard into several
-processes with their own stores (Step 12) instead of pointing several runs at one file.
-
-**"Where did my artifact bytes go?"** If `journal: summary` or a `null` backend is set, only digests are
-kept. Otherwise check `blob_ref`: the payload may be in a file backend, which is transparent on read.
-
-**"A run took 30 s in a retry backoff and I lost concurrency."** You did not: the pipeline is parked in the
-delay queue and the worker took other work. `runner.stats()["delayed_pipelines"]` shows how many are
-parked right now.
-
-## Where to look next
-
-Looking for a specific feature rather than a whole document? See [Find what you need](#find-what-you-need)
-near the top.
-
-| Resource | What is in it |
-|---|---|
-| [`docs/reference.md`](reference.md) | every public class and function: signatures, parameters, examples |
-| [`docs/cli.md`](cli.md) | every subcommand and flag, exit codes, the config file reference |
-| [`docs/design.md`](design.md) | conceptual model, six invariants, lease contract, data model, tradeoffs |
-| [`README.md`](../README.md) | the compact tour: scheduling guarantees, sharding, plugins, out of scope |
-| [`examples/quickstart.py`](../examples/quickstart.py) | the SDK in 60 lines, with a resume round |
-| [`examples/llm_eval/`](../examples/llm_eval/README.md) | the full evaluation, two pipeline shapes, measured checkpoint granularity |
-| [`examples/sharded.py`](../examples/sharded.py) | one dataset across N stores, then a merged report |
-| [`examples/plugin_package/`](../examples/plugin_package/README.md) | an installable plugin: tasks, an algorithm, a codec |
-| [`examples/qa_eval.yaml`](../examples/qa_eval.yaml) | the declarative path, end to end |
 
 ## Step 16 — advanced: regenerating with rewind and retry-all
 
@@ -1868,8 +1792,9 @@ def validate(row: dict, ctx) -> Handoff | dict:
 
 @task("report")
 def report(row: dict, ctx) -> dict:
-    # ctx.visit is 1 when this row was regenerated once, 0 when the first sample passed
-    return {"answer": row["answer"], "regenerations": ctx.visit, "temperature": row["temperature"]}
+    # ctx.visit counts entries into *this* station, and report ran once — so it is 0 here. How many
+    # regenerations the row needed is the generate station's counter, printed from the store below.
+    return {"answer": row["answer"], "temperature": row["temperature"]}
 
 
 # `rewind` is declared from validate to the strictly earlier generate; max_handoffs is required and is
@@ -1943,4 +1868,237 @@ What is worth knowing before you use it:
   snapshot/restore bookkeeping; nothing in the runner reads it to decide where to go next.
 
 The full interface — the visit/occurrence model, the budget lifecycle, the store capability and the
-`HistoryArtifact` codec — is in [the backward guide](backward.md).
+`HistoryArtifact` codec — is in [reference → advanced: backward traversal](reference.md#advanced-backward-traversal-rewind-retry-all-visits),
+and the optional payload history gets its own step next.
+
+---
+
+## Step 17 — advanced: payloads that carry their own history
+
+**Also advanced, also opt-in, and it changes nothing about scheduling.** Steps 15 and 16 decide *where* the
+pipeline goes; this one is the optional companion to a rewind, for when the state you send back should carry
+named checkpoints of its own.
+
+The situation: `validate` wants to send `generate` back to the state as it was *before* the sample that
+failed — not to a dictionary the author rebuilt by hand. Building that dictionary is the common case and it
+is what Step 16 does; there is nothing wrong with it. But when the payload *is* the application's state
+machine — it has stages, earlier stages are worth keeping, and "regenerate from stage 2 while stage 3 stays
+on the record" is the operation you want — `HistoryArtifact` is an optional payload base class that carries
+detached snapshots of application state plus a versioned codec for them.
+
+```python
+# tutorial/step_17_history.py
+"""Step 17 (advanced) - optional payload history: named checkpoints carried inside the payload."""
+
+from pyattacker import CodecRegistry, Handoff, HistoryArtifact, Runner, pipeline, task
+
+
+class DraftState(HistoryArtifact):
+    """Application state with its own snapshots; the runner stores it and never reads it."""
+
+
+@task("prepare")
+def prepare(seed: dict) -> DraftState:
+    state = DraftState({"prompt": seed["prompt"], "temperature": 0.2})
+    return state.checkpoint("prepared")
+
+
+@task("generate")
+def generate(state: DraftState, ctx) -> DraftState:
+    # <- your model call: a revisit is a genuinely new sample, so the label names the visit
+    draft = state.with_state({**state.state, "answer": f"sample-{ctx.visit}", "valid": ctx.visit >= 1})
+    return draft.checkpoint(f"sample-{ctx.visit}", metadata={"temperature": draft.state["temperature"]})
+
+
+@task("validate")
+def validate(state: DraftState, ctx) -> Handoff | DraftState:
+    if not state.state["valid"]:
+        # Go back to the snapshot taken before this sample, then choose what the generator sees next.
+        base = state.restore("prepared")
+        return Handoff.rewind(
+            "generate",
+            base.with_state({**base.state, "temperature": 0.7}),
+            reason="answer did not parse",
+        )
+    return state
+
+
+@task("report")
+def report(state: DraftState, ctx) -> dict:
+    # The decoded payload still carries every snapshot, in order, plus the one that is selected.
+    return {
+        "answer": state.state["answer"],
+        "labels": [row["label"] for row in state.history],
+        "selected": state.selected,
+    }
+
+
+registry = CodecRegistry()
+registry.register_type(DraftState)   # decoding restores DraftState, not a bare HistoryArtifact
+
+# The same registry goes to the template (for seeds) and to the Runner (for checkpoints) - Step 14's rule.
+template = pipeline(
+    "draft",
+    prepare | generate | validate | report,
+    registry=registry,
+    control={"rewind": {"validate": ["generate"]}, "max_handoffs": 3},
+)
+
+with Runner(store=":memory:", registry=registry) as runner:
+    report_obj = runner.run(template.map([{"prompt": "Return JSON with one field"}]))
+    print(report_obj.summary())
+    store = runner.store
+    record = next(iter(store.pipelines()))
+    for row in store.tasks(record.pipeline_id):
+        print(f"   seq={row.seq} visit={row.visit} {row.name:9s} {row.state}")
+    validate_output = runner.registry.load(store.get_artifact(record.pipeline_id, 2).encoded())
+    print("\nfinal artifact:", runner.registry.load(store.get_artifact(record.pipeline_id, 3).encoded()))
+    print("snapshots:", [row["label"] for row in validate_output.history])
+    print("selected:", validate_output.selected)
+    pruned = validate_output.prune("sample-0")   # explicit, and never the selected snapshot
+    print("after pruning sample-0:", [row["label"] for row in pruned.history])
+    try:
+        pruned.prune("prepared")
+    except ValueError as exc:
+        print("prune refused:", exc)
+```
+
+The traversal is Step 16's; what is new is that the payload itself remembers where it has been:
+
+```text
+   seq=0 visit=0 prepare   succeeded
+   seq=1 visit=0 generate  succeeded
+   seq=1 visit=1 generate  succeeded
+   seq=2 visit=0 validate  handed_off
+   seq=2 visit=1 validate  succeeded
+   seq=3 visit=0 report    succeeded
+
+final artifact: {'answer': 'sample-1', 'labels': ['prepared', 'sample-0', 'sample-1'], 'selected': 'snapshot:0'}
+snapshots: ['prepared', 'sample-0', 'sample-1']
+selected: snapshot:0
+after pruning sample-0: ['prepared', 'sample-1']
+prune refused: cannot prune the selected snapshot
+```
+
+What is worth knowing before you use it:
+
+* **It is a payload, not a record.** `HistoryArtifact` is a decoded application value; it is *not* the
+  persisted `Artifact` row, and snapshot history never replaces the framework's execution ledger, task or
+  visit records. Nothing in the runner reads it to decide where to go next — the `Handoff.rewind` you
+  return is still the only thing that moves the pipeline. A plain dictionary stays a plain dictionary:
+  there is no automatic snapshot on task entry or completion.
+* **Snapshots are detached, so nested edits cannot rewrite the past.** `state`, `history` and
+  `snapshot(...)` all return deep copies; `checkpoint(label, *, metadata=None)` appends a snapshot with a
+  stable id (`snapshot:0`, `snapshot:1`, …) and a unique label, and `snapshot:` is reserved for those ids.
+  `with_state(value)` replaces the current state *without* appending a snapshot, `restore(id_or_label)`
+  replaces it *and* records `selected`, keeping the whole history so the later stages stay inspectable,
+  and `prune(*selectors)` is the explicit way to drop snapshots — it raises `ValueError` rather than
+  pruning the selected one, and ids are not reused.
+* **Persisting is the commit's job, not `checkpoint()`'s.** Calling `checkpoint()` inside a task does not
+  touch the store. The runner persists the payload — history included — when it commits the task's output
+  or its control transition, exactly like any other artifact. A crash before that commit loses the
+  in-memory snapshot, and the codec cannot help with that.
+* **The codec needs the class.** State and metadata must be JSON serializable, and the versioned
+  `history-v1` codec restores snapshots *and* the registered subclass: give the same `CodecRegistry` to
+  `pipeline(..., registry=...)` and `Runner(..., registry=...)` (Step 14) and register the subclass with
+  `register_type` — an unregistered subclass fails decoding explicitly instead of coming back as a
+  `HistoryArtifact`. Subclasses inherit the base constructor, so application fields live in `state`;
+  custom constructors and extra attributes are outside this interface.
+* **History grows with the payload.** Every snapshot is kept in full, so a long-lived value can grow with
+  the number and size of them; prune on purpose. For "send this row back" the usual shape is one snapshot
+  per visit plus the states you want to return to, which is what the program above does.
+
+---
+
+## Cheat sheet
+
+| I want to… | Do this |
+|---|---|
+| run one task over a dataset | `Runner(store=..., pools=[...]).run(template.map(rows))` |
+| k samples per row | `template.map(rows, repeats=k)` |
+| stable ids from my dataset | `template.map(rows, key_of=lambda r: r["qid"])` |
+| test without touching disk | `Runner(store=":memory:")` |
+| see what happened | `report.summary()`, `report.to_dict()`, `store.errors()` |
+| see why it was slow | `store.attempts(pipeline_id=...)` → `duration_ms`, `decision`, `leases` |
+| resume after a crash | `runner.run(specs, resume=True)` or `pyattacker resume -c cfg.yaml` |
+| re-run results I do not trust | `retry_succeeded=True` / `--retry-succeeded` |
+| start a pipeline over from the seed, keeping its audit rows | `fresh_restart=True` / `--fresh-restart` |
+| bound the blast radius | `stop_after_failures=N`, `stop_after_s=T`, `--limit N` |
+| cap concurrency per endpoint | `Resource.create(..., capacity=N)` |
+| fail fast instead of queueing | `algorithm="immediate"` + `Retrying(retry_unknown=True)` |
+| survive a 429 | `raise RetryableError(..., error_class="rate_limit", retry_after=...)` |
+| store big payloads out of the DB | `--artifact-backend file:///data/blobs` |
+| use four processes | `--shards 4 --jobs 4`, then `report`/`export` over the shard files |
+| branch inside a step | `fanout(task_a, task_b)` |
+| skip ahead / finish early, on the record | `return Handoff.to("report", v)` / `Handoff.end(v)` on a pipeline declared with `control={"edges": {...}}` |
+| send a station back to an earlier one (advanced) | `return Handoff.rewind("generate", chosen_state)` on a pipeline declared with `control={"rewind": {...}, "max_handoffs": N}` |
+| restart the whole pipeline from its seed (advanced) | `return Handoff.retry_all()` on a pipeline declared with `control={"retry_all": [...], "max_handoffs": N}` |
+| keep named state checkpoints inside a payload (advanced) | `class S(HistoryArtifact)`, then `s.checkpoint("label")` / `.restore(...)` / `.prune(...)`, registered in both registries |
+| make my code usable from YAML | no plugin: `use: my_pkg.tasks:my_task`; with an entry point in `pyattacker.tasks`: `use: my_task` |
+
+Every class and function, with signatures and parameter tables: [`docs/reference.md`](reference.md).
+
+## Troubleshooting
+
+**"My task takes three arguments."** Tasks are unary: `(value)` or `(value, ctx)`. Put extra state in a
+factory closure (`def make_task(model): @task(...) async def t(value, ctx): ...; return t`) — this is the
+same pattern Step 6 uses.
+
+**"Resume re-ran the whole pipeline."** The store was almost certainly written with `journal: summary`,
+which keeps digests but no payloads, so the checkpoint cannot be decoded. Look for a
+`pipeline.checkpoint_missing` event. Use `journal: full` (the default).
+
+**"Nothing ran, there are no rows."** Every pipeline was skipped because it had already succeeded — see
+`report.skipped`. That is the intended behaviour, including for a second identical run.
+
+**"A pipeline failed with `unknown`."** The exception was not classifiable (for example
+`ResourceUnavailable`, or a bare `Exception`). Either map it — `raise RetryableError(...)` — or set
+`retry_unknown=True` if you really want to retry anything.
+
+**"It hangs with no output."** A selector matches no resource and the algorithm is `wait`; or a task holds
+a lease from a pool while asking the same pool for another (look for an `acquire.suspected_deadlock`
+event); or an `await` in your own code never returns. `timeout_s=` on the task and `timeout=` on the
+acquire turn both become errors.
+
+**"My resource never comes back."** It does — check `leases_leaked` and the `lease.leaked` event: you used
+`await ctx.acquire_lease()` without releasing. Use `async with`, and set `strict_leases=True` in CI so this
+fails loudly.
+
+**"The store file is busy / one process is not enough."** SQLite allows one writer. Shard into several
+processes with their own stores (Step 12) instead of pointing several runs at one file.
+
+**"Where did my artifact bytes go?"** If `journal: summary` or a `null` backend is set, only digests are
+kept. Otherwise check `blob_ref`: the payload may be in a file backend, which is transparent on read.
+
+**"A run took 30 s in a retry backoff and I lost concurrency."** You did not: the pipeline is parked in the
+delay queue and the worker took other work. `runner.stats()["delayed_pipelines"]` shows how many are
+parked right now.
+
+**"A backward pipeline fails at build time, or dies with a spent budget."** `control.max_handoffs` is
+required — and must be a positive integer, so `0`, `"3"`, `3.0` and `True` are refused — as soon as
+`rewind` or `retry_all` is declared. It is consumed by every nonterminal transfer and survives a resume,
+so a pipeline that failed *because* the budget ran out needs `fresh_restart=True` / `--fresh-restart`:
+`resume=True` alone replays the same fatal error. A row still marked `running` after a hard kill is only
+claimed with `resume=True`; without it the run skips it instead of forking a traversal.
+
+**"`Handoff.rewind` raises a `FatalError`."** The target must be a declared, strictly earlier task, named by
+a unique task name or by its seq. Self-rewind, `end`, and a destination that the pipeline did not declare
+are authoring mistakes, so they are fatal and never retried; `retry_all` likewise needs its source in
+`control.retry_all` and accepts no value.
+
+## Where to look next
+
+Looking for a specific feature rather than a whole document? See [Find what you need](#find-what-you-need)
+near the top.
+
+| Resource | What is in it |
+|---|---|
+| [`docs/reference.md`](reference.md) | every public class and function: signatures, parameters, examples |
+| [`docs/cli.md`](cli.md) | every subcommand and flag, exit codes, the config file reference |
+| [`docs/design.md`](design.md) | conceptual model, six invariants, lease contract, data model, tradeoffs |
+| [`README.md`](../README.md) | the compact tour: scheduling guarantees, sharding, plugins, out of scope |
+| [`examples/quickstart.py`](../examples/quickstart.py) | the SDK in 60 lines, with a resume round |
+| [`examples/llm_eval/`](../examples/llm_eval/README.md) | the full evaluation, two pipeline shapes, measured checkpoint granularity |
+| [`examples/sharded.py`](../examples/sharded.py) | one dataset across N stores, then a merged report |
+| [`examples/plugin_package/`](../examples/plugin_package/README.md) | an installable plugin: tasks, an algorithm, a codec |
+| [`examples/qa_eval.yaml`](../examples/qa_eval.yaml) | the declarative path, end to end |

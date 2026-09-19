@@ -269,8 +269,10 @@ with Runner(store=":memory:", concurrency=4) as runner:
   发送给一个更早的任务；`Handoff.retry_all()` 从最初绑定的种子重新开始。需要声明
   `control.rewind` / `control.retry_all` 以及有限的 `control.max_handoffs`。可选的 `HistoryArtifact`
   载荷提供显式的快照与恢复；普通字典仍然由作者控制。
-  访问（visits）与确切的工件出现记录都会保留历史，使恢复安全。API、预算和恢复边界见
-  [反向遍历指南](docs/zh-CN/backward.md)。
+  访问（visits）与确切的工件出现记录都会保留历史，使恢复安全。API、预算与恢复边界见
+  [reference → 进阶：反向遍历](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/reference.md#进阶反向遍历rewindretry-allvisits)，
+  可运行的程序见
+  [tutorial 第 16–17 步](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/tutorial.md#第-16-步--高级用回退和全部重试重新生成)。
 
 API 就是一个类（[`Handoff`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/reference.md#进阶交接可选启用)）、
 一个声明——正向跳转用 `control={"edges": {...}}`，反向遍历用 `control.rewind` / `control.retry_all` /
@@ -445,11 +447,10 @@ uv run pyattacker bench --algorithms wait,backoff --seeds 5 --json runs/bench.js
 
 | 文档 | 内容 |
 |---|---|
-| [`docs/tutorial.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/tutorial.md) | 十六个可运行的步骤，从“单个任务”到分片评估与高级的交接/反向层级；每个步骤都由测试套件执行 |
-| [`docs/reference.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/reference.md) | 所有公开的类与函数：签名、参数、示例 |
+| [`docs/tutorial.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/tutorial.md) | 十七个可运行的步骤，从“单个任务”到分片评估与高级的交接/反向层级——包含回退、全部重试与载荷历史；每个步骤都由测试套件执行 |
+| [`docs/reference.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/reference.md) | 所有公开的类与函数：签名、参数、示例——包括高级的反向遍历层级与 `HistoryArtifact` |
 | [`docs/cli.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/cli.md) | 每个子命令、每个标志、退出码、配置参考 |
 | [`docs/design.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/design.md) | 概念模型、六条不变量、租约契约、数据模型、权衡 |
-| [`docs/backward.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/backward.md) | 高级层级：回退、全部重试、visits、控制预算、可选的载荷历史 |
 | [`docs/benchmark.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/benchmark.md) | 算法基准测试：场景假设了什么、各指标含义、如何阅读表格 |
 | [`CHANGELOG.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/CHANGELOG.md) | 每个发布版本改动了什么 |
 | [`docs/releasing.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/releasing.md) | 面向维护者：一个发布版本如何切出并发布 |

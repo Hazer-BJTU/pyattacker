@@ -88,7 +88,7 @@ which keeps the payload a checkpoint needs.
 backward-enabled pipeline is never taken over without it: the run skips that row (`pipeline.skipped` with
 `reason="owned_by_another_run"`) rather than forking a traversal another run may still own. A restart that
 should *discard* a checkpoint instead of resuming it is `--fresh-restart` (`fresh_restart=True`), which also
-resets a spent handoff budget; see [backward traversal](backward.md#recovery-and-ownership).
+resets a spent handoff budget; see [backward traversal](reference.md#recovery-and-ownership).
 
 ## `demo` — verify the install with zero config
 
@@ -367,8 +367,11 @@ Anything it cannot express is a reason to use the SDK, not a reason to add YAML 
 required positive `max_handoffs` for backward traversal. `edges` is optional for backward-only plans;
 existing forward-only declarations stay unchanged. `run.max_handoffs` sets the runtime ceiling (default
 1000). Validation shares Python's name/seq resolution and reports configuration field paths. Rewind payloads
-are chosen by task code, not config. See [the backward guide](backward.md) for working Python examples,
-state-history interfaces, budget lifecycle and missing-payload recovery.
+are chosen by task code, not config. See
+[reference → advanced: backward traversal](reference.md#advanced-backward-traversal-rewind-retry-all-visits)
+for the syntax, the visit model, the budget lifecycle and missing-payload recovery, and
+[tutorial steps 16–17](tutorial.md#step-16--advanced-regenerating-with-rewind-and-retry-all) for working
+Python examples, `HistoryArtifact` included.
 
 ## See also
 

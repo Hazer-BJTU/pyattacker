@@ -43,7 +43,8 @@
 | 存储自定义类型或大载荷，发布插件 | [第 14 步](tutorial.md#第-14-步--自定义类型blob插件) | [编解码器](reference.md#codecregistry)、[后端](reference.md#工件后端)、[插件](reference.md#插件) |
 | 监控正在进行的运行 | [第 14 步](tutorial.md#第-14-步--自定义类型blob插件) | [监控](reference.md#监控) |
 | 在任务内部跳过链中剩余部分（高级） | [第 15 步](tutorial.md#第-15-步--高级跳过站点交接) | [交接](reference.md#进阶交接可选启用) |
-| 把工作送回更早的站点（高级） | [第 16 步](tutorial.md#第-16-步--高级用回退和全部重试重新生成) | [反向遍历](backward.md) |
+| 把工作送回更早的站点（高级） | [第 16 步](tutorial.md#第-16-步--高级用回退和全部重试重新生成) | [反向遍历](reference.md#进阶反向遍历rewindretry-allvisits) |
+| 在载荷内部快照与恢复状态（高级） | [第 17 步](tutorial.md#第-17-步--高级让载荷自带历史) | [`HistoryArtifact`](reference.md#historyartifact) |
 
 ---
 
@@ -1732,7 +1733,8 @@ cdce72ca  state=succeeded  ran=['prepare', 'ask', 'judge', 'report']  skipped=['
   想要的是图引擎，而本框架不是。
 * **进阶层级。** 它可选启用，会改变执行模型，并且在 1.0 之前都是实验性的：上面这些
   保证是稳定的，但写法仍可能变化。单独声明的反向操作会
-  使用访问和有限预算；参见 [回退、全部重试与载荷历史](backward.md)。
+  使用访问和有限预算；参见[第 16 步](tutorial.md#第-16-步--高级用回退和全部重试重新生成)
+  以及 [reference → 进阶：反向遍历](reference.md#进阶反向遍历rewindretry-allvisits)。
   两个内置存储都能提交交接；不能提交的自定义存储会在一开始就被拒绝，并抛出
   `ConfigError`，而不是写入一次无法在崩溃后存活的跳转。
 
@@ -1745,84 +1747,6 @@ cdce72ca  state=succeeded  ran=['prepare', 'ask', 'judge', 'report']  skipped=['
 [存储恢复契约](reference.md#表与读取器)。
 
 ---
-
-## 速查表
-
-| 我想…… | 这样做 |
-|---|---|
-| 在一个数据集上运行一个任务 | `Runner(store=..., pools=[...]).run(template.map(rows))` |
-| 每行 k 个样本 | `template.map(rows, repeats=k)` |
-| 从我的数据集生成稳定的 id | `template.map(rows, key_of=lambda r: r["qid"])` |
-| 不碰磁盘地测试 | `Runner(store=":memory:")` |
-| 查看发生了什么 | `report.summary()`、`report.to_dict()`、`store.errors()` |
-| 查看为什么慢 | `store.attempts(pipeline_id=...)` → `duration_ms`、`decision`、`leases` |
-| 崩溃后恢复 | `runner.run(specs, resume=True)` 或 `pyattacker resume -c cfg.yaml` |
-| 重新运行我不信任的结果 | `retry_succeeded=True` / `--retry-succeeded` |
-| 从种子重新开始一条流水线，并保留其审计行 | `fresh_restart=True` / `--fresh-restart` |
-| 限制影响范围 | `stop_after_failures=N`、`stop_after_s=T`、`--limit N` |
-| 限制每个端点的并发 | `Resource.create(..., capacity=N)` |
-| 快速失败而不是排队 | `algorithm="immediate"` + `Retrying(retry_unknown=True)` |
-| 扛过 429 | `raise RetryableError(..., error_class="rate_limit", retry_after=...)` |
-| 把大载荷存到数据库之外 | `--artifact-backend file:///data/blobs` |
-| 使用四个进程 | `--shards 4 --jobs 4`，然后对分片文件运行 `report`/`export` |
-| 在步骤内分支 | `fanout(task_a, task_b)` |
-| 有记录地向前跳过 / 提前结束 | 在声明了 `control={"edges": {...}}` 的流水线上 `return Handoff.to("report", v)` / `Handoff.end(v)` |
-| 让我的代码可以从 YAML 使用 | 不用插件：`use: my_pkg.tasks:my_task`；在 `pyattacker.tasks` 中有入口点：`use: my_task` |
-
-所有类和函数，含签名与参数表：[`docs/reference.md`](reference.md)。
-
-## 疑难排查
-
-**“我的任务接收三个参数。”** 任务是一元的：`(value)` 或 `(value, ctx)`。把额外状态放进
-工厂闭包（`def make_task(model): @task(...) async def t(value, ctx): ...; return t`）——这与
-第 6 步使用的模式相同。
-
-**“恢复重新运行了整条流水线。”** 存储几乎可以肯定是以 `journal: summary` 写入的，
-它保留摘要但不保留载荷，因此检查点无法解码。请查找
-`pipeline.checkpoint_missing` 事件。请使用 `journal: full`（默认值）。
-
-**“什么都没运行，也没有任何行。”** 每条流水线都因为已经成功而被跳过——参见
-`report.skipped`。这是预期行为，第二次完全相同的运行也是如此。
-
-**“一条流水线以 `unknown` 失败了。”** 该异常无法归类（例如
-`ResourceUnavailable`，或者裸的 `Exception`）。要么映射它——`raise RetryableError(...)`——要么
-在你确实想重试任何东西时设置 `retry_unknown=True`。
-
-**“它挂住了，没有任何输出。”** 要么是选择器匹配不到任何资源而算法是 `wait`；要么是一个任务持有
-来自某个资源池的租约，同时又向同一个资源池申请另一个（查找 `acquire.suspected_deadlock`
-事件）；要么是你自己代码里的某个 `await` 永不返回。任务上的 `timeout_s=` 和
-acquire 回合上的 `timeout=` 都会变成错误。
-
-**“我的资源永远不回来。”** 它会回来的——检查 `leases_leaked` 和 `lease.leaked` 事件：你使用了
-`await ctx.acquire_lease()` 却没有归还。请使用 `async with`，并在 CI 中设置 `strict_leases=True`，让这种情况
-醒目地失败。
-
-**“存储文件被占用 / 一个进程不够用。”** SQLite 只允许一个写入者。请分片到几个
-各自拥有存储的进程（见第 12 步），而不是让多次运行指向同一个文件。
-
-**“我的工件字节去哪了？”** 如果设置了 `journal: summary` 或 `null` 后端，就只会保留
-摘要。否则检查 `blob_ref`：载荷可能在文件后端里，读取时是透明的。
-
-**“一次运行在重试退避中花了 30 秒，我失去了并发。”** 你并没有：这条流水线挂起在
-延迟队列中，worker 去做了其他工作。`runner.stats()["delayed_pipelines"]` 显示当前有多少条
-处于挂起状态。
-
-## 接下来该看什么
-
-想找某个特定功能而不是整篇文档？请见靠近开头的
-[找到你需要的内容](tutorial.md#找到你需要的内容)。
-
-| 资源 | 里面有什么 |
-|---|---|
-| [`docs/reference.md`](reference.md) | 每个公开类和函数：签名、参数、示例 |
-| [`docs/cli.md`](cli.md) | 每个子命令和标志、退出码、配置文件参考 |
-| [`docs/design.md`](design.md) | 概念模型、六条不变量、租约契约、数据模型、权衡 |
-| [`README.md`](../../README.zh-CN.md) | 精简导览：调度保证、分片、插件、不在范围内的内容 |
-| [`examples/quickstart.py`](../../examples/quickstart.py) | 60 行讲完 SDK，含一轮恢复 |
-| [`examples/llm_eval/`](../../examples/llm_eval/README.zh-CN.md) | 完整评测、两种流水线形态、实测的检查点粒度 |
-| [`examples/sharded.py`](../../examples/sharded.py) | 一个数据集分布在 N 个存储上，然后合并报告 |
-| [`examples/plugin_package/`](../../examples/plugin_package/README.zh-CN.md) | 可安装的插件：任务、一个算法、一个编解码器 |
-| [`examples/qa_eval.yaml`](../../examples/qa_eval.yaml) | 声明式路径，端到端 |
 
 ## 第 16 步 —— 高级：用回退和全部重试重新生成
 
@@ -1868,8 +1792,9 @@ def validate(row: dict, ctx) -> Handoff | dict:
 
 @task("report")
 def report(row: dict, ctx) -> dict:
-    # ctx.visit is 1 when this row was regenerated once, 0 when the first sample passed
-    return {"answer": row["answer"], "regenerations": ctx.visit, "temperature": row["temperature"]}
+    # ctx.visit counts entries into *this* station, and report ran once — so it is 0 here. How many
+    # regenerations the row needed is the generate station's counter, printed from the store below.
+    return {"answer": row["answer"], "temperature": row["temperature"]}
 
 
 # `rewind` is declared from validate to the strictly earlier generate; max_handoffs is required and is
@@ -1943,4 +1868,230 @@ effective outputs: {0: 0, 1: 1, 2: 1, 3: 0}
   快照/恢复的簿记；运行器中没有任何东西会读取它来决定下一步去哪。
 
 完整接口——访问/发生实例（occurrence）模型、预算生命周期、存储能力以及
-`HistoryArtifact` 编解码器——见 [反向指南](backward.md)。
+`HistoryArtifact` 编解码器——见 [reference → 进阶：反向遍历](reference.md#进阶反向遍历rewindretry-allvisits)，
+而可选的载荷历史在下一步。
+
+---
+
+## 第 17 步 —— 高级：让载荷自带历史
+
+**同样是高级特性、同样可选启用，而且它完全不改变调度。** 第 15、16 步决定流水线*去哪里*；这一步则是
+回退的可选搭档，用于你送回的那个状态本身需要携带具名检查点的场合。
+
+场景：`validate` 想把 `generate` 送回**那个失败样本之前**的状态，而不是作者手工重建的字典。手工
+构造那个字典是常见做法，也正是第 16 步做的事，本身没有任何问题。但当载荷*本身*就是应用的
+状态机——它有若干阶段，早先的阶段值得保留，而“从阶段 2 重新生成，同时让阶段 3 留在记录里”才是
+你想要的操作——`HistoryArtifact` 就是这个可选的载荷基类：它携带应用状态的分离快照，以及对应的
+版本化编解码器。
+
+```python
+# tutorial/step_17_history.py
+"""Step 17 (advanced) - optional payload history: named checkpoints carried inside the payload."""
+
+from pyattacker import CodecRegistry, Handoff, HistoryArtifact, Runner, pipeline, task
+
+
+class DraftState(HistoryArtifact):
+    """Application state with its own snapshots; the runner stores it and never reads it."""
+
+
+@task("prepare")
+def prepare(seed: dict) -> DraftState:
+    state = DraftState({"prompt": seed["prompt"], "temperature": 0.2})
+    return state.checkpoint("prepared")
+
+
+@task("generate")
+def generate(state: DraftState, ctx) -> DraftState:
+    # <- your model call: a revisit is a genuinely new sample, so the label names the visit
+    draft = state.with_state({**state.state, "answer": f"sample-{ctx.visit}", "valid": ctx.visit >= 1})
+    return draft.checkpoint(f"sample-{ctx.visit}", metadata={"temperature": draft.state["temperature"]})
+
+
+@task("validate")
+def validate(state: DraftState, ctx) -> Handoff | DraftState:
+    if not state.state["valid"]:
+        # Go back to the snapshot taken before this sample, then choose what the generator sees next.
+        base = state.restore("prepared")
+        return Handoff.rewind(
+            "generate",
+            base.with_state({**base.state, "temperature": 0.7}),
+            reason="answer did not parse",
+        )
+    return state
+
+
+@task("report")
+def report(state: DraftState, ctx) -> dict:
+    # The decoded payload still carries every snapshot, in order, plus the one that is selected.
+    return {
+        "answer": state.state["answer"],
+        "labels": [row["label"] for row in state.history],
+        "selected": state.selected,
+    }
+
+
+registry = CodecRegistry()
+registry.register_type(DraftState)   # decoding restores DraftState, not a bare HistoryArtifact
+
+# The same registry goes to the template (for seeds) and to the Runner (for checkpoints) - Step 14's rule.
+template = pipeline(
+    "draft",
+    prepare | generate | validate | report,
+    registry=registry,
+    control={"rewind": {"validate": ["generate"]}, "max_handoffs": 3},
+)
+
+with Runner(store=":memory:", registry=registry) as runner:
+    report_obj = runner.run(template.map([{"prompt": "Return JSON with one field"}]))
+    print(report_obj.summary())
+    store = runner.store
+    record = next(iter(store.pipelines()))
+    for row in store.tasks(record.pipeline_id):
+        print(f"   seq={row.seq} visit={row.visit} {row.name:9s} {row.state}")
+    validate_output = runner.registry.load(store.get_artifact(record.pipeline_id, 2).encoded())
+    print("\nfinal artifact:", runner.registry.load(store.get_artifact(record.pipeline_id, 3).encoded()))
+    print("snapshots:", [row["label"] for row in validate_output.history])
+    print("selected:", validate_output.selected)
+    pruned = validate_output.prune("sample-0")   # explicit, and never the selected snapshot
+    print("after pruning sample-0:", [row["label"] for row in pruned.history])
+    try:
+        pruned.prune("prepared")
+    except ValueError as exc:
+        print("prune refused:", exc)
+```
+
+遍历过程与第 16 步相同；新的一点是载荷自己记住了它走过的位置：
+
+```text
+   seq=0 visit=0 prepare   succeeded
+   seq=1 visit=0 generate  succeeded
+   seq=1 visit=1 generate  succeeded
+   seq=2 visit=0 validate  handed_off
+   seq=2 visit=1 validate  succeeded
+   seq=3 visit=0 report    succeeded
+
+final artifact: {'answer': 'sample-1', 'labels': ['prepared', 'sample-0', 'sample-1'], 'selected': 'snapshot:0'}
+snapshots: ['prepared', 'sample-0', 'sample-1']
+selected: snapshot:0
+after pruning sample-0: ['prepared', 'sample-1']
+prune refused: cannot prune the selected snapshot
+```
+
+动手用它之前值得知道的事：
+
+* **它是载荷，不是记录。** `HistoryArtifact` 是解码后的应用值；它*不是*持久化的 `Artifact` 行，
+  快照历史也绝不取代框架的执行账本、任务行或访问记录。runner 中没有任何代码会读它来决定下一步去
+  哪里——你返回的 `Handoff.rewind` 仍然是唯一移动流水线的东西。普通字典仍然是普通字典：任务进入
+  或完成时都不会自动生成快照。
+* **快照是分离的，所以嵌套修改改不了过去。** `state`、`history` 和 `snapshot(...)` 返回的都是深
+  拷贝；`checkpoint(label, *, metadata=None)` 追加一个带有稳定 id（`snapshot:0`、`snapshot:1`……）
+  和唯一标签的快照，`snapshot:` 前缀保留给这些 id。`with_state(value)` 替换当前状态但*不*追加快照；
+  `restore(id_or_label)` 替换当前状态*并且*记录 `selected`，同时保留整段历史，让后续阶段仍可检视；
+  `prune(*selectors)` 是显式丢弃快照的方式——选择器指向被选中的快照时它会抛出 `ValueError` 而不是照
+  做，并且 id 不会被重用。
+* **持久化是提交的事，不是 `checkpoint()` 的事。** 在任务里调用 `checkpoint()` 不会碰存储。runner
+  在提交任务输出或控制转移时把载荷（连同历史）一起持久化，和其他工件完全一样。在那次提交之前崩溃，
+  内存里的快照就丢了，编解码器帮不上忙。
+* **编解码器需要那个类。** 状态与 metadata 必须可 JSON 序列化，而版本化的 `history-v1` 编解码器恢复
+  的不只是快照，还有已注册的子类：把同一个 `CodecRegistry` 交给 `pipeline(..., registry=...)` 和
+  `Runner(..., registry=...)`（第 14 步），并用 `register_type` 注册子类——未注册的子类会明确解码
+  失败，而不是以 `HistoryArtifact` 的身份回来。子类继承基类的构造函数，因此应用字段放在 `state`
+  里；自定义构造函数和额外属性不在这个接口的范围内。
+* **历史随载荷一起增长。** 每个快照都会被完整保留，所以一个长期存活的值的体积会随快照的数量与大小
+  增长；要有意识地 prune。对于“把这一行送回去”这种用法，常见形态是每次访问留一个快照，外加你想
+  回到的那些状态，上面的程序就是这么做的。
+
+---
+
+## 速查表
+
+| 我想…… | 这样做 |
+|---|---|
+| 在一个数据集上运行一个任务 | `Runner(store=..., pools=[...]).run(template.map(rows))` |
+| 每行 k 个样本 | `template.map(rows, repeats=k)` |
+| 从我的数据集生成稳定的 id | `template.map(rows, key_of=lambda r: r["qid"])` |
+| 不碰磁盘地测试 | `Runner(store=":memory:")` |
+| 查看发生了什么 | `report.summary()`、`report.to_dict()`、`store.errors()` |
+| 查看为什么慢 | `store.attempts(pipeline_id=...)` → `duration_ms`、`decision`、`leases` |
+| 崩溃后恢复 | `runner.run(specs, resume=True)` 或 `pyattacker resume -c cfg.yaml` |
+| 重新运行我不信任的结果 | `retry_succeeded=True` / `--retry-succeeded` |
+| 从种子重新开始一条流水线，并保留其审计行 | `fresh_restart=True` / `--fresh-restart` |
+| 限制影响范围 | `stop_after_failures=N`、`stop_after_s=T`、`--limit N` |
+| 限制每个端点的并发 | `Resource.create(..., capacity=N)` |
+| 快速失败而不是排队 | `algorithm="immediate"` + `Retrying(retry_unknown=True)` |
+| 扛过 429 | `raise RetryableError(..., error_class="rate_limit", retry_after=...)` |
+| 把大载荷存到数据库之外 | `--artifact-backend file:///data/blobs` |
+| 使用四个进程 | `--shards 4 --jobs 4`，然后对分片文件运行 `report`/`export` |
+| 在步骤内分支 | `fanout(task_a, task_b)` |
+| 有记录地向前跳过 / 提前结束 | 在声明了 `control={"edges": {...}}` 的流水线上 `return Handoff.to("report", v)` / `Handoff.end(v)` |
+| 把一个站点送回更早的站点（高级） | 在声明了 `control={"rewind": {...}, "max_handoffs": N}` 的流水线上 `return Handoff.rewind("generate", chosen_state)` |
+| 让整条流水线从自己的种子重新开始（高级） | 在声明了 `control={"retry_all": [...], "max_handoffs": N}` 的流水线上 `return Handoff.retry_all()` |
+| 在载荷内部保留具名状态检查点（高级） | `class S(HistoryArtifact)`，然后 `s.checkpoint("label")` / `.restore(...)` / `.prune(...)`，并在两个注册表里登记 |
+| 让我的代码可以从 YAML 使用 | 不用插件：`use: my_pkg.tasks:my_task`；在 `pyattacker.tasks` 中有入口点：`use: my_task` |
+
+所有类和函数，含签名与参数表：[`docs/reference.md`](reference.md)。
+
+## 疑难排查
+
+**“我的任务接收三个参数。”** 任务是一元的：`(value)` 或 `(value, ctx)`。把额外状态放进
+工厂闭包（`def make_task(model): @task(...) async def t(value, ctx): ...; return t`）——这与
+第 6 步使用的模式相同。
+
+**“恢复重新运行了整条流水线。”** 存储几乎可以肯定是以 `journal: summary` 写入的，
+它保留摘要但不保留载荷，因此检查点无法解码。请查找
+`pipeline.checkpoint_missing` 事件。请使用 `journal: full`（默认值）。
+
+**“什么都没运行，也没有任何行。”** 每条流水线都因为已经成功而被跳过——参见
+`report.skipped`。这是预期行为，第二次完全相同的运行也是如此。
+
+**“一条流水线以 `unknown` 失败了。”** 该异常无法归类（例如
+`ResourceUnavailable`，或者裸的 `Exception`）。要么映射它——`raise RetryableError(...)`——要么
+在你确实想重试任何东西时设置 `retry_unknown=True`。
+
+**“它挂住了，没有任何输出。”** 要么是选择器匹配不到任何资源而算法是 `wait`；要么是一个任务持有
+来自某个资源池的租约，同时又向同一个资源池申请另一个（查找 `acquire.suspected_deadlock`
+事件）；要么是你自己代码里的某个 `await` 永不返回。任务上的 `timeout_s=` 和
+acquire 回合上的 `timeout=` 都会变成错误。
+
+**“我的资源永远不回来。”** 它会回来的——检查 `leases_leaked` 和 `lease.leaked` 事件：你使用了
+`await ctx.acquire_lease()` 却没有归还。请使用 `async with`，并在 CI 中设置 `strict_leases=True`，让这种情况
+醒目地失败。
+
+**“存储文件被占用 / 一个进程不够用。”** SQLite 只允许一个写入者。请分片到几个
+各自拥有存储的进程（见第 12 步），而不是让多次运行指向同一个文件。
+
+**“我的工件字节去哪了？”** 如果设置了 `journal: summary` 或 `null` 后端，就只会保留
+摘要。否则检查 `blob_ref`：载荷可能在文件后端里，读取时是透明的。
+
+**“一次运行在重试退避中花了 30 秒，我失去了并发。”** 你并没有：这条流水线挂起在
+延迟队列中，worker 去做了其他工作。`runner.stats()["delayed_pipelines"]` 显示当前有多少条
+处于挂起状态。
+
+**“反向流水线在建流水线时就失败，或者跑着跑着预算就耗尽了。”** 只要声明了 `rewind` 或
+`retry_all`，`control.max_handoffs` 就是必需的，而且必须是正整数，所以 `0`、`"3"`、`3.0`
+和 `True` 都会被拒绝。每一次非终止转移都会消耗它，并且它会跨 resume 保留，因此一条*因为*
+预算耗尽而失败的流水线需要 `fresh_restart=True` / `--fresh-restart`：只写 `resume=True`
+只会重放同一个致命错误。硬杀之后仍标记为 `running` 的行只有在 `resume=True` 时才会被接管；
+否则这次运行会跳过它，而不是把一条遍历分叉出去。
+
+**“`Handoff.rewind` 抛出 `FatalError`。”** 目标必须是已声明的、严格更早的任务，用唯一的任务名
+或它的 seq 指定。自回退、`end`，以及流水线没有声明的目的地都属于编写错误，因此是致命错误、
+永不被重试；`retry_all` 同样需要它的来源出现在 `control.retry_all` 中，并且不接受任何值。
+
+## 接下来该看什么
+
+想找某个特定功能而不是整篇文档？请见靠近开头的
+[找到你需要的内容](tutorial.md#找到你需要的内容)。
+
+| 资源 | 里面有什么 |
+|---|---|
+| [`docs/reference.md`](reference.md) | 每个公开类和函数：签名、参数、示例 |
+| [`docs/cli.md`](cli.md) | 每个子命令和标志、退出码、配置文件参考 |
+| [`docs/design.md`](design.md) | 概念模型、六条不变量、租约契约、数据模型、权衡 |
+| [`README.md`](../../README.zh-CN.md) | 精简导览：调度保证、分片、插件、不在范围内的内容 |
+| [`examples/quickstart.py`](../../examples/quickstart.py) | 60 行讲完 SDK，含一轮恢复 |
+| [`examples/llm_eval/`](../../examples/llm_eval/README.zh-CN.md) | 完整评测、两种流水线形态、实测的检查点粒度 |
+| [`examples/sharded.py`](../../examples/sharded.py) | 一个数据集分布在 N 个存储上，然后合并报告 |
+| [`examples/plugin_package/`](../../examples/plugin_package/README.zh-CN.md) | 可安装的插件：任务、一个算法、一个编解码器 |
+| [`examples/qa_eval.yaml`](../../examples/qa_eval.yaml) | 声明式路径，端到端 |

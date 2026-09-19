@@ -367,7 +367,7 @@ into a crash.
 ### 4.8 Advanced: Handoffs —— Declared Forward Jumps (Opt-In, Experimental)
 
 The forward-only contract below remains the v1 path. Backward-enabled declarations use the visit-aware
-contract in §4.8.8 and [the backward guide](backward.md); forward-only traversal still uses its existing
+contract in §4.8.8 and [the backward reference](reference.md#advanced-backward-traversal-rewind-retry-all-visits); forward-only traversal still uses its existing
 ledger/cursor recovery without new identity or budget requirements.
 
 Everything above describes an ordinary pipeline: a chain walked one task at a time, each task returning the
@@ -585,7 +585,10 @@ the way they are, and it is the reason the model below is specified now rather t
 Implemented as a separate opt-in capability: `control.rewind` declares strictly earlier destinations,
 `control.retry_all` declares sources, and `control.max_handoffs` bounds traversal. Rewind requires explicit
 author-selected entry state; retry-all decodes the original seed captured at binding. History-bearing
-payloads are optional and never drive scheduling. The [backward guide](backward.md) describes the interface.
+payloads are optional and never drive scheduling. The
+[backward reference](reference.md#advanced-backward-traversal-rewind-retry-all-visits) specifies the
+interface, and [tutorial steps 16–17](tutorial.md#step-16--advanced-regenerating-with-rewind-and-retry-all)
+build it up from a working program.
 
 A persisted traversal record owns per-seq counters, effective slot-to-visit mappings and pending entry,
 including its exact input occurrence. Every fresh entry allocates a visit; resume reuses the pending visit.
