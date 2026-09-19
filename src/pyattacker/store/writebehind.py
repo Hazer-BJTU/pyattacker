@@ -283,10 +283,11 @@ class WriteBehindStore:
         return _iter_attempts(self.inner, run_id=run_id, pipeline_id=pipeline_id)
 
     def iter_events(
-        self, *, pipeline_id: str | None = None, run_id: str | None = None
+        self, *, pipeline_id: str | None = None, run_id: str | None = None,
+        kind: str | None = None
     ) -> Iterator[EventRecord]:
         self.flush()
-        return _iter_events(self.inner, pipeline_id=pipeline_id, run_id=run_id)
+        return _iter_events(self.inner, pipeline_id=pipeline_id, run_id=run_id, kind=kind)
 
     def iter_artifacts(self, *, pipeline_id: str) -> Iterator[Artifact]:
         self.flush()
@@ -299,10 +300,29 @@ class WriteBehindStore:
         return self.inner.pipelines(run_id=run_id, state=state, limit=limit)
 
     def events(
-        self, *, pipeline_id: str | None = None, run_id: str | None = None, limit: int = 200
+        self, *, pipeline_id: str | None = None, run_id: str | None = None,
+        kind: str | None = None, limit: int = 200
     ) -> list[EventRecord]:
         self.flush()
-        return self.inner.events(pipeline_id=pipeline_id, run_id=run_id, limit=limit)
+        # When kind is None, don't forward it to legacy inner stores that don't accept the kwarg.
+        if kind is None:
+            return self.inner.events(pipeline_id=pipeline_id, run_id=run_id, limit=limit)
+        return self.inner.events(pipeline_id=pipeline_id, run_id=run_id, kind=kind, limit=limit)
+
+    def count_events(
+        self, *, kind: str | None = None, run_id: str | None = None,
+        pipeline_id: str | None = None,
+    ) -> int:
+        self.flush()
+        native = getattr(self.inner, "count_events", None)
+        if callable(native):
+            return int(native(kind=kind, run_id=run_id, pipeline_id=pipeline_id))
+        # Fallback: use the compatibility-aware iterator helper so legacy inner stores
+        # that don't accept `kind` don't crash.
+        from .base import iter_events
+        return sum(
+            1 for _ in iter_events(self.inner, kind=kind, run_id=run_id, pipeline_id=pipeline_id)
+        )
 
     def stats(self, run_id: str | None = None) -> dict[str, Any]:
         self.flush()

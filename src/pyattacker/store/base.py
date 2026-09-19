@@ -430,7 +430,8 @@ class Store(Protocol):
     ) -> list[PipelineRecord]: ...
 
     def events(
-        self, *, pipeline_id: str | None = None, run_id: str | None = None, limit: int = 200
+        self, *, pipeline_id: str | None = None, run_id: str | None = None,
+        kind: str | None = None, limit: int = 200
     ) -> list[EventRecord]: ...
 
     def stats(self, run_id: str | None = None) -> dict[str, Any]: ...
@@ -440,6 +441,28 @@ class Store(Protocol):
     def export_rows(self, *, run_id: str | None = None) -> Iterator[dict[str, Any]]: ...
 
     def close(self) -> None: ...
+
+
+def count_events(
+    store: Store, *, kind: str | None = None, run_id: str | None = None,
+    pipeline_id: str | None = None,
+) -> int:
+    """Count events matching the filters, without materializing them.
+
+    Prefers a native aggregate method when the store has one (``count_events``);
+    otherwise falls back to iterating and counting via the compatibility-aware
+    ``iter_events()`` helper — which handles legacy stores that don't accept
+    the ``kind`` keyword. Built-in stores use their native aggregate, so the
+    normal large-store path stays O(1) in materialized Python objects.
+    """
+    native = getattr(store, "count_events", None)
+    if callable(native):
+        return int(native(kind=kind, run_id=run_id, pipeline_id=pipeline_id))
+    # Fallback: iterate and count. Use the compatibility-aware iterator so legacy
+    # stores without `kind` support don't crash.
+    return sum(
+        1 for _ in iter_events(store, kind=kind, run_id=run_id, pipeline_id=pipeline_id)
+    )
 
 
 @runtime_checkable
@@ -478,7 +501,8 @@ class PagedStore(Protocol):
     ) -> Iterator[AttemptRecord]: ...
 
     def iter_events(
-        self, *, pipeline_id: str | None = None, run_id: str | None = None
+        self, *, pipeline_id: str | None = None, run_id: str | None = None,
+        kind: str | None = None
     ) -> Iterator[EventRecord]: ...
 
     def iter_artifacts(self, *, pipeline_id: str) -> Iterator[Artifact]: ...
@@ -578,7 +602,8 @@ def iter_attempts(
 
 
 def iter_events(
-    store: Store, *, pipeline_id: str | None = None, run_id: str | None = None
+    store: Store, *, pipeline_id: str | None = None, run_id: str | None = None,
+    kind: str | None = None
 ) -> Iterator[EventRecord]:
     """Stream events in insertion order (``event_id``), oldest first.
 
@@ -586,15 +611,52 @@ def iter_events(
     cannot drop or duplicate a row. The iterator is bound to the high-water mark taken when its
     first page is read: events emitted after that are not part of this traversal (per iterator, not
     permanent — a new iterator sees them).
+
+    Backward compatibility: when ``kind`` is ``None``, the keyword is not passed to legacy
+    implementations (which may not accept it). When ``kind`` is provided but the native method
+    doesn't support it, we fall back to materializing and filtering in Python.
+
+    The compatibility fallback only catches ``TypeError`` from the *method invocation itself* —
+    not from errors raised inside the iterator body. That way backend bugs are not silently
+    converted into compatibility fallback behavior.
     """
     native = getattr(store, "iter_events", None)
     if callable(native):
-        yield from native(pipeline_id=pipeline_id, run_id=run_id)
+        # When kind is None, call the legacy-compatible signature directly (no kind kwarg).
+        # When kind is provided, try with it first; if the legacy signature doesn't accept it,
+        # retry without kind and filter in Python. The try/except only wraps the *call*,
+        # not iteration, so TypeErrors raised inside the iterator body propagate normally.
+        if kind is None:
+            yield from native(pipeline_id=pipeline_id, run_id=run_id)
+            return
+        try:
+            iterator = native(pipeline_id=pipeline_id, run_id=run_id, kind=kind)
+        except TypeError:
+            # Legacy store without kind support: pull everything and filter in Python.
+            iterator = native(pipeline_id=pipeline_id, run_id=run_id)
+            for event in iterator:
+                if event.kind == kind:
+                    yield event
+            return
+        yield from iterator
     else:
         # The list API's own `limit` means "the most recent N" (default 200) and cannot express
         # "everything", so the fallback asks for the largest limit it can represent. Both built-in
         # stores return the selected events oldest first, which is the order the export documents.
-        yield from store.events(pipeline_id=pipeline_id, run_id=run_id, limit=_LIST_LIMIT_ALL)
+        kwargs: dict[str, Any] = {"pipeline_id": pipeline_id, "run_id": run_id, "limit": _LIST_LIMIT_ALL}
+        if kind is not None:
+            kwargs["kind"] = kind
+        try:
+            rows = store.events(**kwargs)
+        except TypeError:
+            if kind is None:
+                raise
+            # Legacy events() without kind support: pull everything and filter in Python.
+            del kwargs["kind"]
+            rows = store.events(**kwargs)
+        for event in rows:
+            if kind is None or event.kind == kind:
+                yield event
 
 
 def iter_artifacts(store: Store, *, pipeline_id: str) -> Iterator[Artifact]:

@@ -37,6 +37,7 @@ class MergedReport:
     events_total: int = 0
     attempts_total: int = 0
     handoffs_total: int = 0
+    repair_failures: int = 0
 
     # ----------------------------------------------------------------- views
     def stats(self) -> dict[str, Any]:
@@ -70,6 +71,7 @@ class MergedReport:
             "attempts_total": self.attempts_total,
             "handoffs_total": self.handoffs_total,
             "events_total": self.events_total,
+            "repair_failures": self.repair_failures,
             "duplicates_folded": self.duplicates,
         }
 
@@ -83,7 +85,8 @@ class MergedReport:
             + (f"  (folded {self.duplicates} duplicate rows)" if self.duplicates else ""),
             "  " + " ".join(f"{k}={v}" for k, v in sorted(by_state.items()))
             + f"  attempts={stats['attempts_total']} events={stats['events_total']}"
-            + (f"  handoffs={stats['handoffs_total']}" if stats["handoffs_total"] else ""),
+            + (f"  handoffs={stats['handoffs_total']}" if stats["handoffs_total"] else "")
+            + (f"  repair_failures={stats['repair_failures']}" if stats["repair_failures"] else ""),
             f"  pipeline latency ms: p50={durations['p50']} p95={durations['p95']} max={durations['max']}",
         ]
         tasks = stats["tasks"]["by_name"]
@@ -139,16 +142,26 @@ def merge_reports(
 ) -> MergedReport:
     """Merge pipeline rows from several stores. ``sources`` may be stores or SQLite paths."""
     if open_store is None:  # imported lazily so this module stays usable without SQLite
+        from .store.base import count_events as _count
         from .store.base import open_store as _open
 
         open_store = _open
+        count_ev = _count
+    else:
+        from .store.base import count_events as _count
+        count_ev = _count
+
     rows_by_id: dict[str, Mapping[str, Any]] = {}
     duplicates = 0
     events_total = 0
     attempts_total = 0
     handoffs_total = 0
+    # Track which pipelines have at least one failed terminal repair.
+    # We collect this during the store loop, before stores are closed.
+    repair_failed_pids: set[str] = set()
     paths: list[str] = []
     run_ids: list[str] = []
+
     for source in sources:
         store = source if hasattr(source, "export_rows") else open_store(str(source))
         path = getattr(store, "path", None) or getattr(getattr(store, "inner", None), "path", None)
@@ -167,6 +180,12 @@ def merge_reports(
                     rows_by_id[key] = _winner(rows_by_id[key], row)
                 else:
                     rows_by_id[key] = row
+                # Collect repair-failed pipeline ids from this store.
+                # (A pipeline may appear in multiple stores if they were copied.)
+                if key not in repair_failed_pids and count_ev(
+                    store, kind="pipeline.terminal_repair_failed", pipeline_id=key
+                ) > 0:
+                    repair_failed_pids.add(key)
         finally:
             if not hasattr(source, "export_rows"):
                 store.close()
@@ -180,4 +199,5 @@ def merge_reports(
         events_total=events_total,
         attempts_total=attempts_total,
         handoffs_total=handoffs_total,
+        repair_failures=len(repair_failed_pids),
     )

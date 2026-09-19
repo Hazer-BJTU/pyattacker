@@ -869,6 +869,72 @@ def test_a_failed_terminal_repair_is_visible_to_the_caller_and_exits_non_zero(
     assert payload["pipelines"]["by_state"] == {}
 
 
+def test_posthoc_report_shows_repair_failures(
+    tmp_path, monkeypatch, capsys
+):
+    """Issue #46: a post-hoc `report` must surface failed repair attempts from the event log."""
+    db = tmp_path / "repair.db"
+    cfg = _write_config(tmp_path, "repair.json", REPAIR_CONFIG)
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 0
+    pid = _poison_terminal_row(db)
+
+    # Inject a failing repair attempt
+    monkeypatch.setattr("pyattacker.runner.open_store", _failing_open_store)
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 1
+
+    # The run-local counter worked, but now we close and re-open the store
+    # (post-hoc view) and check that count_events() and events(kind=...) expose the failure.
+    from pyattacker.store.base import count_events
+    store = SqliteStore(str(db))
+    assert count_events(store, kind="pipeline.terminal_repair_failed") == 1
+    assert count_events(store, kind="pipeline.terminal_repair_failed", pipeline_id=pid) == 1
+
+    # events(kind=...) filters correctly
+    repair_events = store.events(kind="pipeline.terminal_repair_failed")
+    assert len(repair_events) == 1
+    assert repair_events[0].pipeline_id == pid
+
+    # Other kinds are excluded
+    all_events = store.events()
+    assert len(all_events) > len(repair_events)
+
+    store.close()
+
+    # Now run `pyattacker report` on the store and check it shows the repair failure
+    out = capsys.readouterr().out  # clear previous output
+    assert main(["report", str(db)]) == 0
+    out = capsys.readouterr().out
+    assert "Terminal repair failures: 1 pipeline(s)" in out
+
+
+def test_report_run_id_scope_associates_repair_failures_with_selected_pipelines(
+    tmp_path, monkeypatch, capsys
+):
+    """Issue #46: --run-id scopes repair failures to the pipelines in that run, not the event's run_id."""
+    db = tmp_path / "repair.db"
+    cfg = _write_config(tmp_path, "repair.json", REPAIR_CONFIG)
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 0
+    _poison_terminal_row(db)
+
+    # Inject a failing repair attempt from a *different* run
+    monkeypatch.setattr("pyattacker.runner.open_store", _failing_open_store)
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 1
+
+    # Now run `report --run-id run-original` (the pipeline row's owner).
+    # The repair failure event belongs to the second run, but the pipeline belongs to run-original.
+    # The report should still show the repair failure, because it's associated with the pipeline.
+    out = capsys.readouterr().out  # clear previous output
+    assert main(["report", str(db), "--run-id", "run-original"]) == 0
+    out = capsys.readouterr().out
+    assert "Terminal repair failures: 1 pipeline(s)" in out
+
+    # And JSON output should agree
+    assert main(["report", str(db), "--run-id", "run-original", "--json"]) == 0
+    out = capsys.readouterr().out
+    # The JSON is printed at the end; find it by looking for the repair_failures key
+    assert '"repair_failures": 1' in out
+
+
 # ---------------------------------------------------------- worker liveness (#44)
 class _WorkerDied(BaseException):
     """A direct ``BaseException``: nothing in the worker's own handler chain can contain it."""

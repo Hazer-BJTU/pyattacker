@@ -31,6 +31,7 @@ from .runner import RunConfig, Runner
 from .server import StatsServer
 from .shard import parse_shard, shard_env, shard_paths, shard_specs, shard_store_path
 from .store import SqliteStore
+from .store.base import count_events
 from .tasks import echo, simulate_llm
 
 __all__ = ["main"]
@@ -354,6 +355,27 @@ def _cmd_report(args: argparse.Namespace) -> int:
                     ["pipeline", "task", "error", "message"],
                 )
             )
+        # Repair failures: associate them with the pipelines in this report, not globally.
+        # The repair event's run_id may differ from the pipeline row's run_id (the row stays
+        # owned by the original failed run), so we derive the scope from the selected pipelines.
+        report_pipelines = store.pipelines(run_id=run_id)
+        repair_failed_pids = set()
+        repair_details = []
+        for row in report_pipelines:
+            pid = row.pipeline_id
+            count = count_events(store, kind="pipeline.terminal_repair_failed", pipeline_id=pid)
+            if count > 0:
+                repair_failed_pids.add(pid)
+                # Get the latest failure detail for this pipeline
+                evs = store.events(kind="pipeline.terminal_repair_failed", pipeline_id=pid, limit=1)
+                if evs:
+                    repair_details.append((pid, evs[-1].data.get("phase", "?"), count))
+        if repair_failed_pids:
+            print(f"\nTerminal repair failures: {len(repair_failed_pids)} pipeline(s)")
+            for pid, phase, count in sorted(repair_details):
+                suffix = f" ({count}x)" if count > 1 else ""
+                print(f"  - {pid}: {phase}{suffix}")
+        stats["repair_failures"] = len(repair_failed_pids)
         if args.json:
             print(json.dumps(stats, ensure_ascii=False, indent=2))
     finally:

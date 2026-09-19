@@ -973,7 +973,8 @@ class SqliteStore(VisitStore):
         )
 
     def iter_events(
-        self, *, pipeline_id: str | None = None, run_id: str | None = None
+        self, *, pipeline_id: str | None = None, run_id: str | None = None,
+        kind: str | None = None
     ) -> Iterator[EventRecord]:
         """``event_id`` (total, monotonic); bounded by the mark taken when iteration starts."""
         where: list[str] = []
@@ -984,6 +985,9 @@ class SqliteStore(VisitStore):
         if run_id:
             where.append("run_id=?")
             args.append(run_id)
+        if kind:
+            where.append("kind=?")
+            args.append(kind)
         yield from self._iter_keyset(
             "events", where, args,
             columns=("event_id",), mapper=_to_event, bound="event_id",
@@ -1053,7 +1057,8 @@ class SqliteStore(VisitStore):
         return [_to_attempt(r) for r in self._conn.execute(sql, args).fetchall()]
 
     def events(
-        self, *, pipeline_id: str | None = None, run_id: str | None = None, limit: int = 200
+        self, *, pipeline_id: str | None = None, run_id: str | None = None,
+        kind: str | None = None, limit: int = 200
     ) -> list[EventRecord]:
         sql = "SELECT * FROM events WHERE 1=1"
         args: list[Any] = []
@@ -1063,10 +1068,31 @@ class SqliteStore(VisitStore):
         if run_id:
             sql += " AND run_id=?"
             args.append(run_id)
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
         sql += " ORDER BY event_id DESC LIMIT ?"
         args.append(limit)
         rows = self._conn.execute(sql, args).fetchall()
         return [_to_event(r) for r in reversed(rows)]
+
+    def count_events(
+        self, *, kind: str | None = None, run_id: str | None = None,
+        pipeline_id: str | None = None,
+    ) -> int:
+        """Count events matching the filters, using an aggregate query (no materialization)."""
+        sql = "SELECT COUNT(*) AS n FROM events WHERE 1=1"
+        args: list[Any] = []
+        if pipeline_id:
+            sql += " AND pipeline_id=?"
+            args.append(pipeline_id)
+        if run_id:
+            sql += " AND run_id=?"
+            args.append(run_id)
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
+        return int(self._conn.execute(sql, args).fetchone()["n"])
 
     def stats(self, run_id: str | None = None) -> dict[str, Any]:
         where, args = ("WHERE run_id=?", [run_id]) if run_id else ("", [])

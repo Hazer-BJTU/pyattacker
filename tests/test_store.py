@@ -392,6 +392,106 @@ def test_events_query_filters_orders_and_limits(store):
     assert [e.kind for e in store.events(run_id="run-1", limit=1)] == ["task.failed"]
 
 
+def test_events_kind_filter(store):
+    """events(kind=...) filters by event type, composed with other filters."""
+    store.emit_event(EventRecord(ts=1.0, kind="task.succeeded", run_id="run-1", pipeline_id="p1", data={}))
+    store.emit_event(EventRecord(ts=2.0, kind="task.failed", run_id="run-1", pipeline_id="p2", data={}))
+    store.emit_event(EventRecord(ts=3.0, kind="task.succeeded", run_id="run-2", pipeline_id="p1", data={}))
+
+    # kind filter alone
+    assert len(store.events(kind="task.succeeded")) == 2
+    assert len(store.events(kind="task.failed")) == 1
+    assert store.events(kind="nonexistent.kind") == []
+
+    # kind + run_id
+    assert len(store.events(kind="task.succeeded", run_id="run-1")) == 1
+    assert len(store.events(kind="task.succeeded", run_id="run-2")) == 1
+
+    # kind + pipeline_id
+    assert len(store.events(kind="task.succeeded", pipeline_id="p1")) == 2
+    assert len(store.events(kind="task.succeeded", pipeline_id="p2")) == 0
+
+    # kind + limit
+    assert len(store.events(kind="task.succeeded", limit=1)) == 1
+
+
+def test_count_events(store):
+    """count_events() returns exact counts via aggregate query, no materialization."""
+    store.emit_event(EventRecord(ts=1.0, kind="task.succeeded", run_id="run-1", pipeline_id="p1", data={}))
+    store.emit_event(EventRecord(ts=2.0, kind="task.failed", run_id="run-1", pipeline_id="p2", data={}))
+    store.emit_event(EventRecord(ts=3.0, kind="task.succeeded", run_id="run-2", pipeline_id="p1", data={}))
+
+    # total
+    assert store.count_events() == 3
+
+    # by kind
+    assert store.count_events(kind="task.succeeded") == 2
+    assert store.count_events(kind="task.failed") == 1
+    assert store.count_events(kind="nonexistent") == 0
+
+    # by run_id
+    assert store.count_events(run_id="run-1") == 2
+    assert store.count_events(run_id="run-2") == 1
+
+    # by pipeline_id
+    assert store.count_events(pipeline_id="p1") == 2
+    assert store.count_events(pipeline_id="p2") == 1
+
+    # composed
+    assert store.count_events(kind="task.succeeded", run_id="run-1") == 1
+    assert store.count_events(kind="task.succeeded", pipeline_id="p1") == 2
+
+
+def test_iter_events_kind_filter(store):
+    """iter_events(kind=...) streams matching events in order."""
+    store.emit_event(EventRecord(ts=1.0, kind="task.succeeded", run_id="run-1", pipeline_id="p1", data={}))
+    store.emit_event(EventRecord(ts=2.0, kind="task.failed", run_id="run-1", pipeline_id="p2", data={}))
+    store.emit_event(EventRecord(ts=3.0, kind="task.succeeded", run_id="run-2", pipeline_id="p1", data={}))
+
+    from pyattacker.store.base import iter_events
+
+    kinds = [e.kind for e in iter_events(store, kind="task.succeeded")]
+    assert kinds == ["task.succeeded", "task.succeeded"]
+
+    kinds = [e.kind for e in iter_events(store, kind="task.failed")]
+    assert kinds == ["task.failed"]
+
+    # composed with pipeline_id
+    runs = [e.run_id for e in iter_events(store, kind="task.succeeded", pipeline_id="p1")]
+    assert runs == ["run-1", "run-2"]
+
+
+def test_iter_events_legacy_store_without_kind_support():
+    """Backward compatibility: a legacy iter_events() that doesn't accept `kind` still works."""
+    from pyattacker.store.base import iter_events
+
+    class LegacyStore:
+        """A fake legacy store that doesn't accept `kind` in iter_events or events()."""
+        def __init__(self):
+            self.events_list = [
+                EventRecord(ts=1.0, kind="task.succeeded", run_id="run-1", pipeline_id="p1", data={}),
+                EventRecord(ts=2.0, kind="task.failed", run_id="run-1", pipeline_id="p2", data={}),
+            ]
+
+        def iter_events(self, *, pipeline_id=None, run_id=None):
+            # Legacy signature: no `kind` parameter
+            yield from self.events_list
+
+        def events(self, *, pipeline_id=None, run_id=None, limit=200):
+            # Legacy signature: no `kind` parameter
+            return self.events_list[:limit]
+
+    store = LegacyStore()
+
+    # kind=None: should work fine (no kind kwarg passed)
+    kinds = [e.kind for e in iter_events(store, kind=None)]
+    assert kinds == ["task.succeeded", "task.failed"]
+
+    # kind="task.failed": should fall back to full pull + Python filter
+    kinds = [e.kind for e in iter_events(store, kind="task.failed")]
+    assert kinds == ["task.failed"]
+
+
 # ------------------------------------------------------------- paged iteration
 
 
