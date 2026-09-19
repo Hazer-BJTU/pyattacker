@@ -11,7 +11,10 @@ Coverage
 * ``write_rows`` in ``jsonl`` / ``json`` / ``csv`` (including the ``extra`` column for keys that
   appear only after ``header_rows``) and ``export_store`` / ``export_stores``
 * ``merge_reports``: de-duplication by ``pipeline_id``, the winner rule (best state, then latest
-  ``finished_at``), recomputed pipeline stats with ``duplicates_folded``, stores *and* paths
+  ``finished_at``), recomputed pipeline stats with ``duplicates_folded``, stores *and* paths, and the
+  counter scopes of issue #59 — ``attempts_total``/``handoffs_total`` recomputed from the surviving rows
+  (so a store given twice, or one pipeline in two shards, cannot inflate them) next to the deliberately
+  raw ``source_events_total``
 * ``pyattacker.cli.main``: ``run --shard i/N`` partitioning one dataset, the JSON summary,
   ``report`` / ``export`` over several shard stores, the missing-store config error, and the
   process-spawning ``run --shards N`` form
@@ -925,9 +928,113 @@ def test_merge_reports_deduplicates_pipeline_ids_across_stores(tmp_path):
     assert stats["pipelines"]["by_state"] == {"succeeded": 2}
     assert stats["duplicates_folded"] == 2
     assert stats["tasks"]["by_name"] == {"export.inc": 4}
+    # Two full copies of the same two pipelines: the de-duplicated counters describe the two survivors,
+    # not the four rows that were read (issue #59).
+    assert stats["attempts_total"] == EXPECTED_COUNTS["attempts"] == 4
+    assert stats["handoffs_total"] == 0
+    assert "attempts=4" in merged.summary()
 
     # same state in both stores -> the later finished_at wins
     assert {row["run_id"] for row in merged.rows} == {report2.run_id}
+
+
+def test_merge_reports_counters_survive_the_same_store_twice(tmp_path):
+    """Issue #59: folding duplicates must not inflate the de-duplicated counters.
+
+    Passing one store twice — as two paths, or as two objects on one file — has always left
+    ``pipelines.total`` alone, because rows are de-duplicated by ``pipeline_id``. The workload counters
+    used to be summed per source anyway, so they doubled while the row count did not, contradicting the
+    documented promise that merging is idempotent. The event log is the documented exception: an event
+    does not hang off a pipeline row, so nothing in the merged rows says which copy owns it. That one is
+    reported raw, under a name that says so.
+    """
+    db = tmp_path / "once.db"
+    _run(db, TWO_STEP, [{"n": 0}, {"n": 1}])
+
+    single = merge_reports([str(db)]).stats()
+    assert single["pipelines"]["total"] == 2
+    assert single["attempts_total"] == EXPECTED_COUNTS["attempts"] == 4
+    assert single["source_events_total"] == EXPECTED_COUNTS["events"] == 7
+
+    twice = merge_reports([str(db), str(db)])
+    twice_stats = twice.stats()
+    assert twice.duplicates == 2
+    assert twice_stats["pipelines"]["total"] == single["pipelines"]["total"]
+    assert twice_stats["attempts_total"] == single["attempts_total"]
+    assert twice_stats["handoffs_total"] == single["handoffs_total"]
+    assert twice_stats["duplicates_folded"] == 2
+    # Raw by contract, and named `source_*`: it follows the sources, not the surviving pipelines.
+    assert twice_stats["source_events_total"] == 2 * single["source_events_total"]
+    assert "attempts=4 source_events=14" in twice.summary()
+
+    # A store object and a path to the same file are the same source, and must agree exactly.
+    store_a, store_b = _open(db), _open(db)
+    try:
+        from_stores = merge_reports([store_a, store_b]).stats()
+    finally:
+        store_a.close()
+        store_b.close()
+    assert from_stores == twice_stats
+
+
+def test_merge_reports_recomputes_attempts_when_a_pipeline_lives_in_two_shards(tmp_path):
+    """Issue #59, the case sharding actually produces: a shard-count change leaves one pipeline in two
+    stores. Summing per source counted the folded copy's attempts as if they were extra work."""
+    db1, db2 = tmp_path / "shard0.db", tmp_path / "shard1.db"
+    _run(db1, TWO_STEP, [{"n": 0}])  # holds one of the two pipelines
+    _run(db2, TWO_STEP, [{"n": 0}, {"n": 1}])  # holds both, so one row is a genuine duplicate
+
+    merged = merge_reports([str(db1), str(db2)])
+    assert merged.duplicates == 1
+    assert len(merged.rows) == 2
+    assert merged.stats()["attempts_total"] == 4  # 2 pipelines x 2 tasks, not 3 x 2
+    assert merged.stats()["attempts_total"] == sum(row["attempts_total"] for row in merged.rows)
+
+    # `source_events_total` is the raw sum over the given sources, duplicates included, by definition.
+    store1, store2 = _open(db1), _open(db2)
+    try:
+        raw = store1.stats()["events_total"] + store2.stats()["events_total"]
+    finally:
+        store1.close()
+        store2.close()
+    assert merged.stats()["source_events_total"] == raw
+
+
+def test_merged_handoff_count_is_de_duplicated_and_follows_the_report_scope():
+    """Handoffs are read off each surviving pipeline's nested ledger, so two things hold: folding the
+    same pipeline twice counts its jumps once, and a ``run_id``-filtered report counts that run's jumps
+    — the ledger is nested whole, because it outlives the run that wrote it."""
+    row = {
+        "pipeline_id": "pipe-1",
+        "run_id": "run-2",
+        "state": "succeeded",
+        "attempts_total": 3,
+        "handoffs": [{"run_id": "run-1", "handoff_id": 1}, {"run_id": "run-2", "handoff_id": 2}],
+    }
+
+    class _Source:
+        """Only the surface ``merge_reports`` reads from a store object."""
+
+        path = "stub.db"
+
+        def stats(self, run_id=None):
+            # Deliberately wrong about attempts/handoffs: nothing but the event log may be taken from a
+            # source's own aggregate, so a regression that sums these again fails loudly here.
+            return {"events_total": 1, "attempts_total": 999, "handoffs_total": 999}
+
+        def export_rows(self, *, run_id=None):
+            return [row] if run_id in (None, "run-2") else []
+
+        def events(self, **kwargs):
+            return []
+
+    source = _Source()
+    assert merge_reports([source]).stats()["handoffs_total"] == 2
+    assert merge_reports([source], run_id="run-2").stats()["handoffs_total"] == 1
+    assert merge_reports([source, source]).stats()["handoffs_total"] == 2
+    assert merge_reports([source]).stats()["attempts_total"] == 3
+    assert merge_reports([source]).stats()["source_events_total"] == 1
+
 
 
 def test_merge_reports_deduplicates_repair_failures_across_stores(tmp_path):
@@ -1055,6 +1162,10 @@ def test_merge_accepts_stores_and_paths_and_recomputes_stats(tmp_path):
         assert stats["pipelines"]["by_state"] == {"succeeded": 4}
         assert stats["tasks"]["by_name"] == {"export.inc": 8}
         assert stats["duplicates_folded"] == 0
+        # Nothing was folded, so the recomputed counters equal the plain sum of the two runs.
+        assert stats["attempts_total"] == 2 * EXPECTED_COUNTS["attempts"] == 8
+        assert stats["source_events_total"] == 2 * EXPECTED_COUNTS["events"] == 14
+        assert stats["handoffs_total"] == 0
 
     assert [row["pipeline_id"] for row in from_paths.rows] == [
         row["pipeline_id"] for row in from_stores.rows

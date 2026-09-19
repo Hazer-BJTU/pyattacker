@@ -146,7 +146,9 @@ pyattacker report STORE [STORE ...] [--run-id ID] [--errors N] [--json] [--artif
 ```
 
 Several stores are merged into one coherent view: de-duplicated by `pipeline_id` (best state wins, latest
-finish breaks ties) with statistics recomputed from the merged rows, and it tells you how many rows it folded.
+finish breaks ties) with the workload counters recomputed from the surviving rows, and it tells you how many
+rows it folded. One counter is raw on purpose: the summary line's `source_events=` is the event log summed
+over the stores you passed, duplicates included, because an event is not part of a pipeline row.
 `--errors N` prints the first N failures with their error class. `--json` gives you the same numbers as an
 object. A run that recorded handoffs says so in its summary line (`... attempts: total=12 handoffs=2`), and
 `--rows pipelines` on `export` carries the ledger itself (see

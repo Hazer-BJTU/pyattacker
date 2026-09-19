@@ -1150,6 +1150,9 @@ print("pipeline rows:", len(merged.rows), "| duplicates dropped:", merged.duplic
 # Merging is idempotent: a duplicated store is de-duplicated by pipeline_id, best state wins.
 again = merge_reports([*paths, paths[0]])
 print("with one store counted twice:", len(again.rows), "rows,", again.duplicates, "duplicates dropped")
+print("  attempts:", merged.stats()["attempts_total"], "->", again.stats()["attempts_total"],
+      "| source_events:", merged.stats()["source_events_total"], "->",
+      again.stats()["source_events_total"], "(raw, so it follows the sources)")
 
 merged.export("runs/step12-all.jsonl")
 with open("runs/step12-all.jsonl", encoding="utf-8") as handle:
@@ -1161,16 +1164,17 @@ print("shard of the first pipeline:", shard_index(specs[0].pipeline_id, SHARDS),
 
 ```text
 shard 0:  6 pipelines -> {'succeeded': 6} -> runs/step12.shard0of3.db
-shard 1:  2 pipelines -> {'succeeded': 2} -> runs/step12.shard1of3.db
-shard 2:  4 pipelines -> {'succeeded': 4} -> runs/step12.shard2of3.db
+shard 1:  5 pipelines -> {'succeeded': 5} -> runs/step12.shard1of3.db
+shard 2:  1 pipelines -> {'succeeded': 1} -> runs/step12.shard2of3.db
 
 merged 12 pipelines from 3 store(s)
-  succeeded=12  attempts=12 events=27
+  succeeded=12  attempts=12 source_events=27
   tasks: ask=12
 pipeline rows: 12 | duplicates dropped: 0 | sources: 3
 with one store counted twice: 12 rows, 6 duplicates dropped
+  attempts: 12 -> 12 | source_events: 27 -> 40 (raw, so it follows the sources)
 merged export rows: 12
-shard of the first pipeline: 2 of 3
+shard of the first pipeline: 1 of 3
 ```
 
 ```bash
@@ -1186,8 +1190,8 @@ uv run pyattacker report runs/qa.shard*of4.db
 uv run pyattacker export runs/qa.shard*of4.db runs/all.jsonl
 ```
 
-* `shard_index(key, N)` 用 `blake2b` 而不是 Python 的 `hash()`（后者按进程加盐）对 key 哈希，所以切分跨多次运行、跨机器都稳定。`--shard 2/4 --resume` 会把每条流水线放回原来的位置。各分片大小*大致*相等——12 条切成 6/2/4 很正常。
-* 合并按 `pipeline_id` 去重，保留最好的状态（succeeded > failed > interrupted，平了取最晚完成的），根据合并后的行重算统计。部分重叠的重跑，或者同一个存储算了两次，结果还是一个答案。
+* `shard_index(key, N)` 用 `blake2b` 而不是 Python 的 `hash()`（后者按进程加盐）对 key 哈希，所以切分跨多次运行、跨机器都稳定。`--shard 2/4 --resume` 会把每条流水线放回原来的位置。各分片大小只是*大致*相等——12 条切成 6/5/1 不是 bug。
+* 合并按 `pipeline_id` 去重，保留最好的状态（succeeded > failed > interrupted，平了取最晚完成的），并且从存活下来的行**重算**工作量计数——`attempts_total`、`handoffs_total`。部分重叠的重跑，或者同一个存储算了两次，结果还是一个答案。事件日志是刻意的例外：事件不挂在流水线行上，所以 `source_events_total` 是你传入那些源库的原始总数，名字就是这么起的，不假装成别的口径。
 * `merge_reports([...])` 返回一个 `MergedReport`，带 `.summary()`、`.stats()`、`.errors()` 和 `.export(path, fmt=..., kind=...)`。
 
 ---

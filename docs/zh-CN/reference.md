@@ -1664,15 +1664,25 @@ merged.export("runs/all.jsonl")
 merge_reports(paths) -> MergedReport
 ```
 
-按 `pipeline_id` 去重（最优状态胜出，最晚完成者打破平局），然后根据合并后的行**重算**
-统计。合并幂等，所以同一个存储被算两次不会虚增任何数字。
+按 `pipeline_id` 去重（最优状态胜出，最晚完成者打破平局），然后根据存活下来的行**重算**工作量
+计数：`pipelines`、`tasks`、`attempts_total`、`handoffs_total` 描述的是并集，所以合并幂等——同一个
+存储被算两次，或者分片数变了之后同一条流水线同时出现在两个分片里，都不会把它们放大。
+
+`source_events_total` 是刻意的例外，名字就说明了这一点：事件不挂在流水线行上，合并后的行里没有
+任何东西能说清两份副本里哪一份拥有某个事件。它是你传入那些源库的原始总数，重复的部分照样算。
+
+从行里读计数，也是 `merge_reports` 对自定义存储 `export_rows()` 的唯一额外要求：流水线行上的
+`attempts_total`，以及嵌套的 `handoffs` 账本（两个内置存储都会嵌套它，背后的能力是
+`store.handoffs(...)`）。
 
 | `MergedReport` 成员 | 含义 |
 |---|---|
 | `rows` | 合并后的流水线行 |
 | `duplicates` | 被折掉的行数 |
 | `sources` | 哪些存储参与 |
-| `stats()` | 重算的统计 |
+| `attempts_total`、`handoffs_total` | 从存活的行重算，已去重 |
+| `source_events_total` | 所给源库的原始事件日志行数，**未**去重 |
+| `stats()` | 同一批计数，外加重算的流水线与任务统计 |
 | `summary()` | 人类可读的摘要 |
 | `errors(limit=20)` | 所有分片的失败 |
 | `export(path, *, fmt="jsonl", kind="pipelines")` | 写出合并后的视图 |
@@ -1837,8 +1847,8 @@ export_store(store, "attempts.csv", kind="attempts", fmt="csv")
 再流式读每条流水线的工件，所以内存单位是**一条流水线**，不是整个存储。一条
 `pipelines` 行本身嵌套，所以导出该 kind 时一次物化一条流水线的任务和工件。
 `merge_reports` 是刻意的例外：按 `pipeline_id` 去重需要每条流水线的胜出行，
-所以合并后的行留内存（它用聚合查询统计事件/尝试，
-不是读日志）。
+所以合并后的行留内存（唯一不从这些行读的计数是 `source_events_total`，
+它走各源库自己的聚合查询，而不是物化日志）。
 
 ---
 

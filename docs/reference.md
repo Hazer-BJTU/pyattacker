@@ -1741,15 +1741,27 @@ when you are driving a cluster yourself.
 merge_reports(paths) -> MergedReport
 ```
 
-De-duplicates by `pipeline_id` (best state wins, latest finish breaks ties), then **recomputes** statistics
-from the merged rows. Merging is idempotent, so a store counted twice does not inflate anything.
+De-duplicates by `pipeline_id` (best state wins, latest finish breaks ties), then **recomputes** the
+workload counters from the surviving rows: `pipelines`, `tasks`, `attempts_total` and `handoffs_total`
+describe the union, so merging is idempotent — a store counted twice, or one pipeline present in two
+shards after a shard-count change, cannot inflate them.
+
+`source_events_total` is the deliberate exception, and is named for it: events do not hang off a pipeline
+row, so nothing in the merged rows says which of two copies owns an event. It is a raw total over the
+sources you passed, duplicates included.
+
+Reading the counters off the rows is also the one thing `merge_reports` expects from a custom store's
+`export_rows()` beyond the row itself: the pipeline row's `attempts_total`, and the nested `handoffs` ledger
+(both built-in stores nest it, and `store.handoffs(...)` is the capability behind it).
 
 | `MergedReport` member | Meaning |
 |---|---|
 | `rows` | the merged pipeline rows |
 | `duplicates` | how many rows were folded away |
 | `sources` | which stores contributed |
-| `stats()` | recomputed statistics |
+| `attempts_total`, `handoffs_total` | recomputed from the surviving rows, so de-duplicated |
+| `source_events_total` | raw event-log rows across the given sources, **not** de-duplicated |
+| `stats()` | the same counters, plus the recomputed pipeline and task statistics |
 | `summary()` | human-readable |
 | `errors(limit=20)` | failures across all shards |
 | `export(path, *, fmt="jsonl", kind="pipelines")` | write the merged view |
@@ -1914,8 +1926,8 @@ read through the paged helpers in batches of `ITER_BATCH_SIZE` (1000) rows, and 
 pipelines and then streams each one's artifacts, so the memory unit is **one pipeline**, not the store. A
 `pipelines` row is itself nested, so exporting that kind materializes one pipeline's tasks and artifacts at
 a time. `merge_reports` is the deliberate exception: de-duplicating by `pipeline_id` needs the winning row
-of every pipeline, so the merged rows are held in memory (it counts events/attempts with aggregate queries
-instead of reading the log).
+of every pipeline, so the merged rows are held in memory (the one counter that is not read off those rows —
+`source_events_total` — comes from each source's aggregate query instead of materializing the log).
 
 ---
 

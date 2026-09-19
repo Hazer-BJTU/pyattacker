@@ -10,7 +10,12 @@ concatenating rows, because:
   ``failed`` one from an earlier attempt. The rule is: **prefer the best state, break ties by the
   latest finish time**, and report how many duplicates were folded so the number is never hidden.
 
-Statistics are recomputed from the merged rows rather than summed per store, for the same reason.
+Statistics are recomputed from the merged rows rather than summed per store, for the same reason:
+``attempts_total`` and ``handoffs_total`` are read off the surviving rows, so folding a duplicate — or
+passing the same store twice — cannot inflate them. The one count that cannot be re-derived is the event
+log: events are not part of a pipeline row, so nothing in the merged rows says which of two copies owns
+them. That one keeps its own scope, as ``source_events_total``: a raw total over the given sources,
+deliberately **not** de-duplicated (issue #59).
 """
 
 from __future__ import annotations
@@ -34,9 +39,13 @@ class MergedReport:
     sources: list[str] = field(default_factory=list)
     run_ids: list[str] = field(default_factory=list)
     duplicates: int = 0
-    events_total: int = 0
+    # De-duplicated: recomputed from the rows that survived folding, never summed per store.
     attempts_total: int = 0
     handoffs_total: int = 0
+    # Raw: the append-only event log, summed over the given sources and **not** de-duplicated. An event
+    # cannot be attributed to one of two copies of a pipeline, so this keeps its own scope instead of
+    # pretending to be a de-duplicated workload count.
+    source_events_total: int = 0
     repair_failures: int = 0
 
     # ----------------------------------------------------------------- views
@@ -70,7 +79,7 @@ class MergedReport:
             "tasks": {"by_name": task_counts},
             "attempts_total": self.attempts_total,
             "handoffs_total": self.handoffs_total,
-            "events_total": self.events_total,
+            "source_events_total": self.source_events_total,
             "repair_failures": self.repair_failures,
             "duplicates_folded": self.duplicates,
         }
@@ -84,7 +93,7 @@ class MergedReport:
             f"merged {len(self.rows)} pipelines from {len(self.sources)} store(s)"
             + (f"  (folded {self.duplicates} duplicate rows)" if self.duplicates else ""),
             "  " + " ".join(f"{k}={v}" for k, v in sorted(by_state.items()))
-            + f"  attempts={stats['attempts_total']} events={stats['events_total']}"
+            + f"  attempts={stats['attempts_total']} source_events={stats['source_events_total']}"
             + (f"  handoffs={stats['handoffs_total']}" if stats["handoffs_total"] else "")
             + (f"  repair_failures={stats['repair_failures']}" if stats["repair_failures"] else ""),
             f"  pipeline latency ms: p50={durations['p50']} p95={durations['p95']} max={durations['max']}",
@@ -153,9 +162,7 @@ def merge_reports(
 
     rows_by_id: dict[str, Mapping[str, Any]] = {}
     duplicates = 0
-    events_total = 0
-    attempts_total = 0
-    handoffs_total = 0
+    source_events_total = 0
     # Track which pipelines have at least one failed terminal repair.
     # We collect this during the store loop, before stores are closed.
     repair_failed_pids: set[str] = set()
@@ -167,11 +174,11 @@ def merge_reports(
         path = getattr(store, "path", None) or getattr(getattr(store, "inner", None), "path", None)
         paths.append(str(path or source))
         try:
-            # Counts come from the aggregate query, not from materializing the log.
+            # The event log is the one count that cannot be re-derived after folding, because events do
+            # not hang off a pipeline row: sum the aggregate per source and call it what it is. Never do
+            # this for attempts/handoffs — those come back off the surviving rows below (issue #59).
             counts = store.stats(run_id)
-            events_total += int(counts.get("events_total") or 0)
-            attempts_total += int(counts.get("attempts_total") or 0)
-            handoffs_total += int(counts.get("handoffs_total") or 0)
+            source_events_total += int(counts.get("events_total") or 0)
             for row in store.export_rows(run_id=run_id):
                 key = row["pipeline_id"]
                 run_ids.append(row["run_id"])
@@ -191,12 +198,24 @@ def merge_reports(
                 store.close()
 
     ordered = sorted(rows_by_id.values(), key=lambda r: (r.get("name") or "", r.get("started_at") or 0.0))
+    # Recomputed from the surviving rows, never summed per store: this is what makes a merge idempotent,
+    # for the same store passed twice and for a pipeline that genuinely exists in two shards after a
+    # shard-count change. Both shapes are read straight off the documented pipeline row.
+    attempts_total = sum(int(row.get("attempts_total") or 0) for row in ordered)
+    handoffs_total = sum(
+        1
+        for row in ordered
+        for hop in (row.get("handoffs") or ())
+        # The ledger is nested whole (it outlives the run that wrote it), so honour the report's scope
+        # the same way `store.stats(run_id)` does instead of counting every historical jump.
+        if run_id is None or hop.get("run_id") == run_id
+    )
     return MergedReport(
         rows=ordered,
         sources=paths,
         run_ids=sorted(set(run_ids)),
         duplicates=duplicates,
-        events_total=events_total,
+        source_events_total=source_events_total,
         attempts_total=attempts_total,
         handoffs_total=handoffs_total,
         repair_failures=len(repair_failed_pids),

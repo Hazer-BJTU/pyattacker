@@ -116,7 +116,7 @@ pyattacker bench [--scenario NAME] [--list] [--algorithms A,B] [--seeds N]
 pyattacker report STORE [STORE ...] [--run-id ID] [--errors N] [--json] [--artifact-backend SPEC]
 ```
 
-多个存储会合并成一个一致的视图：按 `pipeline_id` 去重（状态最好的胜出，平局按最新完成时间判），统计量从合并后的行重算，还会告诉你折叠了多少行。`--errors N` 打印前 N 个失败和错误类别。`--json` 用对象格式输出同样的数字。
+多个存储会合并成一个一致的视图：按 `pipeline_id` 去重（状态最好的胜出，平局按最新完成时间判），工作量计数从存活下来的行重算，还会告诉你折叠了多少行。有一个计数刻意保持原始口径：摘要行里的 `source_events=` 是你传入那些存储的事件日志总和，重复的也算——因为事件并不挂在流水线行上。`--errors N` 打印前 N 个失败和错误类别。`--json` 用对象格式输出同样的数字。
 
 如果存储里有过终端修复失败的尝试，report 会单独列出（`Terminal repair failures: N pipeline(s)`），每条注明流水线和失败阶段。这是事后可观测性指标：实时运行的 `RunReport.repair_failures` 是运行本地的计数器，事后视图从事件日志里查询这些流水线的修复失败历史——范围和报告里的流水线一致，不是全局统计。
 
