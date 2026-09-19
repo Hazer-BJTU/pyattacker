@@ -450,17 +450,19 @@ def count_events(
     """Count events matching the filters, without materializing them.
 
     Prefers a native aggregate method when the store has one (``count_events``);
-    otherwise falls back to ``len(events(...))`` — which materializes the matching
-    rows, but only as many as the store's own ``limit`` allows. For large stores
-    that need exact counts, the native method should be implemented.
+    otherwise falls back to iterating and counting via the compatibility-aware
+    ``iter_events()`` helper — which handles legacy stores that don't accept
+    the ``kind`` keyword. Built-in stores use their native aggregate, so the
+    normal large-store path stays O(1) in materialized Python objects.
     """
     native = getattr(store, "count_events", None)
     if callable(native):
         return int(native(kind=kind, run_id=run_id, pipeline_id=pipeline_id))
-    # Fallback: materialize and count. Use a large limit so we get the full count
-    # in the common case; for truly large stores the native method should exist.
-    return len(store.events(kind=kind, run_id=run_id, pipeline_id=pipeline_id,
-                           limit=_LIST_LIMIT_ALL))
+    # Fallback: iterate and count. Use the compatibility-aware iterator so legacy
+    # stores without `kind` support don't crash.
+    return sum(
+        1 for _ in iter_events(store, kind=kind, run_id=run_id, pipeline_id=pipeline_id)
+    )
 
 
 @runtime_checkable
@@ -613,20 +615,28 @@ def iter_events(
     Backward compatibility: when ``kind`` is ``None``, the keyword is not passed to legacy
     implementations (which may not accept it). When ``kind`` is provided but the native method
     doesn't support it, we fall back to materializing and filtering in Python.
+
+    The compatibility fallback only catches ``TypeError`` from the *method invocation itself* —
+    not from errors raised inside the iterator body. That way backend bugs are not silently
+    converted into compatibility fallback behavior.
     """
     native = getattr(store, "iter_events", None)
     if callable(native):
         # Try with kind first; if the legacy signature doesn't accept it, retry without kind
-        # and filter in Python.
+        # and filter in Python. The try/except only wraps the *call*, not iteration, so
+        # TypeErrors raised inside the iterator body propagate normally.
         try:
-            yield from native(pipeline_id=pipeline_id, run_id=run_id, kind=kind)
+            iterator = native(pipeline_id=pipeline_id, run_id=run_id, kind=kind)
         except TypeError:
             if kind is None:
                 raise
-            # Legacy store without kind support: pull everything and filter
-            for event in native(pipeline_id=pipeline_id, run_id=run_id):
+            # Legacy store without kind support: pull everything and filter in Python.
+            iterator = native(pipeline_id=pipeline_id, run_id=run_id)
+            for event in iterator:
                 if event.kind == kind:
                     yield event
+            return
+        yield from iterator
     else:
         # The list API's own `limit` means "the most recent N" (default 200) and cannot express
         # "everything", so the fallback asks for the largest limit it can represent. Both built-in
@@ -635,15 +645,16 @@ def iter_events(
         if kind is not None:
             kwargs["kind"] = kind
         try:
-            yield from store.events(**kwargs)
+            rows = store.events(**kwargs)
         except TypeError:
             if kind is None:
                 raise
-            # Legacy events() without kind support: pull everything and filter
+            # Legacy events() without kind support: pull everything and filter in Python.
             del kwargs["kind"]
-            for event in store.events(**kwargs):
-                if event.kind == kind:
-                    yield event
+            rows = store.events(**kwargs)
+        for event in rows:
+            if kind is None or event.kind == kind:
+                yield event
 
 
 def iter_artifacts(store: Store, *, pipeline_id: str) -> Iterator[Artifact]:

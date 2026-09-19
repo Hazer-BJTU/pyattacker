@@ -930,6 +930,38 @@ def test_merge_reports_deduplicates_pipeline_ids_across_stores(tmp_path):
     assert {row["run_id"] for row in merged.rows} == {report2.run_id}
 
 
+def test_merge_reports_deduplicates_repair_failures_across_stores(tmp_path):
+    """Issue #46: merge_reports must not double-count a pipeline's repair failures across stores."""
+    from pyattacker.store import SqliteStore
+
+    db1, db2 = tmp_path / "a.db", tmp_path / "b.db"
+    seeds = [{"n": 0}]
+    _run(db1, TWO_STEP, seeds)
+    time.sleep(0.02)
+    _run(db2, TWO_STEP, seeds)
+
+    # Inject a fake terminal_repair_failed event into both stores
+    pid = next(iter(TWO_STEP.map(seeds))).pipeline_id
+    for db in (db1, db2):
+        store = SqliteStore(str(db))
+        store.emit_event(EventRecord(
+            ts=time.time(), kind="pipeline.terminal_repair_failed",
+            run_id="some-repair-run", pipeline_id=pid,
+            data={"phase": "test", "error": "test error"},
+        ))
+        store.close()
+
+    store1, store2 = _open(db1), _open(db2)
+    try:
+        merged = merge_reports([store1, store2])
+    finally:
+        store1.close()
+        store2.close()
+
+    # The same pipeline appears in both stores, but repair_failures should be 1, not 2.
+    assert merged.stats()["repair_failures"] == 1
+
+
 def test_merge_prefers_succeeded_over_failed(tmp_path):
     seeds = [{"n": 0}, {"n": 1}]
     FAILING["on"] = True

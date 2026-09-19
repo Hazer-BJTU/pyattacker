@@ -1344,11 +1344,12 @@ with closing(open_store("runs/qa.db")) as store:      # reopen a finished run, a
 
 | 方法 | 返回值 |
 |---|---|
-| `stats(run_id=None)` | 计数、状态分布、延迟百分位；`handoffs_total` 统计记下来的跳转次数（普通运行为 0）；`repair_failures` 统计按 run 过滤的终端修复失败次数 |
+| `stats(run_id=None)` | 计数、状态分布、延迟百分位；`handoffs_total` 统计记下来的跳转次数（普通运行为 0） |
 | `errors(*, run_id=None, limit=20)` | 失败项，含任务名、错误类型和消息 |
 | `export_rows(*, run_id=None)` | 嵌套的流水线行：含任务、工件和交接 |
 | `attempts(*, pipeline_id=None, ...)` | 尝试历史 |
 | `events(*, pipeline_id=None, run_id=None, kind=None, limit=...)` | 事件流，可按事件类型过滤 |
+| `count_events(*, kind=None, run_id=None, pipeline_id=None)` | 匹配事件的精确计数，通过聚合查询（不物化日志） |
 | `close()` | 关连接 |
 
 ```python
@@ -1385,11 +1386,11 @@ print([event.kind for event in store.events(pipeline_id=pid)])
 失败永远不出现在按运行范围统计的 `stats` 里；它计入
 `RunReport.repair_failures`，正是这让 CLI 退出码为 `1`，不是报一次干净运行。
 
-**事后**跑的 `pyattacker report <store>` 只根据流水线行重建视图，所以它说不
-了后续某次运行试过修这样的流水线还失败了：那行还是描述原始失败，
-修复尝试在事件流里（`pipeline.terminal_repair_failed`）。把该命令
-的输出当流水线状态，不是每次尝试的历史；当场那次 `run` 的退出码才是
-对它刚完成的那次尝试的权威信号。
+**事后**跑的 `pyattacker report <store>` 现在会显示失败的终端修复尝试：它从事件日志里查询
+报告范围内的流水线是否有 `pipeline.terminal_repair_failed` 事件，并打印
+`Terminal repair failures: N pipeline(s)` 段落，列出每个受影响的流水线和失败阶段。
+计数按 `pipeline_id` 去重，所以同一条流水线出现在多个存储里不会重复计数。
+实时 `run` 的退出码仍然是它刚完成的那次尝试的权威信号；事后报告是历史视图。
 开控制的流水线加一个分支，在那些规则**之前**查
 （[交接](reference.md#进阶交接可选启用)）：如果最新活动账本行的目标等于游标或在它前方，
 运行用记录的入口工件*从那个目标*恢复，绝不重跑源任务；持久的

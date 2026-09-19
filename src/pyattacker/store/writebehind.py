@@ -314,8 +314,12 @@ class WriteBehindStore:
         native = getattr(self.inner, "count_events", None)
         if callable(native):
             return int(native(kind=kind, run_id=run_id, pipeline_id=pipeline_id))
-        # Fallback for stores without native count_events
-        return len(self.inner.events(kind=kind, run_id=run_id, pipeline_id=pipeline_id, limit=1000000))
+        # Fallback: use the compatibility-aware iterator helper so legacy inner stores
+        # that don't accept `kind` don't crash.
+        from .base import iter_events
+        return sum(
+            1 for _ in iter_events(self.inner, kind=kind, run_id=run_id, pipeline_id=pipeline_id)
+        )
 
     def stats(self, run_id: str | None = None) -> dict[str, Any]:
         self.flush()

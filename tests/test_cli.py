@@ -907,6 +907,34 @@ def test_posthoc_report_shows_repair_failures(
     assert "Terminal repair failures: 1 pipeline(s)" in out
 
 
+def test_report_run_id_scope_associates_repair_failures_with_selected_pipelines(
+    tmp_path, monkeypatch, capsys
+):
+    """Issue #46: --run-id scopes repair failures to the pipelines in that run, not the event's run_id."""
+    db = tmp_path / "repair.db"
+    cfg = _write_config(tmp_path, "repair.json", REPAIR_CONFIG)
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 0
+    _poison_terminal_row(db)
+
+    # Inject a failing repair attempt from a *different* run
+    monkeypatch.setattr("pyattacker.runner.open_store", _failing_open_store)
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 1
+
+    # Now run `report --run-id run-original` (the pipeline row's owner).
+    # The repair failure event belongs to the second run, but the pipeline belongs to run-original.
+    # The report should still show the repair failure, because it's associated with the pipeline.
+    out = capsys.readouterr().out  # clear previous output
+    assert main(["report", str(db), "--run-id", "run-original"]) == 0
+    out = capsys.readouterr().out
+    assert "Terminal repair failures: 1 pipeline(s)" in out
+
+    # And JSON output should agree
+    assert main(["report", str(db), "--run-id", "run-original", "--json"]) == 0
+    out = capsys.readouterr().out
+    # The JSON is printed at the end; find it by looking for the repair_failures key
+    assert '"repair_failures": 1' in out
+
+
 # ---------------------------------------------------------- worker liveness (#44)
 class _WorkerDied(BaseException):
     """A direct ``BaseException``: nothing in the worker's own handler chain can contain it."""
