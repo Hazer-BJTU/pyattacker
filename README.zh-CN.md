@@ -322,10 +322,12 @@ uv run pyattacker run -c examples/qa_eval.yaml --artifact-backend file:///data/b
 
 ```bash
 uv run pyattacker serve runs/qa.db        # http://127.0.0.1:8787
-# /  dashboard   /stats  /events  /pipelines  /resources  /errors   (JSON)
+# /  dashboard   /stats  /metrics  /events  /pipelines  /resources  /errors   (JSON)
 ```
 
 每个请求都新开一个只读连接，所以可以和正在跑的进程并存。**没有认证**，只绑回环地址——它没有 artifact 路由，但会暴露这次运行记下来的东西：事件的 `data`、存下来的错误信息。当调试工具用就好，别裸暴露到公网。
+应用可用 `runner.report_metric("accuracy", value, display="percent")` 汇报实时指标；框架只展示，
+不计算指标。参见 [`examples/live_metrics.py`](examples/live_metrics.py)。
 
 **步骤内分支**——`fanout(a, b)` 拿同一份输入并发跑多个任务，返回 `{task_name: value}`。重试粒度变成整个组，这是不把流水线做成 DAG 的代价。组是 Runner 看到的唯一规格，所以子任务们对 `resource`、`algorithm`、`timeout_s` 达成一致时，这些参数从子任务继承（此时 `timeout_s` 限制整个组）。
 

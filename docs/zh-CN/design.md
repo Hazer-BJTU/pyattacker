@@ -24,6 +24,10 @@
 1. 导出 artifact（`export` / `report.export_jsonl`），在外面自己算；
 2. 写一条**汇聚流水线**（sink pipeline）：用一个任务把结果发到某个资源/总线上，订阅者消费——归约就变成你用框架原语自己拼的东西。
 
+应用还可以通过 `Runner.report_metric()` 汇报自己算好的最新值。这只是传输和展示，不改变
+语义归约的边界。数值按运行（可选按流水线）划分作用域，同步覆盖写入，并由只读的
+`/metrics` 端点读取。Runner 的存储连接仍是唯一写入者。
+
 ---
 
 ## 2. 核心不变量
@@ -233,7 +237,7 @@ REVOKED ◀── explicit revoke / revoked from within a task
 
 **只追加的事实按批写。** `WriteBehindStore` 缓冲尝试和事件，按批刷（大小阈值、时间间隔、任何读 API、运行心跳、运行结束）。状态写入——`pipelines`、`tasks`、`artifacts`——永远直接落盘，因为还没落盘的检查点不算检查点。所以 `SIGKILL` 可能丢最后一批历史，所有检查点完好；`--no-write-behind` 用吞吐换每次尝试立即提交。
 
-### 4.6 监控：看流量和阻塞，不看指标
+### 4.6 监控：运行状态与应用汇报
 
 ```python
 snapshot = runner.stats()          # live in-process snapshot
@@ -241,6 +245,8 @@ snapshot = runner.stats()          # live in-process snapshot
 ```
 
 面板显示：流水线状态分布、p95/最大延迟、各任务计数，每个资源池的 `active/capacity`、`ready/degraded/dead`、`waiting`、吞吐和泄漏计数器，最近的错误。也可以编程用：`monitor.render_snapshot(stats)` / `monitor.watch(store)`。
+应用汇报值与运行计数分开展示。应用可以观察已提交的流水线终态并汇报准确率，但对流水线
+去重、以及从持久化产物恢复累计结果都由应用负责。
 
 ### 4.7 完成以计数为准，worker 生命周期受监督
 

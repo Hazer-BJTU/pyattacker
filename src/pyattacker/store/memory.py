@@ -55,6 +55,7 @@ class MemoryStore(VisitStore):
         self._attempts: list[AttemptRecord] = []
         self._handoffs: list[HandoffRecord] = []
         self._events: list[EventRecord] = []
+        self._reported_metrics: dict[tuple[str, str | None, str], Any] = {}
         self._event_id = 0
         self._visits: dict[str, dict[str, Any]] = {}
         self._occurrences: dict[str, Artifact] = {}
@@ -403,6 +404,24 @@ class MemoryStore(VisitStore):
         self._event_id += 1
         event.event_id = self._event_id
         self._events.append(event)
+
+    def upsert_reported_metric(self, row: Any) -> None:
+        self._reported_metrics[(row.run_id, row.pipeline_id, row.name)] = row
+
+    def reported_metrics(
+        self, *, run_id: str | None = None, pipeline_id: str | None = None
+    ) -> list[Any]:
+        if run_id is None:
+            matching = [row for row in self._reported_metrics.values()
+                        if row.pipeline_id == pipeline_id]
+            if not matching:
+                return []
+            run_id = max(matching, key=lambda row: row.updated_at).run_id
+        return sorted(
+            (row for row in self._reported_metrics.values()
+             if row.run_id == run_id and row.pipeline_id == pipeline_id),
+            key=lambda row: (row.run_id, row.name),
+        )
 
     def upsert_resource(
         self,

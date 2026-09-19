@@ -28,6 +28,11 @@ framework to step in:
 2. Write a **sink pipeline**: use one task to publish the results onto some resource/bus, where subscribers
    consume them — reduction becomes something you build yourself out of framework primitives.
 
+An application can now also publish its own latest values through `Runner.report_metric()`. This is
+transport and presentation of an already computed value; it does not change the reduction boundary.
+The value is scoped to a run (optionally a pipeline), upserted synchronously, and read by the
+read-only `/metrics` endpoint. The runner's store remains the sole writer.
+
 ---
 
 ## 2. Core Invariants
@@ -314,7 +319,7 @@ short, and with a fake clock the pump advances virtual time instantly (so tests 
 is not a checkpoint. A `SIGKILL` can therefore lose the last batch of history while every checkpoint stays
 intact; `--no-write-behind` trades throughput for an immediate commit per attempt.
 
-### 4.6 Monitoring: Cares About Traffic and Blocking, Not About Metrics
+### 4.6 Monitoring: Operational State and Application Reports
 
 ```python
 snapshot = runner.stats()          # live in-process snapshot
@@ -324,6 +329,9 @@ snapshot = runner.stats()          # live in-process snapshot
 The panel shows: pipeline state distribution, p95/max latency, per-task counts, and for each pool its
 `active/capacity`, `ready/degraded/dead`, `waiting`, throughput and leak counters, and recent errors.
 It is also usable programmatically: `monitor.render_snapshot(stats)` / `monitor.watch(store)`.
+Application-reported values appear separately from operational counters. The application may
+observe committed pipeline completions and publish accuracy, but it owns deduplication and recovery
+of its accumulator from durable artifacts.
 
 ### 4.7 Completion Is Counted, Worker Lifetime Is Supervised
 

@@ -613,6 +613,7 @@ class TaskContext:
         "_emit_cb",
         "_history",
         "_leases",
+        "_report_metric_cb",
         "attempt",
         "bus",
         "clock",
@@ -652,6 +653,7 @@ class TaskContext:
         default_pool: str | None = None,
         default_algorithm: Any = None,
         emit: Callable[[str, Mapping[str, Any]], None] | None = None,
+        report_metric: Callable[..., Any] | None = None,
         meta: Mapping[str, Any] | None = None,
     ) -> None:
         self.run_id = run_id
@@ -674,6 +676,7 @@ class TaskContext:
         self._leases: list[Lease] = []
         self._history: list[Lease] = []
         self._emit_cb = emit
+        self._report_metric_cb = report_metric
 
     # ------------------------------------------------- resource acquisition
     def acquire(
@@ -801,3 +804,12 @@ class TaskContext:
         payload.setdefault("visit", self.visit)
         with contextlib.suppress(Exception):  # a failed event record must not affect scheduling
             self._emit_cb(kind, payload)
+
+    def report_metric(
+        self, name: str, value: str | int | float | bool, *, label: str = "",
+        display: str = "number"
+    ) -> Any:
+        """Persist a latest-value report scoped to this pipeline."""
+        if self._report_metric_cb is None:
+            raise ConfigError("this task context has no metric reporter")
+        return self._report_metric_cb(name, value, label=label, display=display)

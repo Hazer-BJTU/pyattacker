@@ -32,7 +32,7 @@ import time
 import traceback as tb_mod
 import warnings
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -59,6 +59,7 @@ from .errors import (
 )
 from .handoff import ControlPlan, Handoff
 from .pipeline import PipelineSpec
+from .reported_metrics import ReportedMetric, read_reported_metrics, report_metric
 from .resource import Bus, Pool, ResourceEvent
 from .scheduler import DelayQueue
 from .store import (
@@ -397,6 +398,7 @@ class Runner:
         clock: Any = None,
         bus: Bus | None = None,
         registry: CodecRegistry | None = None,
+        on_pipeline_finished: Callable[[PipelineRecord, Artifact | None], None] | None = None,
         config: RunConfig | None = None,
         **config_overrides: Any,
     ) -> None:
@@ -410,6 +412,7 @@ class Runner:
         self.clock = clock or _RealClock()
         self.bus = bus or Bus(clock=self.clock)
         self.registry = registry or DEFAULT_REGISTRY
+        self.on_pipeline_finished = on_pipeline_finished
         # Codec plugins register lazily, on the first Runner: importing pyattacker must not go
         # looking at every installed distribution.
         from .plugins import PLUGINS
@@ -854,6 +857,7 @@ class Runner:
             self.store.finish_pipeline(
                 state.pipeline_id, "interrupted", n_tasks_done=state.record.n_tasks_done
             )
+            self._notify_pipeline_finished(state.pipeline_id)
             self._emit(
                 "pipeline.deferred_interrupted",
                 pipeline_id=state.pipeline_id,
@@ -915,6 +919,7 @@ class Runner:
                         self.store.finish_pipeline(
                             state.pipeline_id, "interrupted", n_tasks_done=state.record.n_tasks_done
                         )
+                        self._notify_pipeline_finished(state.pipeline_id)
                     except Exception as exc:
                         self._fatal_error = StoreUnavailable(
                             f"could not persist cancellation for pipeline {state.pipeline_id!r}: {exc}"
@@ -965,6 +970,8 @@ class Runner:
                     pipeline_id=pipeline_id,
                     data={"error": f"{type(exc).__name__}: {exc}", "traceback": tb},
                 )
+                if pipeline_id is not None:
+                    self._notify_pipeline_finished(pipeline_id)
             finally:
                 queue.task_done()
 
@@ -1139,6 +1146,7 @@ class Runner:
             failed_task=state.task_spec.name if state is not None else None,
             traceback=tb,
         )
+        self._notify_pipeline_finished(pipeline_id)
         return pipeline_id
 
     def _finish_pipeline_after_internal_error(
@@ -2142,6 +2150,9 @@ class Runner:
             emit=lambda kind, data, _pid=spec.pipeline_id, _tid=task_run_id: self._emit(
                 kind, scope="task", pipeline_id=_pid, task_run_id=_tid, data=dict(data)
             ),
+            report_metric=lambda name, value, _pid=spec.pipeline_id, **kwargs: self.report_metric(
+                name, value, pipeline_id=_pid, **kwargs
+            ),
             meta={"tags": spec.template.tags},
         )
         attempt_started = self.clock.now()
@@ -2471,6 +2482,39 @@ class Runner:
                 data=dict(data or {}),
             )
         )
+        if kind in ("pipeline.succeeded", "pipeline.failed") and pipeline_id is not None:
+            self._notify_pipeline_finished(pipeline_id)
+
+    def _notify_pipeline_finished(self, pipeline_id: str) -> None:
+        callback = self.on_pipeline_finished
+        if callback is None:
+            return
+        try:
+            record = self.store.get_pipeline(pipeline_id)
+            if record is None or record.state not in ("succeeded", "failed", "interrupted", "canceled"):
+                return
+            artifact = None
+            if record.state == "succeeded":
+                artifact = next((a for a in self.store.artifacts(pipeline_id) if a.is_final), None)
+            callback(record, artifact)
+        except Exception as exc:
+            self._counters["monitor_callback_errors"] += 1
+            with contextlib.suppress(Exception):
+                self.store.emit_event(EventRecord(
+                    ts=time.time(), kind="monitor.callback_failed", scope="pipeline",
+                    run_id=self._run_id, pipeline_id=pipeline_id,
+                    data={"error": f"{type(exc).__name__}: {exc}"},
+                ))
+
+    def report_metric(
+        self, name: str, value: str | int | float | bool, *, label: str = "",
+        display: str = "number", pipeline_id: str | None = None
+    ) -> ReportedMetric:
+        """Persist an application-defined latest value for the active run."""
+        return report_metric(
+            self.store, self._run_id or "", name, value, label=label,
+            display=display, pipeline_id=pipeline_id,
+        )
 
     async def _heartbeat_loop(self, run_id: str) -> None:
         try:
@@ -2549,6 +2593,9 @@ class Runner:
             "pools": {name: dataclasses.asdict(pool.stats()) for name, pool in self.pools.items()},
             "delayed_pipelines": len(self._delays),
             "buffered": self.store.buffer_stats() if hasattr(self.store, "buffer_stats") else None,
+            "reported_metrics": [dataclasses.asdict(row) for row in read_reported_metrics(
+                self.store, run_id=self._run_id
+            )] if self._run_id else [],
             **rows,
         }
 

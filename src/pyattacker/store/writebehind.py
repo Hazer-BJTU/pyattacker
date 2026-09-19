@@ -24,7 +24,7 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 from ..artifact import Artifact, Encoded
-from ..errors import ConfigError
+from ..errors import ConfigError, StoreFeatureUnsupported
 from .base import (
     AttemptRecord,
     EventRecord,
@@ -120,6 +120,18 @@ class WriteBehindStore:
         self._events.append(event)
         self.buffered_events += 1
         self._maybe_flush()
+
+    def upsert_reported_metric(self, row: Any) -> None:
+        writer = getattr(self.inner, "upsert_reported_metric", None)
+        if not callable(writer):
+            raise StoreFeatureUnsupported("store does not support reported metrics")
+        writer(row)
+
+    def reported_metrics(
+        self, *, run_id: str | None = None, pipeline_id: str | None = None
+    ) -> list[Any]:
+        reader = getattr(self.inner, "reported_metrics", None)
+        return reader(run_id=run_id, pipeline_id=pipeline_id) if callable(reader) else []
 
     # -------------------------------------------------------------- runs (sync)
     def start_run(self, run: RunRecord) -> RunRecord:

@@ -381,6 +381,11 @@ class Store(Protocol):
     # built-in backends (``MemoryStore``, ``SqliteStore``, ``WriteBehindStore``) implement it;
     # callers that want it should check with ``getattr(store, "resources", None)``.
 
+    # ``upsert_reported_metric(row)`` and ``reported_metrics(*, run_id=None,
+    # pipeline_id=None)`` are also optional. They store application-supplied latest
+    # values for monitoring. A third-party store without them remains a valid Store;
+    # requesting a write raises StoreFeatureUnsupported, and readers show an empty view.
+
     # ``settle_pipeline(pipeline_id, *, state, n_tasks_done, run_id)`` is an optional capability in the
     # same spirit: one write that moves a row to its terminal state, rebinds the owning run and clears
     # the failure fields together, so the terminal-cursor repair (``Runner._settle_terminal_cursor``)

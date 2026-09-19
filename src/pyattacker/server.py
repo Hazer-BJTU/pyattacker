@@ -10,7 +10,7 @@ Design notes:
   it again, so the server can run beside a live run without touching its writer.
 * **No authentication, binds to loopback by default.** It exposes your run's payloads; treat it
   as a debug view, not as a public API. Put it behind your own proxy if you need one.
-* **The JSON endpoints are the real interface** (``/stats``, ``/events``, ``/pipelines``,
+* **The JSON endpoints are the real interface** (``/stats``, ``/metrics``, ``/events``, ``/pipelines``,
   ``/resources``); the HTML page at ``/`` is a convenience built on top of them.
 """
 
@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .errors import ConfigError
 from .monitor import read_snapshot
+from .reported_metrics import read_reported_metrics
 from .store.base import Store, open_store
 
 __all__ = ["StatsServer", "serve"]
@@ -41,8 +42,24 @@ _PAGE = """<!doctype html>
 </style></head><body>
 <h1>pyattacker <span id="run" class="k"></span></h1>
 <div class="row" id="cards"></div>
+<h2>Experiment metrics</h2><div class="row" id="metrics"></div>
+<h2>Pipeline reports (first 50)</h2>
+<table><thead><tr><th>pipeline</th><th>reported status</th></tr></thead><tbody id="pipeline-metrics"></tbody></table>
+<h2>Events</h2>
 <table><thead><tr><th>kind</th><th>pipeline</th><th>data</th></tr></thead><tbody id="events"></tbody></table>
 <script>
+function showMetrics(rows){
+  const root = document.getElementById('metrics');
+  root.replaceChildren();
+  for(const row of rows){
+    const card = document.createElement('div'); card.className = 'card';
+    const label = document.createElement('div'); label.className = 'k';
+    label.textContent = row.label || row.name;
+    const value = document.createElement('div'); value.className = 'v';
+    value.textContent = row.display === 'percent' ? `${(row.value * 100).toFixed(1)}%` : String(row.value);
+    card.append(label, value); root.append(card);
+  }
+}
 async function tick(){
   const s = await (await fetch('stats')).json();
   document.getElementById('run').textContent = s.run_id || '';
@@ -52,6 +69,22 @@ async function tick(){
     ['attempts', s.attempts_total||0], ['events', s.events_total||0]];
   document.getElementById('cards').innerHTML = cards.map(([k,v])=>
     `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+  const metrics = await (await fetch('metrics')).json();
+  showMetrics(metrics.rows);
+  const pipelines = await (await fetch('pipelines?limit=50' +
+    (metrics.run_id ? '&run_id=' + encodeURIComponent(metrics.run_id) : ''))).json();
+  const reports = document.getElementById('pipeline-metrics');
+  reports.replaceChildren();
+  for(const row of pipelines.rows){
+    if(!row.reported_metrics.length) continue;
+    const tr = document.createElement('tr');
+    const id = document.createElement('td'); id.textContent = row.pipeline_id.slice(0,12);
+    const details = document.createElement('td');
+    details.textContent = row.reported_metrics.map(item =>
+      `${item.label || item.name}: ${item.display === 'percent' ? (item.value * 100).toFixed(1) + '%' : item.value}`
+    ).join(' · ');
+    tr.append(id, details); reports.append(tr);
+  }
   const ev = await (await fetch('events?limit=40')).json();
   document.getElementById('events').innerHTML = ev.rows.map(r=>{
     const cls = r.kind.includes('failed')?'f':(r.kind.includes('succeeded')?'s':'');
@@ -171,6 +204,26 @@ class StatsServer:
             snapshot.pop("buffered", None)
             return 200, snapshot
 
+        if path == "/metrics":
+            pipeline_id = (query.get("pipeline_id") or [None])[0]
+
+            def _metrics(store: Any) -> Any:
+                rows = read_reported_metrics(store, run_id=run_id, pipeline_id=pipeline_id)
+                # With no selected run, show the most recently updated reporting run.
+                selected = run_id
+                if selected is None and rows:
+                    selected = max(rows, key=lambda row: row.updated_at).run_id
+                    rows = [row for row in rows if row.run_id == selected]
+                return selected, [
+                    {"run_id": row.run_id, "pipeline_id": row.pipeline_id,
+                     "name": row.name, "value": row.value, "label": row.label,
+                     "display": row.display, "updated_at": row.updated_at}
+                    for row in rows
+                ]
+
+            selected, rows = self._read(_metrics)
+            return 200, {"run_id": selected, "rows": rows}
+
         if path == "/events":
             rows = self._read(
                 lambda store: [
@@ -220,6 +273,13 @@ class StatsServer:
                             "error_message": record.error_message,
                             "started_at": record.started_at,
                             "finished_at": record.finished_at,
+                            "reported_metrics": [
+                                {"name": item.name, "value": item.value, "label": item.label,
+                                 "display": item.display, "updated_at": item.updated_at}
+                                for item in read_reported_metrics(
+                                    store, run_id=record.run_id, pipeline_id=record.pipeline_id
+                                )
+                            ],
                         }
                     )
                 return rows
@@ -249,7 +309,7 @@ class StatsServer:
         return 404, {"error": f"unknown path {path!r}", "paths": _PATHS}
 
 
-_PATHS = ["/", "/stats", "/events", "/pipelines", "/resources", "/errors", "/healthz"]
+_PATHS = ["/", "/stats", "/metrics", "/events", "/pipelines", "/resources", "/errors", "/healthz"]
 
 
 def _int(values: list[str] | None, default: int) -> int:

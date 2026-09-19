@@ -215,6 +215,7 @@ async with ctx.acquire(where=lambda r: r.options["ctx_len"] >= 32000) as lease:
 | `ctx.held_leases()` | 这次尝试当前持有的租约 |
 | `ctx.reclaim_now()` | 强制归还当前持有的全部租约；同步、不可中断 |
 | `ctx.emit(kind, **data)` | 把你自己的事件写进这次运行的事件流 |
+| `ctx.report_metric(name, value, *, label="", display="number")` | 汇报当前流水线作用域的最新值 |
 
 ```python
 @task("adaptive", resource="apis")
@@ -677,6 +678,7 @@ with Runner(store="runs/qa.db", pools=[pool], concurrency=64) as runner:
 | `run(specs, *, resume=False, **overrides)` | 跑至完成，返回 `RunReport`。在 `asyncio.run` 里包 `run_async` |
 | `await run_async(specs, *, resume=False, **overrides)` | 同上，但在已有的事件循环里 |
 | `stats()` | 实时快照；运行中途安全调 |
+| `report_metric(name, value, *, label="", display="number", pipeline_id=None)` | 汇报应用计算的最新值 |
 | `stop(reason="user")` | 请求运行优雅停：不再接新活，排空在途工作 |
 | `stopping` | 是否在停 |
 | `run_id` | 当前运行的 id |
@@ -2085,6 +2087,36 @@ runner.run(template.map(jsonl_source("dataset.jsonl", limit=500)))
 
 ## 监控
 
+### 应用汇报的指标
+
+应用可以在运行期间汇报实验指标的最新值。Pyattacker 只负责保存和展示，指标由应用计算。
+可运行的准确率示例见 [`examples/live_metrics.py`](../../examples/live_metrics.py)。
+
+```python
+runner.report_metric("evaluated", completed, label="Evaluated")
+runner.report_metric("accuracy", correct / completed, label="Accuracy", display="percent")
+# Inside a task, ctx.report_metric("phase", "scoring", display="text")
+```
+
+`Runner(..., on_pipeline_finished=callback)` 在流水线终态持久化后调用
+`callback(record, artifact)`。成功时传入最终 `Artifact`，失败或中断时传入 `None`。
+可以用 `runner.registry.load(artifact.encoded())` 解码保存的产物。回调在调度线程中运行，
+应尽快返回。回调异常记录为 `monitor.callback_failed`，不会改变流水线结果。进程崩溃可能
+导致回调遗漏或重放，因此应用应按 pipeline ID 去重，并在需要时从持久化的最终产物重建
+统计。恢复运行使用新的 run ID，汇报值也属于新的作用域。
+
+`report_metric(name, value, *, label="", display="number", pipeline_id=None)` 接受字符串、
+布尔值或有限数字。`display` 可为 `number`、`percent`（传入比例，展示为百分比）或
+`text`（字符串）。同一运行、同一作用域中的同名指标会覆盖旧值。`ctx.report_metric(...)`
+自动使用当前 pipeline 作为作用域。即使启用事件延迟写入，指标仍同步写入。第三方存储
+可以选择支持此功能；对不支持的存储汇报时抛出 `StoreFeatureUnsupported`。
+
+`/metrics?run_id=...` 返回 `{"run_id": ..., "rows": [{"run_id", "pipeline_id", "name",
+"value", "label", "display", "updated_at"}, ...]}`。加上 `pipeline_id=...` 可读取该流水线的
+自定义值；`/pipelines` 的每行也包含 `reported_metrics` 数组。未指定 run ID 时，
+`/metrics` 选择最近一次更新运行级指标的运行。HTML 面板将运行级值显示为卡片；终端
+`watch` 也会展示。HTTP 服务仍只读，指标通过正在运行的 Runner 的存储连接写入。
+
 ### `runner.stats()`
 
 进程内实时快照。运行中途安全调。
@@ -2117,7 +2149,7 @@ with StatsServer("runs/qa.db", port=8787) as server:
 | 端点 | 返回 |
 |---|---|
 | `/` | 一个小巧的自动刷新仪表盘 |
-| `/stats`, `/events`, `/pipelines`, `/resources`, `/errors` | JSON |
+| `/stats`, `/metrics`, `/events`, `/pipelines`, `/resources`, `/errors` | JSON |
 
 `/stats` 带 `handoffs_total`（所选运行的提交数，没运行过滤器则全部提交），每行 `/pipelines` 带
 `handoffs`（活动执行记录的计数）、`handoffs_historical`（全部记录的计数）和

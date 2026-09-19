@@ -5,7 +5,7 @@ Every test starts the server on ``port=0`` (the OS picks a free port, the real o
 real (small) run first, so the JSON assertions are about concrete values, not just shapes.
 
 Coverage
-* ``/`` (HTML, also ``/index.html``), ``/healthz``, ``/stats``, ``/events?limit=N``,
+* ``/`` (HTML, also ``/index.html``), ``/healthz``, ``/stats``, ``/metrics``, ``/events?limit=N``,
   ``/pipelines?state=&limit=``, ``/resources``, ``/errors`` and the 404 path
 * limit handling: honoured, defaulted (50) for a bad value, clamped to >= 1
 * run scoping: the configured ``run_id`` and a ``?run_id=`` override
@@ -28,7 +28,7 @@ from pyattacker import MemoryStore, Runner, SqliteStore, boom, echo, pipeline
 from pyattacker.server import StatsServer
 from pyattacker.tasks import delay
 
-_PATHS = ["/", "/stats", "/events", "/pipelines", "/resources", "/errors", "/healthz"]
+_PATHS = ["/", "/stats", "/metrics", "/events", "/pipelines", "/resources", "/errors", "/healthz"]
 
 # Seed layout (two runs, three pipelines, eight events):
 #   run A: 2 successful "srv-ok" pipelines (task.succeeded + pipeline.succeeded each) + run.finished

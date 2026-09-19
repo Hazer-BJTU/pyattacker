@@ -1468,9 +1468,12 @@ blobs on disk: 3 files, [11, 27, 1536] bytes
 * **工件后端**决定载荷字节放哪：`None`/`"inline"` 留在数据库里，`"null"` 丢掉字节但留摘要，`"file:///data/blobs"`（或 `{"kind": "file", "root": ..., "min_bytes": 262144}`）溢到内容寻址的文件里，读取时再水合回来。上面的 `min_bytes=0` 什么都溢出去，所以工件行显示的是引用而不是字节。
 * **插件**是 `importlib.metadata` 入口点，分四组：`pyattacker.tasks`、`pyattacker.algorithms`、`pyattacker.codecs` 和 `pyattacker.stores`（按 URI scheme 索引，`store = "s3://bucket/runs.db"` 就能用）。内置项先解析，导入时报错的插件记下来不致命——`pyattacker plugins` 两者都列。完整示例包在 [`examples/plugin_package/`](../../examples/plugin_package/README.zh-CN.md)。
 
-**监控正在跑的运行。** `pyattacker watch runs/qa.db` 让你从第二个进程看终端视图，`pyattacker serve runs/qa.db` 提供 HTTP 仪表盘，在 `/stats`、`/events`、`/pipelines`、`/resources` 和 `/errors` 提供 JSON。两个都开只读连接，能和正在跑的任务并排用。HTTP 端点没认证，会把你的载荷给出来——只绑回环地址。
+**监控正在跑的运行。** `pyattacker watch runs/qa.db` 让你从第二个进程看终端视图，`pyattacker serve runs/qa.db` 提供 HTTP 仪表盘，在 `/stats`、`/metrics`、`/events`、`/pipelines`、`/resources` 和 `/errors` 提供 JSON。两个都开只读连接，能和正在跑的任务并排用。HTTP 端点没认证，会把你的载荷给出来——只绑回环地址。
+需要实时实验准确率时，运行 [`examples/live_metrics.py`](../../examples/live_metrics.py)。示例的
+完成回调解码最终产物、按 pipeline ID 去重，再通过 `runner.report_metric()` 汇报当前
+准确率；面板会随着汇报更新。
 * **监控**：`pyattacker serve runs/qa.db` 是零依赖的只读 HTTP 视图（`/`、
-  `/stats`、`/events`、`/pipelines`、`/resources`、`/errors`），每个请求开个新连接，和正在跑的任务并行无碍。绑回环地址、没认证——当调试视图用，别当仪表盘用。
+  `/stats`、`/metrics`、`/events`、`/pipelines`、`/resources`、`/errors`），每个请求开个新连接，和正在跑的任务并行无碍。绑回环地址、没认证——当调试视图用，别当仪表盘用。
 
 ---
 
