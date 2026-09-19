@@ -496,6 +496,11 @@ every known tradeoff with its reason.
 
 ## Status
 
+**0.3.1 — application-reported live metrics.** Applications can publish values such as accuracy to the
+read-only monitoring dashboard through `Runner.report_metric()` or `TaskContext.report_metric()`. A completion
+callback receives committed pipeline results; the application owns the calculation. The dashboard and
+`watch` now follow one run consistently by default. See [`examples/live_metrics.py`](examples/live_metrics.py).
+
 **0.3.0 — advanced control flow (opt-in), and the documentation in Chinese.** Tasks can now
 [hand off](#advanced-handoffs-opt-in): return a `Handoff` to skip declared stations or finish the pipeline
 early, recorded in a durable ledger that recovery resumes from. It is opt-in and inert — a pipeline without a
