@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-09-19
+
+### Added
+
+* **Application-reported live metrics.** `Runner.report_metric()` and `TaskContext.report_metric()`
+  publish latest values scoped to a run or pipeline. Applications can observe committed pipeline
+  completions with `on_pipeline_finished(runner, record, artifact)` and compute their own accuracy or
+  other cross-pipeline measures. SQLite and in-memory stores persist the reports; `/metrics`, the HTML
+  dashboard, and terminal `watch` display them. See `examples/live_metrics.py` for a restart-aware
+  accuracy monitor. Metric calculation remains application-owned.
+
+### Fixed
+
+* **Consistent monitoring scope.** With no explicit run ID, the dashboard, JSON endpoints and terminal
+  `watch` all select the latest started run. The dashboard uses that same ID for statistics, metrics,
+  pipelines and events, including when only pipeline-scoped values were reported. `run_id=all` requests
+  aggregate operational statistics without mixing in a single run's application metrics.
+
 ## [0.3.0] — 2026-09-19
 
 ### Added
