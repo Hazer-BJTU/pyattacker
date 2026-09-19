@@ -182,9 +182,10 @@ def merge_reports(
                     rows_by_id[key] = row
                 # Collect repair-failed pipeline ids from this store.
                 # (A pipeline may appear in multiple stores if they were copied.)
-                if key not in repair_failed_pids:
-                    if count_ev(store, kind="pipeline.terminal_repair_failed", pipeline_id=key) > 0:
-                        repair_failed_pids.add(key)
+                if key not in repair_failed_pids and count_ev(
+                    store, kind="pipeline.terminal_repair_failed", pipeline_id=key
+                ) > 0:
+                    repair_failed_pids.add(key)
         finally:
             if not hasattr(source, "export_rows"):
                 store.close()
