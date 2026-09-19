@@ -406,8 +406,9 @@ uv run pyattacker serve runs/qa.db        # http://127.0.0.1:8787
 ```
 
 It opens a fresh read-only connection per request, so it runs happily beside a live run. It has **no
-authentication** and binds to loopback: it exposes your payloads, so treat it as a debug view and do not
-put it on a public interface without your own proxy in front.
+authentication** and binds to loopback: there is no artifact route, but it does expose what your run recorded —
+event `data` and stored error messages — so treat it as a debug view over your own data and do not put it on a
+public interface without your own proxy in front.
 
 **Branching inside a step** — `fanout(a, b)` runs several tasks on the same input concurrently and
 returns `{task_name: value}`. Retry granularity becomes the group, which is the honest price of not

@@ -2,7 +2,8 @@
 
 **English** | [简体中文](zh-CN/design.md)
 
-> Version: 0.1.0 (M0–M4 complete, M5 advanced control flow in progress — see "Implemented / Left for later" in Section 9)
+> Version: 0.2.0 — M0–M5 complete, including the opt-in advanced control flow of §4.8 (forward handoffs and
+> backward traversal), which stays experimental until 1.0. See "Implemented / Left for later" in Section 9.
 > In one sentence: **an async task orchestration framework centered on the artifact, using the pipeline as the unit of completion, and the resource pool as the only shared surface.**
 > It does not touch the network, does not do reduction, and does not do DAG scheduling — it is only responsible for "running tens of thousands of mutually independent pipelines to completion, reliably, recoverably, and observably".
 
@@ -837,8 +838,11 @@ artifact_backend = { kind = "file", root = "/data/blobs", min_bytes = 262144 }
 
 **Monitoring endpoint**: `pyattacker serve runs/qa.db` starts a zero-dependency, read-only HTTP view
 (fresh read-only connection per request, so it can run beside a live run). `/stats`, `/events`,
-`/pipelines`, `/resources`, `/errors` are JSON; `/` is a small auto-refreshing dashboard. It binds
-to loopback and has no authentication — it exposes your payloads, so treat it as a debug view.
+`/pipelines`, `/resources`, `/errors` are JSON; `/` is a small auto-refreshing dashboard. There is no
+artifact route: what it exposes is what the run *recorded* — each event's `data` verbatim, and the
+`error_message` on failed pipelines and `recent_errors` — so whatever a task logged or put in an exception
+message is readable there. It binds to loopback and has no authentication for that reason; treat it as a
+debug view.
 
 **Fan-out**: `fanout(a, b, ...)` runs several tasks on the *same* input concurrently **inside one
 task**, which is how a genuinely branching step is expressed without turning pipelines into a DAG.
@@ -905,7 +909,9 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
 5. **`quota_aware` is a preference, not a hard limit**: when every candidate is out of quota the best of them
    is still handed out, because refusing to work is worse than overspending. For a hard stop, raise from the
    task once its own budget is gone.
-6. **v1 only supports asyncio tasks**: wrap blocking code yourself inside the task with
+6. **A task may be sync or async, but the loop is single-threaded**: a plain `def` is called inline and holds
+   the event loop for its whole duration — which is also why `timeout_s` is accepted and cannot fire for it,
+   since there is no point at which the framework could cancel it. Wrap blocking code yourself with
    `await asyncio.to_thread(...)` (one line of code, in exchange for a pool that needs no locks and carries no
    thread-safety burden).
 7. **One writer per database**: scaling out means more processes, each with its own store (`--shard i/N`),
@@ -928,9 +934,11 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
 11. **A `null` backend costs you recovery granularity**: dropping payloads means intermediate artifacts
     cannot be reused, so `resume` reruns the whole pipeline — the same tradeoff as `journal=summary`.
     A missing blob file behaves the same way, on purpose: `available` goes false and the work is redone.
-12. **The HTTP endpoint is unauthenticated and loopback-only by default.** It is a debug view over your
-    run's payloads, not a service. Put it behind your own proxy if you need one, and think before binding
-    it to a public interface.
+12. **The HTTP endpoint is unauthenticated and loopback-only by default.** It is a debug view over what your
+    run *recorded* — event `data` verbatim, and the error messages on failed pipelines — not over the artifact
+    table, which has no route at all. So it is still "your data on an open port": a task that logs a row, or
+    raises with one in the message, publishes it. Put it behind your own proxy if you need one, and think
+    before binding it to a public interface.
 13. **YAML is an extra, not a dependency**: `dependencies` is empty, and the declarative layer reads JSON and
     TOML with the standard library, so `pip install pyattacker` pulls in nothing. A `.yaml`/`.yml` config needs
     `pip install "pyattacker[yaml]"`, and without it the loader raises a `ConfigError` naming the extra and the
@@ -1060,6 +1068,15 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
 * `tests/test_tutorial.py` — every code block in `docs/tutorial.md` marked as a complete program
   (`# tutorial/<name>.py`) is extracted and actually run, so the tutorial cannot silently rot out of sync
   with the real API.
+* `tests/test_docs_examples.py` / `tests/test_docs_i18n.py` / `tests/test_docs_facts.py` — the documents
+  themselves are tested. Every `# example/<name>.py`, `# reference/<name>.py` and `# example/<name>.yaml`
+  block is executed in a temporary directory; the Simplified Chinese documents are held to the English ones
+  (a counterpart exists, fenced code blocks are byte-identical in order, heading levels, language switchers,
+  runnable markers and every relative link and anchor match); and the facts that rot silently are asserted
+  instead of trusted — the version in this document against `pyproject.toml`, every "N runnable steps" claim
+  against the number of `# tutorial/` blocks, and every monitoring route the reference names against
+  `StatsServer`'s real route table. Prose accuracy stays a review question: the machine checks what has a
+  source of truth.
 
 All time-related logic (backoff, circuit-break cooldown) goes through an injectable `Clock`, and tests use
 `tests/helpers.py::FakeClock` to turn time into a controllable variable, making them both deterministic and fast.
@@ -1076,6 +1093,13 @@ checkpoint and recovery, retry and error classification, the resource pool state
 pool wait-time metrics, deterministic sharding with merged reports, five row shapes in three export formats,
 entry-point plugins, external artifact backends, a fan-out helper, and a read-only HTTP monitoring endpoint.
 
+**Implemented (M5, opt-in, experimental until 1.0)**: declared control flow — the `Handoff` directive with
+`control=` on the pipeline, the append-only `handoffs` ledger, atomic `commit_handoff` /
+`commit_control_transition`, ledger-first recovery that resumes a killed process at the target, backward
+traversal (`rewind`, `retry_all`, finite control budgets), visit-aware occurrence identity with effective
+versus exact artifact reads, and the optional `HistoryArtifact` payload. A pipeline without a `control` block
+is provably untouched: no new rows and a byte-identical `spec_digest`.
+
 **Left for later (post-0.1.0)**: a distributed scheduler, Parquet export, blob garbage collection
 (`FileBackend` is content-addressed, so orphan blobs are safe but never removed), and first-class
 `Parallel`/`Gather` nodes — the last one only if the unary task model proves too limiting in practice.
@@ -1091,7 +1115,7 @@ entry-point plugins, external artifact backends, a fan-out helper, and a read-on
 | **M2 Smarter resources and retries** ✅ | write-behind, backoff that yields the worker, per-resource targeted wakeups, quota-aware algorithms, finer `acquire` metrics | backoff is observable when the pool is saturated, and can be replayed from `events` |
 | **M3 Scale and ergonomics** ✅ | `--shard i/N` + `--shards N`, merged reports, shard utilities, multi-shape/multi-format export | multiple processes run the same dataset |
 | **M4 Ecosystem** ✅ | entry-point plugins, external artifact backends, fan-out helper, HTTP monitoring endpoint, 0.1.0 packaging | third parties can publish task packages |
-| **M5 Advanced control flow (opt-in)** 🚧 | declared forward handoffs (`Handoff`, `control=`, the `handoffs` ledger, atomic `commit_handoff`, ledger-first recovery) | a handoff is a durable checkpoint: a killed process resumes at the target with the entry state, and a control-free pipeline is provably unchanged |
+| **M5 Advanced control flow (opt-in)** ✅ | declared forward handoffs (`Handoff`, `control=`, the `handoffs` ledger, atomic `commit_handoff`, ledger-first recovery) and backward traversal (rewind, retry-all, visits, finite control budgets, optional `HistoryArtifact` payload history) | a handoff is a durable checkpoint: a killed process resumes at the target with the entry state, and a control-free pipeline is provably unchanged |
 
 ---
 

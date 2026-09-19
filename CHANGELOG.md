@@ -56,6 +56,20 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+* **Documentation drift that no test could see** (issue #60), and a lightweight check for the class of it.
+  The design document still opened with "Version: 0.1.0 (M0–M4 complete, M5 … in progress)" while
+  `pyproject.toml`, the changelog and the README had been on 0.2.0 since September, and M5 — forward
+  handoffs and backward traversal — had shipped; §8 still claimed "v1 only supports asyncio tasks" while the
+  first task of the tutorial is a plain `def` and the reference documents sync-task behaviour; the reference
+  still called the tutorial "fourteen runnable steps" after three more were added; and the monitoring docs
+  promised that `serve` "serves your artifact payloads" although no route returns one — what is actually
+  exposed is event `data` and stored `error_message` fields, which is a warning worth keeping, so the
+  sentence now names those instead of the wrong thing. All of it is mirrored in the Chinese documents.
+  `tests/test_docs_facts.py` now asserts the three claims that have a source of truth — the version header
+  against `pyproject.toml`, every "N runnable steps" claim against the number of `# tutorial/` blocks, and
+  every route the monitoring endpoint table advertises against the routes `StatsServer` answers — so the next
+  release cannot leave the header behind.
+
 * **`merge_reports` no longer inflates its counters when it folds a duplicate** (issue #59). Rows were
   always de-duplicated by `pipeline_id`, but `attempts_total` and `handoffs_total` were summed over the
   sources — before de-duplication — so `pyattacker report a.db a.db`, or one pipeline living in two shards

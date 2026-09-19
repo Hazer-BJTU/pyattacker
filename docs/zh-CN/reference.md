@@ -2125,7 +2125,11 @@ with StatsServer("runs/qa.db", port=8787) as server:
 **位置**，不是已跑任务数，所以非零的 `handoffs` 才说明"这条
 流水线跳过了站点"。
 
-**它没认证，会把你的工件载荷给出来。** 正因如此，它只绑回环地址。把它
+**没有 artifact 路由，端点也没有认证。** JSON 视图暴露的是这次运行*记下来*的东西：
+`/events` 把每条事件的 `data` 原样返回，`/pipelines`、`/errors` 以及 `/stats`（通过
+`recent_errors`）返回存下来的 `error_message`。任务把某行数据打进日志、或者把它写进
+异常信息里抛出来，就等于在那里公开了它——所以请把它当成"看你自己数据的调试视图"，
+而 artifact 载荷本身只能通过存储或 `pyattacker export` 拿到。正因如此，它只绑回环地址。把它
 暴露到其他任何地方之前，先架你自己的代理。`pyattacker serve` 就是同一功能的
 命令行版本。
 
@@ -2139,7 +2143,7 @@ with StatsServer("runs/qa.db", port=8787) as server:
 
 | 文档 | 内容 |
 |---|---|
-| [`docs/tutorial.md`](tutorial.md) | 引导式路径：十四个可运行的步骤 |
+| [`docs/tutorial.md`](tutorial.md) | 引导式路径：17 个可运行步骤 |
 | [`docs/cli.md`](cli.md) | 命令、flag、退出码、配置文件格式 |
 | [`docs/design.md`](design.md) | 模型、不变量，以及这些 API 背后的权衡 |
 | [`examples/`](../../examples) | 完整程序，包括对多种流水线形态的实测比较 |

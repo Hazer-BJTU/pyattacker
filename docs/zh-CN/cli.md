@@ -156,7 +156,7 @@ pyattacker serve STORE [--host HOST] [--port PORT] [--run-id ID]
 
 `/` 是个自动刷新的小仪表盘；`/stats`、`/events`、`/pipelines`、`/resources`、`/errors` 返回 JSON。每个请求都新开一个只读连接，所以和正在跑的流水线并存是安全的。
 
-**没有认证，会暴露你的产物内容。** 所以默认只绑回环地址。要绑别的地址？前面自己加个代理。
+**没有认证，也没有 artifact 路由。** 它暴露的是这次运行记下来的内容——事件的 `data` 原样呈现，存下来的 `error_message` 字段也在——所以默认只绑回环地址。要绑别的地址？前面自己加个代理。
 
 ---
 
