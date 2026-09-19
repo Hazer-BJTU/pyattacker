@@ -6,7 +6,7 @@
 
 ## 1. 它是什么，不是什么
 
-它不是微基准测试：这里不测本机性能，`wall_s` 是*成本*列，不是质量指标。它是仿真，所以数字取决于场景里写死的假设——改一个假设，排名就可能变，因为基础场景的令牌桶会惩罚猛打它的客户端。由此定了两条规矩：不搞综合得分（第 6 节），场景可以报告"没人赢"（基础场景故意放了三个性格不同的端点）。
+它不是微基准测试：这里不测本机性能，`wall_s` 是*成本*列，不是质量指标。它是仿真，所以数字取决于场景里写死的假设——改一个假设，排名就可能变，因为基础场景的令牌桶会惩罚持续高频请求的客户端。由此定了两条规矩：不搞综合得分（第 6 节），场景可以报告"没人赢"（基础场景故意放了三个性格不同的端点）。
 
 ## 2. 一次运行怎么跑
 
@@ -25,7 +25,7 @@
 | 假设（字段） | 对应什么现实问题 | 区分什么 |
 |---|---|---|
 | 容量周期：`LoadCycle(period_s=120, trough=0.35, peak=1.0)`，从低谷开始；容量 = `max(1, round(capacity × weight × factor))` | 厂商自己的负载波动、你应得的公平份额、某区域故障转移带走你的容量 | 把容量当静态值的策略（`immediate`，以及 `quota_aware` 写死的配额）和会重试重排的策略之间的对比。让*什么时候*问和*问谁*一样重要 |
-| 被施压就收紧的令牌桶：按 `per_window/window_s` 补充，`burst` 允许突发；每次拒绝把额度乘以 `tightening`（下限 `tightening_floor`），每个窗口按 `recovery_per_window` 恢复 | 带 `Retry-After` 的 `429`——这是写得再好的客户端也常翻车的地方 | 分散负载慢慢拿回容量的客户端，和一直猛打一直丢容量的客户端之间的对比。`metered` 按 0.35 收紧，1.5s 后重试；其他按 0.5 |
+| 被施压就收紧的令牌桶：按 `per_window/window_s` 补充，`burst` 允许突发；每次拒绝把额度乘以 `tightening`（下限 `tightening_floor`），每个窗口按 `recovery_per_window` 恢复 | 带 `Retry-After` 的 `429`——这是写得再好的客户端也常失败的地方 | 分散负载慢慢拿回容量的客户端，和持续高频重试一直丢容量的客户端之间的对比。`metered` 按 0.35 收紧，1.5s 后重试；其他按 0.5 |
 | 延迟不是单一数值：对数正态主体（`median_s`、`sigma`）加一条慢尾（`tail_rate`、`tail_factor`）；三个端点分别是 0.25s/0.5、1.2s/0.3、0.5s/0.6，尾部概率 2%、1%、3% | 排队等其他租户、GC 停顿、模型长 prompt 输出慢 | "在途数量"和"最近最快"到底靠不靠谱，把 p50 的故事和 p95/p99 的故事分开 |
 | 带相关性的失败：`FailureProfile`（默认 `error_rate=0.01`、`storm_rate=0.05`、`storm_duration_s=30`、`storm_error_rate=0.5`，每个端点可单独覆盖）；风暴按 `(seed, endpoint, time window)` 判定 | 独立的瞬时抖动，加上一次接口方事故，或者某区域网络短暂抽风 | 算法多快察觉某个端点现在不行了，以及为此烧多少重试预算。错误类型是 `ProviderError(503)`、`ConnectionError`、`TimeoutError` 和 429，框架自己的分类逻辑会跑起来 |
 | 几个性格不同的端点：`fast-flaky`（容量 6、0.25s、错误率 0.03、风暴 0.08 概率、时长 0.6）、`slow-steady`（容量 12 × 权重 1.2、1.2s、错误率 0.004、风暴 0.02）、`metered`（容量 4、0.5s、配额 180） | 两家厂商，再加一个受突发限制的试用 key；那个又便宜又快的恰恰是最容易出问题的 | 位置和时间之间的权衡。没有哪个策略在这三者上全能，这就是为什么报告必须能输出多个胜者或零个 |
@@ -37,7 +37,7 @@
 |---|---|---|
 | 世界的脾气是时间的函数，不是调用方的函数：容量是对 `t` 的算术，`storm_until(endpoint, t)` 是 `(seed, endpoint, t)` 的纯函数——风暴从时间窗口起点开始，天气不取决于请求什么时候到 | `provider.py`（`capacity_at`、`storm_until`、`_storm_window`） | `tests/test_benchmark_provider.py::test_storm_state_does_not_depend_on_request_cadence` 在同一批时间戳上对比两种*不同*的流量安排，`::test_the_storm_interval_is_anchored_to_its_window` 钉住锚定 |
 | 公共随机数：延迟和失败的骰子来自 `random.Random(f"{seed}:{endpoint}:{ordinal}")`，按请求*在该端点*的序号索引。两个算法共享同一套**外生**随机性——同样的骰子、同样的天气——但不共享相同的实际接口方状态，后者会分化，因为令牌桶和在途数量会对各自行为做出反应 | `provider.py`（`perform`） | `tests/test_benchmark_provider.py::test_each_request_sees_the_world_by_its_ordinal_whatever_the_timing`；`tests/test_benchmark_harness.py::test_two_algorithms_see_the_same_exogenous_draws` 对比两者都到达的每个序号，共享请求少于 20 个就判失败 |
-| 客户端侧的随机数跟着逻辑身份走，不跟 worker：获取算法和重试策略各自从 `Random(f"{seed}:{acquire,retry}:{job}:{step}:{attempt}")` 取数 | `harness.py`（`acquire_stream`、`retry_stream`） | `tests/test_benchmark_harness.py::test_client_randomness_follows_the_logical_identity_not_the_worker` |
+| 客户端侧的随机数跟着逻辑身份走，不跟 worker：获取算法和重试策略各自从 `Random(f"{seed}:{{acquire,retry}}:{job}:{step}:{attempt}")` 取数 | `harness.py`（`acquire_stream`、`retry_stream`） | `tests/test_benchmark_harness.py::test_client_randomness_follows_the_logical_identity_not_the_worker` |
 | 场景会声明它测不了的算法，这些算法不参与排名，不会拿没意义的数字凑数 | `scenario.py`（`Scenario.unsuited`）、`report.py`（`default_algorithms`、`winners`） | `tests/test_benchmark_harness.py::test_a_scenario_declares_which_algorithms_it_cannot_exercise`、`::test_an_algorithm_the_scenario_cannot_exercise_is_marked_not_ranked` |
 | 只有冷却到期才能结束的等待，是资源池时钟上的真实定时器，仿真时间会推到它，等待者会被唤醒——而且由*最早*的待处理截止时间持有定时器 | `resource.py`（`_ensure_cooldown_notifier`、`_cooldown_deadline`） | `tests/test_lease_safety.py::test_a_wait_that_only_a_cooldown_can_end_actually_ends` 和 `::test_a_cooldown_that_ends_earlier_than_the_armed_one_replaces_it`（内核回归测试：不修的话两个都会超时或延迟唤醒）、`tests/test_benchmark_harness.py::test_a_wait_that_only_a_cooldown_can_end_advances_simulated_time` |
 | 只干了一小部分活的算法，不能在*任何*质量行上赢——包括完成量不足时无定义的延迟和吞吐量，以及它部分掌控分母的各种比率；被排除的在表格和 JSON 里都具名说明，基线会忽略场景声明不适用的算法，只有一个合格竞争者的受门控行干脆没有胜者 | `report.py`（`COMPLETION_FLOOR`、`excluded_by_completion`、`comparable`、`unrivaled`、`winners`）、`metrics.py`（`Metric.requires_comparable_completion`） | `tests/test_benchmark_report.py::test_every_quality_row_requires_comparable_completion`、`::test_an_algorithm_that_does_almost_nothing_cannot_win_any_quality_row`（对全部 13 个受门控行参数化）、`::test_a_quality_metric_cannot_crown_an_algorithm_that_completed_almost_nothing`、`::test_the_completion_baseline_ignores_an_algorithm_the_scenario_cannot_exercise`、`::test_one_eligible_contestant_is_not_crowned` |

@@ -26,7 +26,7 @@ pyattacker {run,resume,report,watch,export,serve,plugins,validate,demo}
 
 ---
 
-## `run` —— 跑声明式配置
+## `run` —— 运行声明式配置
 
 ```bash
 pyattacker run -c config.yaml [options]
@@ -182,7 +182,7 @@ pyattacker validate -c config.yaml [--strict-env]
 
 它只做*声明式*检查：不会打开 `source.path`、不会遍历数据集、不会构建 `artifact_backend`（构建它会创建目录）、不会调任务。但它确实会检查 `artifact_backend` 是 `resolve_backend` 能造出来的——必填字段（比如文件后端的 `root`）也查——所以 `validate` 和 `run` 接受/拒绝的规格是完全一致的。`${VAR}` 的展开方式见下文。
 
-## `plugins` —— 装了什么插件
+## `plugins` —— 已安装的插件
 
 ```bash
 pyattacker plugins [--json]
