@@ -18,6 +18,9 @@ shaped this way.
   keyword-only.
 * **Defaults matter here.** Two in particular surprise people: `Retrying(max_attempts=1)` means *no retries*
   unless you ask, and `Runner(store=":memory:")` means nothing is persisted unless you give it a path.
+* **Some examples are complete programs.** A block whose first line is `# reference/<name>.py` is written out
+  and executed by [`tests/test_docs_examples.py`](../tests/test_docs_examples.py) on every test run — the
+  README and the CLI document share that contract. Blocks without a marker are fragments on purpose.
 
 ## Contents
 
@@ -26,11 +29,12 @@ shaped this way.
 | [Tasks](#tasks) | `task`, `build_task_spec`, `TaskSpec`, `Retrying`, `TaskContext`, `with_retry` |
 | [Pipelines](#pipelines) | `pipeline`, `PipelineTemplate`, `PipelineSpec`, `Chain`, `compute_spec_digest` |
 | [Advanced: handoffs](#advanced-handoffs-opt-in) | `Handoff`, the `control=` declaration, `HandoffRecord` |
+| [Advanced: backward traversal](#advanced-backward-traversal-rewind-retry-all-visits) | `Handoff.rewind`, `Handoff.retry_all`, the backward `control` keys, visits, budgets, recovery |
 | [Running](#running) | `Runner`, `RunConfig`, `RunReport`, worker liveness |
 | [Resources](#resources) | `Resource`, `Pool`, `Lease`, `PoolStats`, `Bus`, `ResourceState`, `ResourceEvent` |
 | [Acquire algorithms](#acquire-algorithms) | `Wait`, `Backoff`, `LeastBusy`, `Failover`, `Sticky`, `QuotaAware`, `Immediate`, `resolve_algorithm` |
 | [Errors](#errors) | the exception hierarchy, `error_class_of` |
-| [Artifacts and codecs](#artifacts-and-codecs) | `Artifact`, `Codec`, `CodecRegistry`, `JsonCodec`, `BytesCodec`, `Encoded`, `canonical_json`, `digest_of` |
+| [Artifacts and codecs](#artifacts-and-codecs) | `Artifact`, `Codec`, `CodecRegistry`, `HistoryArtifact`, `JsonCodec`, `BytesCodec`, `Encoded`, `canonical_json`, `digest_of` |
 | [Stores](#stores) | `open_store`, `SqliteStore`, `MemoryStore`, record types |
 | [Artifact backends](#artifact-backends) | `InlineBackend`, `FileBackend`, `NullBackend`, `resolve_backend` |
 | [Sharding and merging](#sharding-and-merging) | `shard_index`, `in_shard`, `shard_specs`, `shard_store_path`, `parse_shard`, `merge_reports`, `MergedReport` |
@@ -391,17 +395,13 @@ destinations, sorted — so spelling a target as a name or as a seq is the same 
 
 ## Advanced: Handoffs (Opt-In)
 
-For separately declared backward traversal, see [rewind, retry-all and HistoryArtifact](backward.md).
-`Handoff.rewind(target, value, *, reason="")` requires explicit state; `Handoff.retry_all(*, reason="")`
-replays the bound seed. `ctx.visit`, visit-qualified task/artifact IDs, exact-ID artifact lookup, finite
-control budgets and optional visit-aware store capabilities are specified there. The forward API below
-retains its v1 behavior and fingerprint.
-
 **Advanced tier: opt-in, changes the execution model, not needed for ordinary pipelines, experimental until
 1.0.** A task may *skip ahead* by returning a framework-owned directive instead of a value; the pipeline
 continues at a declared later position (or finishes on the spot) and the framework records the jump durably.
 A pipeline that declares nothing here is completely unaffected — see the design document
 [§4.8](design.md#48-advanced-handoffs--declared-forward-jumps-opt-in-experimental) for the full reasoning.
+Backward traversal — `Handoff.rewind`, `Handoff.retry_all` and optional payload history — is a *separately
+declared* tier of the same feature: see [advanced: backward traversal](#advanced-backward-traversal-rewind-retry-all-visits).
 
 ### `Handoff`
 
@@ -454,7 +454,7 @@ Rules that are worth knowing before you use it:
   handoff count is exposed next to it instead.
 * **Stability.** The guarantees above are the stable part; the spelling (`Handoff`, `control`) may still
   change before 1.0. Backward traversal is a *separately declared* opt-in tier rather than part of this
-  forward model — see [rewind, retry-all and payload history](backward.md).
+  forward model — see [advanced: backward traversal](#advanced-backward-traversal-rewind-retry-all-visits).
 
 ### What a hop records
 
@@ -469,6 +469,245 @@ Rules that are worth knowing before you use it:
 `HandoffRecord` (exported from `pyattacker`) is that ledger row: `handoff_id`, `pipeline_id`, `run_id`,
 `from_seq`, `from_task`, `to_seq`/`to_task` (`None` for `END`), `entry_seq`, `entry_artifact_id`,
 `entry_reused`, `reason`, `ts`.
+
+---
+
+## Advanced: backward traversal (rewind, retry-all, visits)
+
+**Advanced tier: opt-in, changes the traversal of a pipeline, experimental until 1.0.** Backward operations
+are declared separately from the forward model above, so a pipeline that declares none keeps its identity,
+its visit-0 artifact addresses, its random stream and its `spec_digest`. Read this section when a station
+decides that an **earlier** station must run again with state the author chooses — regenerate after a failed
+validation, retry a step with different parameters — and both runs have to stay on the record instead of
+collapsing into one task. The [tutorial](tutorial.md#step-16--advanced-regenerating-with-rewind-and-retry-all)
+builds up to it in two steps, the second one covering
+[payload history](tutorial.md#step-17--advanced-payloads-that-carry-their-own-history).
+
+### `Handoff.rewind` and `Handoff.retry_all`
+
+```python
+Handoff.rewind(target, value, *, reason="") -> Handoff   # explicit state is required; None is a value
+Handoff.retry_all(*, reason="") -> Handoff               # restart at seq 0 from the original bound seed
+```
+
+| Field / method | Meaning |
+|---|---|
+| `target` | a task name or a task's seq, always **strictly earlier** than the source |
+| `value` | the target's entry state. `rewind` requires it; `retry_all` takes none |
+| `reason` | free-form string, recorded in the handoff ledger and the `pipeline.handoff` event |
+| `operation` | `"rewind"` or `"retry_all"`: what the ledger row says this transfer was |
+
+Both are returned from a task exactly like `Handoff.to` and `Handoff.end`, and the forward rules carry
+over: a handoff is a return value and never a failure (the retry policy is not consulted, leases are
+already released, a cancelled or timed-out attempt never reaches the return), a directive can never escape
+from a `fanout` branch, and an undeclared or malformed one is a `FatalError` rather than a silent jump.
+What differs:
+
+* **You choose the state; the framework rolls nothing back.** `rewind` requires an explicit value — `None`
+  is a real value, not "reuse the input" — and the destination must be a declared, strictly earlier task,
+  named by a unique task name or by its seq. Self-rewind and `end` as a rewind target are refused, a name
+  that appears twice in the chain must be given as a seq, and results **before** the target stay effective
+  while the target and everything after it become historical and run again with their own visits.
+* **Forward stays forward.** `Handoff.to()` keeps using `control.edges` and never acquires implicit
+  backward semantics; the forward declaration is optional for a backward-only pipeline.
+* **`retry_all` replays the bound seed.** It restarts at seq 0 from the seed **freshly decoded from the
+  bytes captured at binding**, so mutating a task's input or `spec.seed` afterwards does not change what
+  runs. It takes no replacement value: to restart with *different* state, use `Handoff.rewind(0,
+  chosen_state)` from a later task. It may be declared on the first task, including a single-task pipeline,
+  and it does not create another mapped row or repeat, reset resources or start another CLI run — it clears
+  the effective task results while preserving visits, artifacts, attempts and the consumed control budget.
+* **Exception retry is a different mechanism.** `Retrying` retries an attempt inside the same visit;
+  `rewind` and `retry_all` are returned control directives and never invoke the failure retry policy.
+  Authoring mistakes and budget exhaustion are fatal failures that policy cannot retry.
+
+```python
+# reference/backward_rewind.py
+"""The backward tier in one program: a validator sends the work back to the generator."""
+
+from pyattacker import Handoff, Runner, pipeline, task
+
+
+@task("generate")
+def generate(state: dict, ctx) -> dict:
+    # <- your model call; a revisit is a genuinely new sample
+    return {**state, "sample": ctx.visit, "ok": ctx.visit >= 1}
+
+
+@task("validate")
+def validate(row: dict, ctx) -> Handoff | dict:
+    if not row["ok"]:
+        # Explicit state: the author decides what the generator receives next.
+        return Handoff.rewind("generate", {"prompt": row["prompt"], "feedback": "retry warmer"},
+                              reason="invalid sample")
+    return row
+
+
+template = pipeline(
+    "rewind",
+    generate | validate,
+    control={
+        "rewind": {"validate": ["generate"]},   # a strictly earlier destination, declared
+        "max_handoffs": 3,                      # required: the loop budget for this pipeline
+    },
+)
+
+with Runner(store=":memory:", max_handoffs=10) as runner:   # the runtime ceiling; the lower limit wins
+    report = runner.run(template.map([{"prompt": "Return JSON"}]))
+    store = runner.store
+    record = next(iter(store.pipelines()))
+    print(report.stats["pipelines"]["by_state"], "position:", record.n_tasks_done)
+    print([(row.seq, row.visit, row.name, row.state) for row in store.tasks(record.pipeline_id)])
+    print("budget consumed:", store.visit_state(record.pipeline_id)["handoffs"])
+```
+
+### The `control` block
+
+| Key | Shape | Meaning |
+|---|---|---|
+| `edges` | `{source: [later targets]}` | forward jumps (`Handoff.to` / `Handoff.end`); optional when only backward operations are declared |
+| `rewind` | `{source: [strictly earlier targets]}` | enables `Handoff.rewind` from each source |
+| `retry_all` | `[sources]` | enables `Handoff.retry_all` from each source |
+| `max_handoffs` | positive integer | **required** once `rewind` or `retry_all` is present: this pipeline's finite control budget |
+
+`max_handoffs` is validated like every other declaration: `3.0`, `True`, `"3"` and `0` are all refused, and
+a `max_handoffs` with no backward operation is refused too (`control: max_handoffs requires backward
+operations`). `RunConfig.max_handoffs` (default 1000, spelled `run.max_handoffs` in a config) is the
+**runtime ceiling**: the effective limit is `min(control.max_handoffs, run.max_handoffs)`, so a run can
+lower a pipeline's budget and can never raise it. A fresh start resets it. Names and seqs resolve exactly
+as they do for `edges` (an exact task name wins over a numeric string, a repeated name must be given as a
+seq), and every problem is reported as a configuration field path — see
+[CLI → advanced backward control declarations](cli.md#advanced-backward-control-declarations).
+
+```python
+# reference/backward_retry_all.py
+"""Retry-all restarts the pipeline from the seed the run was bound to."""
+
+from pyattacker import Handoff, Runner, pipeline, task
+
+entries = []
+
+
+@task("prepare")
+def prepare(seed: dict, ctx) -> dict:
+    entries.append(ctx.visit)   # a fresh entry after retry-all, not a retry of a failed attempt
+    return {"prompt": seed["prompt"], "prepared": True}
+
+
+@task("check")
+def check(row: dict, ctx) -> Handoff | dict:
+    if ctx.visit == 0:
+        return Handoff.retry_all(reason="new preparation")   # source declared in control.retry_all
+    return row
+
+
+template = pipeline("retry-all", prepare | check,
+                    control={"retry_all": ["check"], "max_handoffs": 2})
+
+with Runner(store=":memory:") as runner:
+    report = runner.run(template.map([{"prompt": "one row"}]))
+    store = runner.store
+    record = next(iter(store.pipelines()))
+    print(report.stats["pipelines"]["by_state"])
+    print("prepare entries:", entries)
+    print("transfers:", store.visit_state(record.pipeline_id)["handoffs"])
+```
+
+### Visits and artifact occurrences
+
+`ctx.visit` starts at 0 for **each station** and increases on every fresh entry into that station — an
+ordinary successor entry after a rewind counts too — while `ctx.attempt` numbers attempts *within one
+visit*. Together they are what keeps a regeneration visible instead of hidden.
+
+| Where | What it says |
+|---|---|
+| `pipeline_id:seq` | the artifact id of visit 0; a revisit uses `pipeline_id:seq#visit` |
+| `TaskRecord.visit`, `AttemptRecord.visit`, `Artifact.visit` | which occurrence a row is |
+| `store.get_artifact(pipeline_id, seq)` | the **effective** output of that station, at its current visit |
+| `store.get_artifact_by_id(artifact_id)` | one **exact historical** occurrence, superseded ones included |
+| `store.visit_state(pipeline_id)` | cursor, pending entry, effective slots, per-seq counters, consumed handoffs |
+| `PipelineRecord.n_tasks_done` | a *position* in a backward pipeline, not a completion count |
+
+Visits participate in the derived randomness: the RNG and `ctx.seed` are byte-identical to the old
+derivation for visit 0 and include the visit on revisits, so a regeneration samples differently. They do
+not make external side effects exactly-once — include `ctx.visit` in an idempotency key when each
+regeneration should be a new external operation (see [External side effects](#external-side-effects)).
+
+A pending entry references its exact input, and a resume keeps its visit and continues the consumed
+attempt numbering: an attempt number is reserved before task code runs, so a hard kill can leave a gap in
+completed attempt rows but can never reuse a number. Framework recovery is at least once for uncommitted
+work.
+
+### Budgets and termination
+
+Backward traversal is no longer structurally finite, which is why the budget is explicit and mandatory.
+Every nonterminal transfer in a backward-enabled pipeline counts, including forward `edges` transfers, and
+**N permits exactly N transfers**: the N+1-th fails *before* publishing a transition or invalidating
+results, so the record still describes exactly what committed. `END` can finish at the limit without
+consuming another transfer.
+
+The consumed count survives a resume, a retry-all and the automatic missing-payload seed fallback; only an
+explicit fresh start begins a new budget lifecycle. Visits and audit rows survive that restart too, so
+historical occurrences stay addressable.
+
+### Recovery and ownership
+
+What opening a stored row does depends on the row, and the rules are meant to be read, not inferred:
+
+| stored row | what this run does |
+| --- | --- |
+| `failed`, `interrupted` | ordinary checkpoint recovery: the exact durable visit — visit number, pending entry, consumed attempt numbering — continues |
+| `running`, `resume=True` | the operator's claim that the previous owner is gone. `interrupt_stale` reclaims heartbeat-stale rows first; the exact durable visit then continues |
+| `running`, no `resume` | **skipped**, never taken over: a durable pending visit can be continued after a crash, so a second writer would fork one traversal. `pipeline.skipped` carries `reason="owned_by_another_run"` plus the owner's run id |
+| rows durable, traversal gone | refused: `corrupt visit checkpoint: missing traversal state`. `fresh_restart=True` is the documented way to discard it and start over |
+| `succeeded` | skipped, unless `retry_succeeded=True`; a restart then runs from the bound seed with a fresh budget |
+
+`fresh_restart=True` is the one switch that discards durable progress: it clears the effective traversal
+and any pending entry (settling every task row it leaves in flight as `interrupted`), starts again from the
+immutable bound seed, resets the control budget and invalidates the previous ledger — while visit counters
+and visit-qualified audit rows stay, so historical occurrences remain addressable, and a store whose
+traversal was lost has its counters rebuilt from those rows. It applies to forward pipelines too, where it
+means "ignore the checkpoint, run the chain again": there the append-only history survives as well, but
+task and chain-artifact addresses are reused by design rather than kept as separate occurrences (the
+[store recovery contract](#tables-and-readers) spells that difference out). Combine it with
+`retry_succeeded=True` to restart a pipeline that already succeeded. A fresh start emits
+`pipeline.restarted` (with the discarded cursor), not `pipeline.checkpoint_missing`: nothing was lost.
+
+A missing or unavailable pending payload emits `pipeline.checkpoint_missing` and establishes a seed replay,
+preserving budget and counters. The first execution of a pipeline never takes that path — its input is the
+bound seed it already holds, so a `journal="summary"` store (whose written seed payload is intentionally
+dropped) does not report a checkpoint failure it never had. Summary journals and `null` backends can run
+loops in-process, but they cannot resume their missing payloads. A pending rewind to seq 0 uses its chosen
+payload rather than triggering a seed reset. Backward transfers requeue through the timer pump, releasing
+the worker for other pipelines.
+
+### Inspecting a backward run
+
+Pipeline exports add a `control` traversal record only for backward-enabled pipelines. It contains
+`cursor`, `pending`, effective `active` slots, durable `counters`, `handoffs` consumed, `version`, the exact
+current `input` and the `terminal` reference. Nested task and artifact rows include ids, visits and
+`active` markers, and individual task/attempt/artifact exports include `visit` (attempts also carry their
+task-run id). The existing closed set of top-level export row kinds is unchanged. The HTTP `/pipelines`
+view includes traversal state and `cursor_kind="position"` for backward-enabled rows; a forward-only row
+gets neither.
+
+A report is scoped to the run it covers and counts that run's repeated visits and attempts, so after a
+resume it shows the new run's workload while the store and the export retain every earlier row. Those
+totals are workload, not completion percentages.
+
+### Store capability
+
+The optional store methods behind this section — `visit_state`, `reset_visits`, `commit_entry`,
+`commit_visit_attempt`, `commit_visit_success`, `commit_control_transition`, `repair_visit_terminal` and
+`get_artifact_by_id` — are specified under
+[Stores → optional store capabilities](#optional-store-capabilities). They sit outside the base `Store`
+protocol, so a third-party backend keeps working for ordinary pipelines; opening a backward-enabled
+pipeline on a store that fails the probe is refused with a `ConfigError` up front instead of being
+downgraded to a non-durable loop.
+
+The same feature owns the store's **feature level** and the compatibility rules that come with it: a store
+stays at `base` until the first revisit is committed, a build that opens an unknown level refuses the store
+outright, and a SQLite store at `visits-v1` arms a writer guard against lineage-unaware writers. See
+[Stores → store compatibility and backups](#store-compatibility-and-backups).
 
 ---
 
@@ -541,7 +780,7 @@ Everything that shapes one run. Pass a `RunConfig`, or pass its fields as keywor
 | `write_batch` | `128` | batch size when write-behind is active |
 | `flush_interval` | `1.0` | seconds between flushes |
 | `artifact_backend` | `None` | where payloads live: `None`/`"inline"`, `"file:///path"`, `"null"`, or a spec dict |
-| `max_handoffs` | `1000` | runtime ceiling on nonterminal control transfers in backward-enabled pipelines; the effective limit is `min(control.max_handoffs, this)` (see [backward traversal](backward.md)) |
+| `max_handoffs` | `1000` | runtime ceiling on nonterminal control transfers in backward-enabled pipelines; the effective limit is `min(control.max_handoffs, this)` (see [backward traversal](#advanced-backward-traversal-rewind-retry-all-visits)) |
 | `notes`, `meta` | `""`, `{}` | free-form, recorded on the run |
 
 ```python
@@ -996,7 +1235,7 @@ checkpoint granularity a task rather than a pipeline.
 
 | Field | Meaning |
 |---|---|
-| `pipeline_id`, `seq` | its identity; `seq=-1` is the pipeline's seed. On a control-enabled pipeline a handoff payload lives at `seq >= n_tasks` (see [handoffs](#advanced-handoffs-opt-in)), so `seq` is a task position only for the chain |
+| `pipeline_id`, `seq` | its identity; `seq=-1` is the pipeline's seed. On a control-enabled pipeline a handoff payload lives at `seq >= n_tasks` (see [handoffs](#advanced-handoffs-opt-in)), so `seq` is a task position only for the chain. In a [backward-enabled](#advanced-backward-traversal-rewind-retry-all-visits) pipeline the first occurrence keeps `pipeline_id:seq` and a revisit qualifies the id as `pipeline_id:seq#visit` |
 | `task_name` | which task produced it |
 | `type_name`, `codec` | how to restore it |
 | `digest`, `size` | `blake2b` of the payload, and its length |
@@ -1053,6 +1292,75 @@ behind the JSON catch-all; an explicit `for_types=` beats the scan.
 
 Built-in codecs: `JsonCodec` (the default) and `BytesCodec` (raw `bytes`/`bytearray`). Distribute your own
 under the `pyattacker.codecs` entry-point group and it installs itself.
+
+### `HistoryArtifact`
+
+An optional base class for a payload that carries its own named snapshots of **application** state. It is a
+decoded payload, not a subclass of the persisted `Artifact` record, and nothing in the runner reads it to
+decide where execution goes next: it exists so a [rewind](#advanced-backward-traversal-rewind-retry-all-visits)
+can send back a state the author chose with the states it passed through still inspectable. Ordinary
+dictionaries stay ordinary dictionaries — there is no automatic snapshot on task entry or completion. The
+tutorial builds one in [Step 17](tutorial.md#step-17--advanced-payloads-that-carry-their-own-history).
+
+```python
+HistoryArtifact(state, *, history=None, selected=None, next_snapshot=0)
+```
+
+| Member | Meaning |
+|---|---|
+| `state` | the current application state, as a detached deep copy |
+| `history` | every snapshot, oldest first, as detached records: `{id, label, state, metadata}` |
+| `selected` | the id of the snapshot `restore` selected last, or `None` |
+| `checkpoint(label, *, metadata=None)` | a new value with a detached snapshot appended; labels are unique and `snapshot:` is reserved for the stable ids (`snapshot:0`, …) |
+| `with_state(value)` | a new value with the current state replaced, appending no snapshot |
+| `snapshot(id_or_label)` | one detached snapshot record; an unknown or ambiguous selector raises `KeyError` |
+| `restore(id_or_label)` | a new value whose state is that snapshot **and** whose `selected` names it; the whole history is retained, so later stages stay inspectable |
+| `prune(*selectors)` | a new value without those snapshots; raises `ValueError` when a selector names the selected snapshot, and ids are never reused |
+
+```python
+# reference/history_artifact.py
+"""HistoryArtifact: named, detached snapshots inside an application payload."""
+
+from pyattacker import CodecRegistry, HistoryArtifact
+
+
+class GenerationState(HistoryArtifact):
+    pass
+
+
+registry = CodecRegistry()
+registry.register_type(GenerationState)   # the codec restores the subclass, not a bare HistoryArtifact
+
+state = GenerationState({"prompt": "Return JSON", "temperature": 0.2})
+state = state.checkpoint("before-generation")
+state = state.with_state({**state.state, "answer": "invalid"}).checkpoint("after-generation")
+restored = state.restore("before-generation")   # selected, with the later snapshot still in history
+next_state = restored.with_state({**restored.state, "temperature": 0.7})
+
+print("labels:", [row["label"] for row in next_state.history])
+print("selected:", next_state.selected)
+print("round trip equal:", registry.load(registry.dump(next_state)).state == next_state.state)
+try:
+    next_state.prune("before-generation")   # the selected snapshot cannot be pruned
+except ValueError as exc:
+    print("prune refused:", exc)
+```
+
+The rules such a payload lives under:
+
+* **Nested mutable values never alias the retained snapshots.** `state`, `history` and `snapshot(...)` all
+  hand back detached copies, so editing the current state cannot rewrite the past.
+* **State and metadata must be JSON serializable.** Encoding rejects clients, leases and other runtime
+  objects.
+* **The versioned `history-v1` codec preserves the snapshots and the registered subclass type.** Subclasses
+  inherit the base constructor (application fields live in `state`); a custom constructor or extra-attribute
+  serialization is outside this interface, and an unregistered subclass fails decoding explicitly rather
+  than coming back as a plain `HistoryArtifact`.
+* **Persisting is the commit's job, not `checkpoint()`'s.** Calling `checkpoint()` inside a task does not
+  touch the store; the runner persists the payload with the task's output or its control-transition commit,
+  so a crash before that commit can lose the in-memory snapshot.
+* **History is self-contained and grows** with the number and size of the snapshots — prune on purpose. It
+  does not replace the framework's execution ledger, its task rows or its visit records.
 
 ### Helpers
 
@@ -1176,7 +1484,7 @@ open, and the open records `pipeline.restarted` (with the cursor it discarded) i
 `pipeline.checkpoint_missing`, because nothing was lost. Everything append-only survives — attempts, events,
 handoffs and, for a backward pipeline, the visit counters, so historical occurrences stay addressable. A
 checkpoint that the framework can no longer use is therefore never a dead end, and neither is a spent
-backward-traversal budget; see [recovery and ownership](backward.md#recovery-and-ownership). By contrast
+backward-traversal budget; see [recovery and ownership](#recovery-and-ownership). By contrast
 `retry_succeeded=True` only widens *which* pipelines are eligible to run again — it never discards the state
 of one that has not succeeded.
 
@@ -1260,6 +1568,8 @@ plugin layer is public API, and existing plugins were written against the list m
 * `Store` remains the only protocol `open_store()` checks, so adding the extension breaks nothing.
   `WriteBehindStore` implements it and flushes before every paged read, like its other read views.
 
+### Optional store capabilities
+
 **`commit_handoff(record, *, task, attempt, payload=None, cursor, final=False)`**,
 **`handoffs(*, pipeline_id=None, run_id=None, limit=None)`** and **`reset_pipeline(record)`** are the optional capability behind the advanced
 handoff feature, in the same "not part of the protocol" spirit as `resources()`. The commit is **one atomic
@@ -1299,12 +1609,18 @@ works: the Runner falls back to `finish_pipeline` (state and cursor, atomically)
 **`commit_visit_success(pipeline, task, attempt, artifact, *, final)`**,
 **`commit_control_transition(record, *, pipeline, task, attempt, payload, entry_id, target_task, limit)`**,
 **`repair_visit_terminal(record)`** and **`get_artifact_by_id(artifact_id)`** are the optional capability
-behind [backward traversal](backward.md), again outside the protocol. `store/visits.py`'s `VisitStore` holds
+behind [backward traversal](#advanced-backward-traversal-rewind-retry-all-visits), again outside the protocol.
+`store/visits.py`'s `VisitStore` holds
 the shared transition semantics and both built-in backends derive from it, so a backend supplies one atomic
 write boundary plus its low-level row writes. Each operation is one commit: entry allocation advances the
 per-seq visit counter and records the pending input, ordinary success writes the output occurrence and the
 effective slot together, and a control transition additionally invalidates the active suffix, consumes one
-budget unit and allocates the target entry. `supports_visits(store)` is the probe; it unwraps
+budget unit and allocates the target entry. A control transfer commits its source visit and attempt, the
+entry occurrence, the ledger row, the control count and the allocated target entry together; a forward
+transfer inside a backward-enabled pipeline consumes budget without moving the cursor backwards. SQLite
+serializes these capability transactions with `BEGIN IMMEDIATE`, and `MemoryStore` restores its state on a
+failed capability write: a blob write that failed cannot publish its reference, while a rolled-back database
+transaction can leave an unreferenced blob. `supports_visits(store)` is the probe; it unwraps
 `WriteBehindStore` (which flushes before delegating these operations synchronously) and requires the visit
 methods, `feature_level()` **plus** `commit_handoff`, `reset_pipeline` and `handoffs`, because a backward
 transition lands its ledger row and source task through that same commit. `feature_level()` is required
@@ -1312,13 +1628,37 @@ rather than optional: the compatibility rule below is part of the capability, no
 fails the probe is refused with a `ConfigError` when a backward-enabled pipeline is opened, never downgraded
 to a non-durable loop.
 
-The same capability owns the store's **feature level** (`feature_level()`, `store/visits.py`): `base` until
-the first revisit is committed, then `visits-v1`, written in the same transaction as the occurrence that
-justifies it. Opening an unknown (newer) level raises `StoreFeatureUnsupported` instead of reading a lineage
-this build cannot see, and a SQLite store at `visits-v1` carries a writer guard that refuses
-`INSERT`/`UPDATE`/`DELETE` on `pipelines`/`tasks`/`artifacts` from any connection that has not declared
-visit-lineage awareness — so a binary released before the marker existed cannot silently mutate the wrong
-occurrence (see [store compatibility](backward.md#store-compatibility)).
+### Store compatibility and backups
+
+SQLite upgrades older stores additively: visit columns default to 0, a traversal-state table appears and a
+`store_meta` feature level is recorded. Forward-only work never leaves `base`. The level becomes `visits-v1`
+inside the *same transaction* that allocates the first second occurrence for a station, and it never goes
+back down — audit rows are not deleted, so neither is the fact that they exist.
+
+That is also the moment a lineage-unaware writer stops being able to interpret the store, so a SQLite store
+at `visits-v1` arms a **writer guard**: `INSERT`/`UPDATE`/`DELETE` on `pipelines`, `tasks` and `artifacts`
+from a connection that has not declared visit-lineage awareness fail loudly (`no such function:
+pyattacker_store_requires_visits_aware_writer`). Raw and legacy reads are not blocked — the guard protects
+state, not access — but interpretation of revisit-aware lineage by a build that does not understand it is
+unsupported: such a reader cannot resolve which occurrence is effective, so its output describes the rows,
+not the execution. What the guard guarantees is the destructive half: a writer released before this feature
+cannot silently mutate the wrong occurrence, because it fails on its first write. A build that opens a level
+it does not know refuses the store outright (`StoreFeatureUnsupported`, read-only included) rather than
+reporting a lineage it cannot see.
+
+Practical consequences:
+
+* **Backups.** For a live database use SQLite's own backup API (`sqlite3 <store> ".backup <copy>"`, or
+  `Connection.backup()`), which is safe while a writer is running; copying an active database file together
+  with its `-wal`/`-shm` side files is only reliable when no writer is active. A SQL dump restores fine as
+  well — `sqlite3 <store> .dump | sqlite3 <copy>` writes table data before creating the guard triggers, so an
+  unaware connection can replay it, and the copy inherits the guard and the feature level with it.
+* Writing to a guarded store from the `sqlite3` shell needs the guard function registered on that connection
+  (or the triggers dropped); both are outside the supported interface.
+* The only supported way back to `base` is a migration performed by a build that understands the level.
+* Simultaneous runners executing the same logical pipeline are not a supported scheduling mode; independent
+  shard rows remain independent (a `running` row is still never taken over without `resume`, see
+  [recovery and ownership](#recovery-and-ownership)).
 
 ---
 

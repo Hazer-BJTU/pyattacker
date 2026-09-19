@@ -1435,15 +1435,6 @@ def test_backward_describe_is_reusable(declaration):
     assert build_control(plan.describe(), ["a", "b"]).fingerprint() == plan.fingerprint()
 
 
-def test_backward_guide_examples_execute():
-    import re
-    from pathlib import Path
-
-    guide = Path(__file__).resolve().parents[1] / "docs" / "backward.md"
-    for snippet in re.findall(r"```python\n(.*?)```", guide.read_text(), re.DOTALL):
-        exec(compile(snippet, str(guide), "exec"), {})
-
-
 @pytest.mark.parametrize("strict", [False, True])
 def test_backward_transfer_obeys_lease_reclamation(store, strict):
     pool = Pool("api", [Resource("api-1", capacity=1)])

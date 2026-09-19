@@ -26,7 +26,8 @@ All notable changes to this project are documented here. The format follows
   `--fresh-restart` discards a checkpoint or traversal from the bound seed, resets the control budget and
   keeps the append-only history, and a store that has committed its first revisit records a `base` → `visits-v1`
   feature level (`store.feature_level()`, `StoreFeatureUnsupported`) so lineage-unaware writers are refused
-  rather than silently mutating the wrong occurrence. See [the backward guide](docs/backward.md).
+  rather than silently mutating the wrong occurrence. See
+  [reference → advanced: backward traversal](docs/reference.md#advanced-backward-traversal-rewind-retry-all-visits).
 
 * **Advanced feature: handoffs — a task can skip ahead, on the record (opt-in, experimental).** A task may
   return `Handoff.to(target, value)` to continue at a declared later station, or `Handoff.end(value)` to
@@ -96,6 +97,18 @@ All notable changes to this project are documented here. The format follows
   escape to return unions containing `Handoff`.
 
 ### Changed
+
+* **The backward-traversal guide is merged into the tutorial and the reference.** `docs/backward.md` was a
+  seventh document that a reader had to find before they could use the feature; its usage now lives where
+  the rest of the API does. [Tutorial step 16](docs/tutorial.md#step-16--advanced-regenerating-with-rewind-and-retry-all)
+  keeps the rewind/retry-all walkthrough and a new step 17 builds an optional `HistoryArtifact` payload,
+  while [reference → advanced: backward traversal](docs/reference.md#advanced-backward-traversal-rewind-retry-all-visits)
+  gains the `Handoff.rewind`/`Handoff.retry_all` signatures, the backward `control` keys, the visit and
+  occurrence model, the budget and recovery rules, and the inspection surface; `HistoryArtifact` is
+  documented next to the codecs it belongs to, and the store capability and compatibility/backup rules moved
+  into the Stores section. Both steps and the reference examples are marked **advanced**, stay opt-in and
+  experimental until 1.0, and are executed by the test suite (`# reference/<name>.py` joins the
+  executable-document markers). The Chinese tree mirrors all of it. No API changed.
 
 * **The sdist no longer ships the branding images.** `assets/` was in the sdist include list, and PNG
   barely compresses, so the two logo files were 883 KB of the 1.26 MB `pyattacker-0.2.0.tar.gz` that PyPI

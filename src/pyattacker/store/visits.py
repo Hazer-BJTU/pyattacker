@@ -52,7 +52,7 @@ def check_feature_level(level: str, *, store: str, read_only: bool = False) -> N
         f"store {store} is at feature level {level!r}, which this build does not understand "
         f"(it knows {', '.join(FEATURE_LEVELS)}); refusing {mode} access. Upgrade pyattacker to open "
         "this store; back it up with SQLite's own backup API (sqlite3 .backup) or a file copy while "
-        "no writer is active (see docs/backward.md)"
+        "no writer is active (see docs/reference.md, store compatibility and backups)"
     )
 
 

@@ -18,6 +18,9 @@
   均为仅限关键字（keyword-only）参数。
 * **此处的默认值很重要。** 有两个默认值尤其令人意外：`Retrying(max_attempts=1)` 意味着除非你主动要求，
   否则*不重试*；`Runner(store=":memory:")` 意味着除非传入路径，否则不会持久化任何内容。
+* **有些示例是完整程序。** 第一行是 `# reference/<name>.py` 的代码块会在每次测试运行时被写出并执行
+  （见 [`tests/test_docs_examples.py`](../../tests/test_docs_examples.py)）——README 与 CLI 文档共享
+  这一契约。没有标记的代码块是刻意的片段。
 
 ## 目录
 
@@ -26,11 +29,12 @@
 | [任务](reference.md#任务) | `task`, `build_task_spec`, `TaskSpec`, `Retrying`, `TaskContext`, `with_retry` |
 | [流水线](reference.md#流水线) | `pipeline`, `PipelineTemplate`, `PipelineSpec`, `Chain`, `compute_spec_digest` |
 | [进阶：交接](reference.md#进阶交接可选启用) | `Handoff`、`control=` 声明、`HandoffRecord` |
+| [进阶：反向遍历](reference.md#进阶反向遍历rewindretry-allvisits) | `Handoff.rewind`、`Handoff.retry_all`、反向的 `control` 键、访问、预算、恢复 |
 | [运行](reference.md#运行) | `Runner`, `RunConfig`, `RunReport`, worker 存活检测 |
 | [资源](reference.md#资源) | `Resource`, `Pool`, `Lease`, `PoolStats`, `Bus`, `ResourceState`, `ResourceEvent` |
 | [获取算法](reference.md#获取算法) | `Wait`, `Backoff`, `LeastBusy`, `Failover`, `Sticky`, `QuotaAware`, `Immediate`, `resolve_algorithm` |
 | [错误](reference.md#错误) | 异常层次结构、`error_class_of` |
-| [工件与编解码器](reference.md#工件与编解码器) | `Artifact`, `Codec`, `CodecRegistry`, `JsonCodec`, `BytesCodec`, `Encoded`, `canonical_json`, `digest_of` |
+| [工件与编解码器](reference.md#工件与编解码器) | `Artifact`, `Codec`, `CodecRegistry`, `HistoryArtifact`, `JsonCodec`, `BytesCodec`, `Encoded`, `canonical_json`, `digest_of` |
 | [存储](reference.md#存储) | `open_store`, `SqliteStore`, `MemoryStore`, 记录类型 |
 | [工件后端](reference.md#工件后端) | `InlineBackend`, `FileBackend`, `NullBackend`, `resolve_backend` |
 | [分片与合并](reference.md#分片与合并) | `shard_index`, `in_shard`, `shard_specs`, `shard_store_path`, `parse_shard`, `merge_reports`, `MergedReport` |
@@ -391,17 +395,13 @@ if compute_spec_digest(new_chain.tasks) != stored_digest:
 
 ## 进阶：交接（可选启用）
 
-关于单独声明的反向遍历，见 [回退、全部重试与 HistoryArtifact](backward.md)。
-`Handoff.rewind(target, value, *, reason="")` 要求显式状态；`Handoff.retry_all(*, reason="")`
-会重放绑定的种子。`ctx.visit`、带访问限定的任务/工件 ID、按精确 ID 查找工件、有限的
-控制预算，以及可选的、感知访问的存储能力，都在那里说明。下面的正向 API
-保持其 v1 行为与指纹。
-
 **进阶层级：可选启用、会改变执行模型、普通流水线不需要、在 1.0 之前属于实验性。** 任务可以通过返回一条
 框架自有的指令而不是一个值来*向前跳过*；流水线会在声明中更靠后的位置继续（或就地结束），
 框架会持久地记录这次跳转。在这里什么都不声明的流水线完全不受影响——
 完整论证见设计文档
-[§4.8](design.md#48-进阶交接--声明式正向跳转可选启用实验性)。
+[§4.8](design.md#48-进阶交接--声明式正向跳转可选启用实验性)。反向遍历——`Handoff.rewind`、
+`Handoff.retry_all` 以及可选的载荷历史——是同一特性中*单独声明*的层级：见
+[进阶：反向遍历](#进阶反向遍历rewindretry-allvisits)。
 
 ### `Handoff`
 
@@ -454,7 +454,7 @@ template = pipeline("qa", retrieve | ask | judge | report,
   取而代之的是，交接计数就在它旁边暴露出来。
 * **稳定性。** 上面这些保证属于稳定的部分；拼写形式（`Handoff`、`control`）
   在 1.0 之前仍可能改变。反向遍历是一个*单独声明*的可选启用层级，而不是这个正向模型的
-  一部分——见 [回退、全部重试与载荷历史](backward.md)。
+  一部分——见 [进阶：反向遍历](#进阶反向遍历rewindretry-allvisits)。
 
 ### 一次跳转记录的内容
 
@@ -469,6 +469,221 @@ template = pipeline("qa", retrieve | ask | judge | report,
 `HandoffRecord`（由 `pyattacker` 导出）就是那条账本行：`handoff_id`、`pipeline_id`、`run_id`、
 `from_seq`、`from_task`、`to_seq`/`to_task`（`END` 时为 `None`）、`entry_seq`、`entry_artifact_id`、
 `entry_reused`、`reason`、`ts`。
+
+---
+
+## 进阶：反向遍历（rewind、retry-all、visits）
+
+**进阶层级：可选启用、会改变流水线的遍历方式、在 1.0 之前属于实验性。** 反向操作与上面的正向模型分开
+声明，因此一条什么都不声明的流水线会保留它的同一性、它在访问 0 的工件地址、它的随机流以及它的
+`spec_digest`。当一个站点判定**更早**的某个站点必须带着作者选定的状态重跑时读这一节——校验失败后
+重新生成、用不同参数重试某个步骤——并且两次运行都必须留在记录里，而不是折叠成一个任务。
+[tutorial](tutorial.md#第-16-步--高级用回退和全部重试重新生成) 用两步把它搭起来，第二步讲的是
+[载荷历史](tutorial.md#第-17-步--高级让载荷自带历史)。
+
+### `Handoff.rewind` 与 `Handoff.retry_all`
+
+```python
+Handoff.rewind(target, value, *, reason="") -> Handoff   # explicit state is required; None is a value
+Handoff.retry_all(*, reason="") -> Handoff               # restart at seq 0 from the original bound seed
+```
+
+| 字段 / 方法 | 含义 |
+|---|---|
+| `target` | 任务名或任务的 seq，始终**严格早于**来源 |
+| `value` | 目标入口状态。`rewind` 要求提供；`retry_all` 不接受任何值 |
+| `reason` | 自由文本字符串，记录到交接账本和 `pipeline.handoff` 事件中 |
+| `operation` | `"rewind"` 或 `"retry_all"`：账本行说这次转移是什么 |
+
+两者都像 `Handoff.to` 和 `Handoff.end` 一样从任务中返回，正向规则也照旧成立：交接是返回值而不是失败
+（不会咨询重试策略，租约已经释放，被取消或超时的尝试永远不会走到这个返回），指令永远无法从
+`fanout` 分支里逃出，未声明或形式错误的指令是 `FatalError` 而不是静默跳转。不同之处在于：
+
+* **状态由你选择；框架不做任何回滚。** `rewind` 要求显式的值——`None` 是真实的值，不是“复用输入”
+  ——并且目的地必须是已声明、严格更早的任务，用唯一的任务名或它的 seq 指定。自回退和把 `end` 当作
+  回退目标都会被拒绝；链中重复出现的名字必须用 seq 指定；**目标之前**的结果保持有效，而目标及其
+  之后的结果变为历史，并带着各自的访问重新运行。
+* **正向仍然是正向。** `Handoff.to()` 继续使用 `control.edges`，永远不会获得隐式的反向语义；
+  对于纯反向的流水线，正向声明是可选的。
+* **`retry_all` 重放绑定的种子。** 它会从 seq 0 重新开始，种子是**绑定时刻捕获的字节新鲜解码**出来的
+  结果，因此事后修改某个任务的输入或 `spec.seed` 不会改变实际运行的内容。它不接受替换值：若想用
+  *不同*状态重启，请从更靠后的任务调用 `Handoff.rewind(0, chosen_state)`。它可以声明在第一个任务上，
+  包括单任务流水线；它不会创建另一个映射行或重复项、不会重置资源、也不会启动另一次 CLI 运行——
+  它会清空有效的任务结果，同时保留访问、工件、尝试以及已消耗的控制预算。
+* **异常重试是另一套机制。** `Retrying` 在同一个访问内重试一次尝试；`rewind` 和 `retry_all` 是返回的
+  控制指令，绝不触发失败重试策略。编写错误和预算耗尽都属于致命失败，该策略无法重试。
+
+```python
+# reference/backward_rewind.py
+"""The backward tier in one program: a validator sends the work back to the generator."""
+
+from pyattacker import Handoff, Runner, pipeline, task
+
+
+@task("generate")
+def generate(state: dict, ctx) -> dict:
+    # <- your model call; a revisit is a genuinely new sample
+    return {**state, "sample": ctx.visit, "ok": ctx.visit >= 1}
+
+
+@task("validate")
+def validate(row: dict, ctx) -> Handoff | dict:
+    if not row["ok"]:
+        # Explicit state: the author decides what the generator receives next.
+        return Handoff.rewind("generate", {"prompt": row["prompt"], "feedback": "retry warmer"},
+                              reason="invalid sample")
+    return row
+
+
+template = pipeline(
+    "rewind",
+    generate | validate,
+    control={
+        "rewind": {"validate": ["generate"]},   # a strictly earlier destination, declared
+        "max_handoffs": 3,                      # required: the loop budget for this pipeline
+    },
+)
+
+with Runner(store=":memory:", max_handoffs=10) as runner:   # the runtime ceiling; the lower limit wins
+    report = runner.run(template.map([{"prompt": "Return JSON"}]))
+    store = runner.store
+    record = next(iter(store.pipelines()))
+    print(report.stats["pipelines"]["by_state"], "position:", record.n_tasks_done)
+    print([(row.seq, row.visit, row.name, row.state) for row in store.tasks(record.pipeline_id)])
+    print("budget consumed:", store.visit_state(record.pipeline_id)["handoffs"])
+```
+
+### `control` 块
+
+| 键 | 形态 | 含义 |
+|---|---|---|
+| `edges` | `{source: [later targets]}` | 正向跳转（`Handoff.to` / `Handoff.end`）；只声明反向操作时可以省略 |
+| `rewind` | `{source: [strictly earlier targets]}` | 允许从每个来源发出 `Handoff.rewind` |
+| `retry_all` | `[sources]` | 允许从每个来源发出 `Handoff.retry_all` |
+| `max_handoffs` | 正整数 | 一旦出现 `rewind` 或 `retry_all` 就**必需**：这条流水线有限的控制预算 |
+
+`max_handoffs` 和其他声明一样要经过校验：`3.0`、`True`、`"3"` 和 `0` 都会被拒绝，而没有任何反向操作
+却给了 `max_handoffs` 也会被拒绝（`control: max_handoffs requires backward operations`）。
+`RunConfig.max_handoffs`（默认 1000，在配置中写作 `run.max_handoffs`）是**运行时上限**：实际限制为
+`min(control.max_handoffs, run.max_handoffs)`，因此一次运行可以调低某条流水线的预算，但永远不能调高。
+全新开始会重置它。名字和 seq 的解析方式与 `edges` 完全相同（精确的任务名优先于数字字符串，重复出现的
+名字必须用 seq 指定），每个问题都会以配置字段路径的形式报告——见
+[CLI → 进阶反向控制声明](cli.md#进阶反向控制声明)。
+
+```python
+# reference/backward_retry_all.py
+"""Retry-all restarts the pipeline from the seed the run was bound to."""
+
+from pyattacker import Handoff, Runner, pipeline, task
+
+entries = []
+
+
+@task("prepare")
+def prepare(seed: dict, ctx) -> dict:
+    entries.append(ctx.visit)   # a fresh entry after retry-all, not a retry of a failed attempt
+    return {"prompt": seed["prompt"], "prepared": True}
+
+
+@task("check")
+def check(row: dict, ctx) -> Handoff | dict:
+    if ctx.visit == 0:
+        return Handoff.retry_all(reason="new preparation")   # source declared in control.retry_all
+    return row
+
+
+template = pipeline("retry-all", prepare | check,
+                    control={"retry_all": ["check"], "max_handoffs": 2})
+
+with Runner(store=":memory:") as runner:
+    report = runner.run(template.map([{"prompt": "one row"}]))
+    store = runner.store
+    record = next(iter(store.pipelines()))
+    print(report.stats["pipelines"]["by_state"])
+    print("prepare entries:", entries)
+    print("transfers:", store.visit_state(record.pipeline_id)["handoffs"])
+```
+
+### 访问与工件发生实例
+
+`ctx.visit` 对**每个站点**都从 0 开始，并在每次全新进入该站点时递增——回退之后的普通后继进入也算——
+而 `ctx.attempt` 编号的是*同一个访问内*的尝试。两者合起来才让一次重新生成保持可见，而不是被藏起来。
+
+| 位置 | 说明 |
+|---|---|
+| `pipeline_id:seq` | 访问 0 的工件 id；重访使用 `pipeline_id:seq#visit` |
+| `TaskRecord.visit`、`AttemptRecord.visit`、`Artifact.visit` | 该行是哪一个发生实例 |
+| `store.get_artifact(pipeline_id, seq)` | 该站点**有效**的输出，处于它当前的访问 |
+| `store.get_artifact_by_id(artifact_id)` | 一个**精确的历史**发生实例，包含已被取代的那些 |
+| `store.visit_state(pipeline_id)` | 游标、待定入口、有效槽位、按 seq 的计数器、已消耗的交接数 |
+| `PipelineRecord.n_tasks_done` | 反向流水线中的*位置*，不是完成度计数 |
+
+访问也参与派生随机性：RNG 和 `ctx.seed` 在访问 0 时与旧的派生方式逐字节一致，而在重访时把访问计入，
+因此一次重新生成会采出不同的样本。它们并不会让外部副作用变成恰好一次——当每次重新生成都应当是一次
+新的外部操作时，请把 `ctx.visit` 纳入幂等键（见[外部副作用](#外部副作用)）。
+
+待定入口引用它确切的输入，恢复会保留它的访问并继续已消耗的尝试编号：尝试编号在任务代码运行之前就已
+保留，因此硬杀可能在已完成的尝试行中留下空缺，但永远不会重用某个编号。对未提交的工作，框架的恢复
+保证是至少一次。
+
+### 预算与终止
+
+反向遍历在结构上不再有限，这正是预算必须显式且强制的原因。启用反向的流水线里每一次非终止转移都要
+计数，包括正向的 `edges` 转移，而且**N 恰好允许 N 次转移**：第 N+1 次会在发布转移或使结果失效*之前*
+被拒绝，因此记录仍然精确描述了已提交的内容。`END` 可以在到达上限时直接完成，而不消耗另一次转移。
+
+已消耗的计数会跨 resume、全部重试以及载荷缺失时的自动种子回退保留下来；只有显式的全新开始才会开启
+新的预算生命周期。访问和审计行也会在这次重启中保留，因此历史发生实例仍然可以寻址。
+
+### 恢复与所有权
+
+打开一条已存储的行会做什么取决于那一行，这些规则是让人读的，不是让人猜的：
+
+| 已存储的行 | 这次运行会做什么 |
+| --- | --- |
+| `failed`、`interrupted` | 普通检查点恢复：精确的持久化访问——访问编号、待定入口、已消耗的尝试编号——继续 |
+| `running`，`resume=True` | 操作者声明上一个所有者已经消失。`interrupt_stale` 会先回收心跳过期的行；随后精确的持久化访问继续 |
+| `running`，没有 `resume` | **跳过**，绝不接管：持久化的待定访问可以在崩溃后继续，因此第二个写入者会把一次遍历分叉。`pipeline.skipped` 会带上 `reason="owned_by_another_run"` 以及所有者的运行 id |
+| 行已持久化，遍历消失 | 拒绝：`corrupt visit checkpoint: missing traversal state`。`fresh_restart=True` 是文档给出的丢弃并重来的方式 |
+| `succeeded` | 跳过，除非 `retry_succeeded=True`；此时重启会从绑定的种子以全新预算运行 |
+
+`fresh_restart=True` 是唯一会丢弃持久化进度的开关：它清空有效的遍历和任何待定入口（把它留下仍在飞行
+中的每个任务行结算为 `interrupted`），从不可变的绑定种子重新开始，重置控制预算并使先前的账本失效
+——同时保留访问计数器和带访问限定的审计行，因此历史发生实例仍然可以寻址，而遍历丢失的存储会从这些
+行重建它的计数器。它同样适用于正向流水线，在那里它的意思是“忽略检查点，重跑整条链”：追加式历史
+也会保留，但任务和链上工件的地址会按设计被重用，而不是保留为独立的发生实例（
+[存储恢复契约](#表与读取器) 把这一区别讲清楚了）。把它和 `retry_succeeded=True` 结合使用，可以重启
+一条已经成功过的流水线。全新开始发出的是 `pipeline.restarted`（带上被丢弃的游标），而不是
+`pipeline.checkpoint_missing`：什么都没有丢。
+
+待定载荷缺失或不可用会发出 `pipeline.checkpoint_missing` 并建立一次种子重放，保留预算和计数器。
+流水线的首次执行永远不会走这条路径——它的输入就是它已经持有的绑定种子，因此 `journal="summary"`
+存储（其写入的种子载荷被有意丢弃）不会报告一次它从未有过的检查点故障。摘要日志和 `null` 后端可以
+在进程内跑循环，但无法恢复它们缺失的载荷。一次指向 seq 0 的待定回退会使用它选定的载荷，而不是触发
+种子重置。反向转移通过定时器泵重新排队，从而把 worker 让给其他流水线。
+
+### 检视一次反向运行
+
+只有启用反向的流水线，其流水线导出才会多一条 `control` 遍历记录。它包含 `cursor`、`pending`、有效的
+`active` 槽位、持久化的 `counters`、已消耗的 `handoffs`、`version`、精确的当前 `input` 以及 `terminal`
+引用。嵌套的任务行和工件行包含 id、访问和 `active` 标记，而单独的任务/尝试/工件导出会包含 `visit`
+（尝试还带有它们的 task-run id）。既有的顶层导出行种类这个闭集没有改变。HTTP `/pipelines` 视图对
+启用反向的行会包含遍历状态和 `cursor_kind="position"`；纯正向的行两者都没有。
+
+报告的作用域是它所覆盖的那次运行，统计的是那次运行里重复的访问和尝试，因此在一次 resume 之后它显示
+的是新运行的工作量，而存储和导出保留此前每一行。这些合计是工作量，不是完成百分比。
+
+### 存储能力
+
+本节背后的可选存储方法——`visit_state`、`reset_visits`、`commit_entry`、`commit_visit_attempt`、
+`commit_visit_success`、`commit_control_transition`、`repair_visit_terminal` 和 `get_artifact_by_id`
+——在[存储 → 可选的存储能力](#可选的存储能力)中说明。它们位于基础 `Store` 协议之外，因此第三方后端
+对普通流水线仍然可用；在未通过探测的存储上打开启用反向的流水线，会在开始之前就被拒绝并抛出
+`ConfigError`，绝不会被降级为非持久的循环。
+
+同一项特性还掌管存储的**特性级别**以及随之而来的兼容性规则：存储会一直停留在 `base`，直到首次提交
+重访；打开未知级别的构建会直接拒绝该存储；处于 `visits-v1` 的 SQLite 存储会武装写入者守卫，
+防止不具备谱系感知的写入者。见[存储 → 存储兼容性与备份](#存储兼容性与备份)。
 
 ---
 
@@ -541,7 +756,7 @@ print(live["in_flight_pipelines"], live["delayed_pipelines"])      # in flight v
 | `write_batch` | `128` | write-behind 生效时的批大小 |
 | `flush_interval` | `1.0` | 两次刷写之间的秒数 |
 | `artifact_backend` | `None` | 载荷存放的位置：`None`/`"inline"`、`"file:///path"`、`"null"`，或一个规格字典 |
-| `max_handoffs` | `1000` | 启用反向的流水线中非终止控制转移的运行时上限；实际限制为 `min(control.max_handoffs, this)`（见 [反向遍历](backward.md)） |
+| `max_handoffs` | `1000` | 启用反向的流水线中非终止控制转移的运行时上限；实际限制为 `min(control.max_handoffs, this)`（见 [反向遍历](#进阶反向遍历rewindretry-allvisits)） |
 | `notes`、`meta` | `""`、`{}` | 自由格式，记录在该次运行上 |
 
 ```python
@@ -996,7 +1211,7 @@ for attempt in store.attempts(pipeline_id=pid):
 
 | 字段 | 含义 |
 |---|---|
-| `pipeline_id`, `seq` | 它的同一性；`seq=-1` 是流水线的种子。在启用控制的流水线上，交接载荷位于 `seq >= n_tasks`（见[交接](reference.md#进阶交接可选启用)），因此 `seq` 只有对链而言才是任务位置 |
+| `pipeline_id`, `seq` | 它的同一性；`seq=-1` 是流水线的种子。在启用控制的流水线上，交接载荷位于 `seq >= n_tasks`（见[交接](reference.md#进阶交接可选启用)），因此 `seq` 只有对链而言才是任务位置。在[启用反向](#进阶反向遍历rewindretry-allvisits)的流水线中，第一个发生实例保留 `pipeline_id:seq`，而重访会把 id 限定为 `pipeline_id:seq#visit` |
 | `task_name` | 由哪个任务产生 |
 | `type_name`, `codec` | 如何恢复它 |
 | `digest`, `size` | 载荷的 `blake2b` 及其长度 |
@@ -1053,6 +1268,71 @@ with Runner(store="runs/embed.db", registry=registry) as runner:   # the same re
 
 内置编解码器：`JsonCodec`（默认）和 `BytesCodec`（原始 `bytes`/`bytearray`）。把你自己的编解码器发布
 到 `pyattacker.codecs` 入口点组下，它就会自行安装。
+
+### `HistoryArtifact`
+
+一个可选的载荷基类：让载荷自带应用状态的**具名**快照。它是解码后的载荷，不是持久化 `Artifact` 记录
+的子类，runner 中也没有任何代码会读它来决定执行下一步去哪：它的存在是为了让一次
+[回退](#进阶反向遍历rewindretry-allvisits)能送回作者选定的状态，同时它途经的那些状态仍然可检视。
+普通字典仍然是普通字典——任务进入或完成时不会自动生成快照。教程在第 17 步
+[把它搭了出来](tutorial.md#第-17-步--高级让载荷自带历史)。
+
+```python
+HistoryArtifact(state, *, history=None, selected=None, next_snapshot=0)
+```
+
+| 成员 | 含义 |
+|---|---|
+| `state` | 当前应用状态，作为分离的深拷贝 |
+| `history` | 全部快照，最旧的在前，作为分离的记录：`{id, label, state, metadata}` |
+| `selected` | `restore` 最近一次选中的快照 id，或 `None` |
+| `checkpoint(label, *, metadata=None)` | 新值，附带一个分离的快照；标签唯一，`snapshot:` 保留给稳定 id（`snapshot:0` 等） |
+| `with_state(value)` | 新值，替换当前状态但不追加快照 |
+| `snapshot(id_or_label)` | 一条分离的快照记录；未知或有歧义的选择器抛出 `KeyError` |
+| `restore(id_or_label)` | 新值，其状态是该快照，**并且**其 `selected` 指向它；整段历史都保留，因此后续阶段仍可检视 |
+| `prune(*selectors)` | 新值，去掉那些快照；当选择器指向被选中的快照时抛出 `ValueError`，并且 id 永不被重用 |
+
+```python
+# reference/history_artifact.py
+"""HistoryArtifact: named, detached snapshots inside an application payload."""
+
+from pyattacker import CodecRegistry, HistoryArtifact
+
+
+class GenerationState(HistoryArtifact):
+    pass
+
+
+registry = CodecRegistry()
+registry.register_type(GenerationState)   # the codec restores the subclass, not a bare HistoryArtifact
+
+state = GenerationState({"prompt": "Return JSON", "temperature": 0.2})
+state = state.checkpoint("before-generation")
+state = state.with_state({**state.state, "answer": "invalid"}).checkpoint("after-generation")
+restored = state.restore("before-generation")   # selected, with the later snapshot still in history
+next_state = restored.with_state({**restored.state, "temperature": 0.7})
+
+print("labels:", [row["label"] for row in next_state.history])
+print("selected:", next_state.selected)
+print("round trip equal:", registry.load(registry.dump(next_state)).state == next_state.state)
+try:
+    next_state.prune("before-generation")   # the selected snapshot cannot be pruned
+except ValueError as exc:
+    print("prune refused:", exc)
+```
+
+这类载荷要遵守的规则：
+
+* **嵌套可变值永远不会与保留的快照互为别名。** `state`、`history` 和 `snapshot(...)` 返回的都是分离的
+  拷贝，因此修改当前状态改不了过去。
+* **状态与 metadata 必须可 JSON 序列化。** 编码会拒绝客户端、租约以及其他运行时对象。
+* **版本化的 `history-v1` 编解码器同时保留快照和已注册的子类类型。** 子类继承基类的构造函数（应用
+  字段放在 `state` 里）；自定义构造函数或额外属性的序列化不在这个接口的范围内，而未注册的子类会明确
+  解码失败，而不是以普通 `HistoryArtifact` 的身份回来。
+* **持久化是提交的事，不是 `checkpoint()` 的事。** 在任务里调用 `checkpoint()` 不会碰存储；runner
+  在提交任务输出或控制转移时持久化该载荷，因此在那次提交之前崩溃可能丢掉内存里的快照。
+* **历史是自包含的，并且会增长**，随快照的数量和大小增长——要有意识地 prune。它不取代框架的执行
+  账本、任务行或访问记录。
 
 ### 辅助函数
 
@@ -1176,7 +1456,7 @@ print([event.kind for event in store.events(pipeline_id=pid)])
 `pipeline.checkpoint_missing`，因为没有丢失任何东西。所有仅追加的内容都会留存——attempts、events、
 handoffs，以及对反向流水线而言的访问计数器，因此历史发生实例仍然可寻址。
 因此，框架不再能使用的检查点绝不是死路，已耗尽的
-反向遍历预算也不是；见[恢复与所有权](backward.md#恢复与所有权)。相比之下，
+反向遍历预算也不是；见[恢复与所有权](#恢复与所有权)。相比之下，
 `retry_succeeded=True` 只是放宽了*哪些*流水线有资格再次运行——它绝不会丢弃
 尚未成功的流水线的状态。
 
@@ -1260,6 +1540,8 @@ ORDER BY <key> LIMIT 1000`），因此没有查询会返回超过一批的数据
 * `Store` 仍是 `open_store()` 唯一检查的协议，因此添加该扩展不会破坏任何东西。
   `WriteBehindStore` 实现了它，并像它的其他读取视图一样在每次分页读取前刷新。
 
+### 可选的存储能力
+
 **`commit_handoff(record, *, task, attempt, payload=None, cursor, final=False)`**,
 **`handoffs(*, pipeline_id=None, run_id=None, limit=None)`** 和 **`reset_pipeline(record)`** 是进阶
 交接功能背后的可选能力，与 `resources()` 一样秉持“不属于协议”的精神。该提交是**一次原子
@@ -1299,12 +1581,15 @@ attempts/events，并通过该提交写入被交接的尝试，而不是通过�
 **`commit_visit_success(pipeline, task, attempt, artifact, *, final)`**,
 **`commit_control_transition(record, *, pipeline, task, attempt, payload, entry_id, target_task, limit)`**,
 **`repair_visit_terminal(record)`** 和 **`get_artifact_by_id(artifact_id)`** 是可选能力，
-位于[反向遍历](backward.md)背后，同样在协议之外。`store/visits.py` 的 `VisitStore` 持有
+位于[反向遍历](#进阶反向遍历rewindretry-allvisits)背后，同样在协议之外。`store/visits.py` 的 `VisitStore` 持有
 共享的状态转换语义，两个内置后端都从它派生，因此后端只需提供一个原子
 写入边界，加上自己的底层行写入。每个操作都是一次提交：入口分配会推进
 按 seq 的访问计数器并记录待定输入，普通成功会一并写入输出的发生实例和
 有效槽位，而控制转换还会使活动后缀失效、消耗一个
-预算单位，并分配目标入口。`supports_visits(store)` 是探测函数；它会解开
+预算单位，并分配目标入口。一次控制转移会把它的源访问与尝试、入口发生实例、账本行、控制计数以及分配好的目标入口
+一起提交；启用反向的流水线里一次正向转移同样消耗预算，但不向后移动游标。SQLite 用
+`BEGIN IMMEDIATE` 串行化这些能力事务，`MemoryStore` 在一次能力写入失败时恢复自己的状态：写入失败的
+blob 无法发布它的引用，而回滚的数据库事务可能留下一个无人引用的 blob。`supports_visits(store)` 是探测函数；它会解开
 `WriteBehindStore`（后者在同步委托这些操作之前会先刷新），并要求具备访问
 方法、`feature_level()` **加上** `commit_handoff`、`reset_pipeline` 和 `handoffs`，因为一次反向
 转换会通过这同一次提交写入其账本行和源任务。`feature_level()` 是必需的，
@@ -1312,13 +1597,33 @@ attempts/events，并通过该提交写入被交接的尝试，而不是通过�
 探测的存储会在打开启用反向的流水线时被拒绝并抛出 `ConfigError`，绝不会被降级为
 非持久的循环。
 
-同一项能力还掌管存储的**特性级别**（`feature_level()`，`store/visits.py`）：在首次提交重访之前为 `base`，
-之后为 `visits-v1`，它与使其成立的发生实例写在同一事务中。
-打开未知的（更新的）级别会抛出 `StoreFeatureUnsupported`，而不是读取这套构建无法看到的
-谱系；处于 `visits-v1` 的 SQLite 存储带有写入者守卫，它会拒绝任何
-尚未声明具备访问谱系感知的连接对 `pipelines`/`tasks`/`artifacts` 执行 `INSERT`/`UPDATE`/`DELETE`——
-因此在标记存在之前发布的二进制文件无法悄悄改动错误的
-发生实例（见[存储兼容性](backward.md#存储兼容性)）。
+### 存储兼容性与备份
+
+SQLite 对旧存储的升级是追加式的：访问列默认为 0，出现一张遍历状态表，并记录一个 `store_meta` 特性
+级别。纯正向的工作永远不会离开 `base`。级别会在为某站点分配第一个第二次发生实例的*同一个事务*里变成
+`visits-v1`，并且永远不会回退——审计行不会被删除，它们存在过这个事实也一样。
+
+那也正是谱系不感知的写入者开始无法解读该存储的时刻，因此处于 `visits-v1` 的 SQLite 存储会武装一个
+**写入者守卫**：任何尚未声明具备访问谱系感知的连接对 `pipelines`、`tasks` 和 `artifacts` 执行
+`INSERT`/`UPDATE`/`DELETE` 都会响亮地失败（`no such function:
+pyattacker_store_requires_visits_aware_writer`）。原始读取和旧式读取不被阻止——守卫保护的是状态，
+不是访问——但由不理解重访谱系的构建去解读它是不受支持的：这样的读取者无法判定哪个发生实例有效，
+因此它的输出描述的是这些行，而不是这次执行。守卫保证的是破坏性的那一半：在此特性之前发布的写入者
+无法悄悄改写错误的发生实例，因为它会在第一次写入时就失败。打开自己不认识级别的构建会直接拒绝该存储
+（`StoreFeatureUnsupported`，只读也一样），而不是报告一套它看不见的谱系。
+
+实际后果：
+
+* **备份。** 对运行中的数据库请使用 SQLite 自带的备份 API（`sqlite3 <store> ".backup <copy>"`，或
+  `Connection.backup()`），它在写入者正在运行时是安全的；把活动数据库文件连同它的 `-wal`/`-shm`
+  边文件一起复制，只有在没有写入者时才可靠。SQL 转储同样可以正常恢复——`sqlite3 <store> .dump |
+  sqlite3 <copy>` 会先写表数据、后创建守卫触发器，因此不具备感知的连接也能重放它，而副本会连同守卫
+  和特性级别一起继承过去。
+* 从 `sqlite3` 命令行写入受守卫保护的存储，需要在该连接上注册守卫函数（或者删掉触发器）；两者都在
+  受支持的接口之外。
+* 唯一受支持的回到 `base` 的方式，是由理解该级别的构建执行迁移。
+* 多个 runner 同时执行同一条逻辑流水线不是受支持的调度模式；彼此独立的分片行仍然独立（没有 `resume`
+  时 `running` 行仍然绝不被接管，见[恢复与所有权](#恢复与所有权)）。
 
 ---
 

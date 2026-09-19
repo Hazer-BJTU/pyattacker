@@ -150,7 +150,7 @@ class StoreFeatureUnsupported(PyAttackerError):
     revisit-aware store with lineage-unaware code would silently operate on the wrong artifact
     occurrence, not merely display incomplete data. Upgrade the package to open the store; back it
     up with SQLite's own backup API (``sqlite3 .backup``) or a file copy taken while no writer is
-    active (see ``docs/backward.md``).
+    active (see ``docs/reference.md``, "Advanced: backward traversal").
     """
 
 

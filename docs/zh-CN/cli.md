@@ -88,7 +88,7 @@ pyattacker resume -c qa.yaml --shards 4 --store runs/qa.db
 启用反向的流水线在没有它时绝不会被接管：本次运行会跳过那一行（`pipeline.skipped`，
 `reason="owned_by_another_run"`），而不是分叉出另一场运行可能仍拥有的遍历。应当*丢弃*检查点
 而不是恢复它的重启方式是 `--fresh-restart`（`fresh_restart=True`），它还会
-重置已用尽的交接预算；见[反向遍历](backward.md#恢复与所有权)。
+重置已用尽的交接预算；见[反向遍历](reference.md#恢复与所有权)。
 
 ## `demo` —— 零配置验证安装
 
@@ -367,8 +367,10 @@ pipeline:
 反向遍历所必需的、必须为正的 `max_handoffs`。对于仅反向的方案，`edges` 是可选的；
 已有的仅向前声明保持不变。`run.max_handoffs` 设置运行时的上限（默认
 1000）。校验复用 Python 的名称/seq 解析，并报告配置字段路径。回退载荷
-由任务代码而非配置选择。可运行的 Python 示例、
-状态历史接口、预算生命周期和载荷缺失恢复见[反向指南](backward.md)。
+由任务代码而非配置选择。语法、访问模型、预算生命周期和载荷缺失恢复见
+[reference → 进阶：反向遍历](reference.md#进阶反向遍历rewindretry-allvisits)；
+可运行的 Python 示例（含 `HistoryArtifact`）见
+[tutorial 第 16–17 步](tutorial.md#第-16-步--高级用回退和全部重试重新生成)。
 
 ## 另见
 
