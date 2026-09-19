@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] — 2026-09-19
 
 ### Added
 
@@ -128,48 +128,6 @@ All notable changes to this project are documented here. The format follows
   preserve numeric source disambiguation in JSON/TOML/YAML and effective config; restrict the annotation
   escape to return unions containing `Handoff`.
 
-### Changed
-
-* **`MergedReport.events_total` is renamed `source_events_total`** (issue #59). The old name sat in the same
-  report as the de-duplicated counters without saying that it was the one number which was not de-duplicated;
-  the new name states the scope, `stats()` carries it under the same key, and `summary()` labels it
-  `source_events=`. Nothing else on `MergedReport` changed name. `MergedReport.events_total` survives as a
-  deprecated read-only alias (removed at 1.0) so an attribute read keeps working, but it is deliberately not a
-  second key in `stats()`: the point is that the JSON a report emits names one scope per number. Note that
-  `store.stats()["events_total"]` is untouched and is not the asymmetry it looks like — for a single store it
-  is the same measurement as the merged report's `source_events_total`, which the new test pins.
-
-* **The backward-traversal guide is merged into the tutorial and the reference.** `docs/backward.md` was a
-  seventh document that a reader had to find before they could use the feature; its usage now lives where
-  the rest of the API does. [Tutorial step 16](docs/tutorial.md#step-16--advanced-regenerating-with-rewind-and-retry-all)
-  keeps the rewind/retry-all walkthrough and a new step 17 builds an optional `HistoryArtifact` payload,
-  while [reference → advanced: backward traversal](docs/reference.md#advanced-backward-traversal-rewind-retry-all-visits)
-  gains the `Handoff.rewind`/`Handoff.retry_all` signatures, the backward `control` keys, the visit and
-  occurrence model, the budget and recovery rules, and the inspection surface; `HistoryArtifact` is
-  documented next to the codecs it belongs to, and the store capability and compatibility/backup rules moved
-  into the Stores section. Both steps and the reference examples are marked **advanced**, stay opt-in and
-  experimental until 1.0, and are executed by the test suite (`# reference/<name>.py` joins the
-  executable-document markers). The Chinese tree mirrors all of it. No API changed.
-
-* **The sdist no longer ships the branding images.** `assets/` was in the sdist include list, and PNG
-  barely compresses, so the two logo files were 883 KB of the 1.26 MB `pyattacker-0.2.0.tar.gz` that PyPI
-  serves — two thirds of the download for an archive whose purpose is to be rebuilt and tested. Nothing
-  that unpacks an sdist needs them, and the README loads its banner over an absolute
-  `raw.githubusercontent.com` URL, so the PyPI description is unaffected; the tarball is back to 439 KB.
-  Both `ci.yml` and `release.yml` now fail the build if the sdist grows past 1 MiB, and
-  `tests/test_packaging.py` fails if a README image ever points into the checkout again.
-* **A release goes through TestPyPI before it reaches PyPI.** The scratch-index upload was a rehearsal a
-  maintainer had to opt into, and the `v0.2.0` tag skipped it — so the files PyPI received were the first copy
-  of that version any index had ever served. Every tag now publishes to TestPyPI, installs those files back by
-  name into a clean environment, asserts that the installed CLI reports the version being released, and only
-  then uploads to PyPI. The check is a job of its own with no OIDC token, so the job that holds a credential
-  that can publish does nothing else, and `pypi` now depends on it. A dispatched run still rehearses when
-  *Publish to TestPyPI* is checked and stops before both uploads otherwise. `docs/releasing.md` records the
-  consequence this makes load-bearing: a filename an index has seen can never be uploaded again, so a commit
-  after a rehearsal means a new version number, not a re-run.
-
-### Fixed
-
 * **A worker that dies outside its own handlers no longer hangs the run.** Run completion was tracked purely
   by pipeline counters (`pipelines_done` against `pipelines_admitted`), so a `BaseException` that is not
   `CancelledError` — a custom subclass raised by a store or backend hook, for example — escaped the worker's
@@ -216,6 +174,46 @@ All notable changes to this project are documented here. The format follows
   final task (the documented at-least-once boundary) rather than leaving a `succeeded` pipeline whose final
   artifact was never marked — a state no later run could repair, because a succeeded pipeline is skipped
   forever.
+
+### Changed
+
+* **`MergedReport.events_total` is renamed `source_events_total`** (issue #59). The old name sat in the same
+  report as the de-duplicated counters without saying that it was the one number which was not de-duplicated;
+  the new name states the scope, `stats()` carries it under the same key, and `summary()` labels it
+  `source_events=`. Nothing else on `MergedReport` changed name. `MergedReport.events_total` survives as a
+  deprecated read-only alias (removed at 1.0) so an attribute read keeps working, but it is deliberately not a
+  second key in `stats()`: the point is that the JSON a report emits names one scope per number. Note that
+  `store.stats()["events_total"]` is untouched and is not the asymmetry it looks like — for a single store it
+  is the same measurement as the merged report's `source_events_total`, which the new test pins.
+
+* **The backward-traversal guide is merged into the tutorial and the reference.** `docs/backward.md` was a
+  seventh document that a reader had to find before they could use the feature; its usage now lives where
+  the rest of the API does. [Tutorial step 16](docs/tutorial.md#step-16--advanced-regenerating-with-rewind-and-retry-all)
+  keeps the rewind/retry-all walkthrough and a new step 17 builds an optional `HistoryArtifact` payload,
+  while [reference → advanced: backward traversal](docs/reference.md#advanced-backward-traversal-rewind-retry-all-visits)
+  gains the `Handoff.rewind`/`Handoff.retry_all` signatures, the backward `control` keys, the visit and
+  occurrence model, the budget and recovery rules, and the inspection surface; `HistoryArtifact` is
+  documented next to the codecs it belongs to, and the store capability and compatibility/backup rules moved
+  into the Stores section. Both steps and the reference examples are marked **advanced**, stay opt-in and
+  experimental until 1.0, and are executed by the test suite (`# reference/<name>.py` joins the
+  executable-document markers). The Chinese tree mirrors all of it. No API changed.
+
+* **The sdist no longer ships the branding images.** `assets/` was in the sdist include list, and PNG
+  barely compresses, so the two logo files were 883 KB of the 1.26 MB `pyattacker-0.2.0.tar.gz` that PyPI
+  serves — two thirds of the download for an archive whose purpose is to be rebuilt and tested. Nothing
+  that unpacks an sdist needs them, and the README loads its banner over an absolute
+  `raw.githubusercontent.com` URL, so the PyPI description is unaffected; the tarball is back to 439 KB.
+  Both `ci.yml` and `release.yml` now fail the build if the sdist grows past 1 MiB, and
+  `tests/test_packaging.py` fails if a README image ever points into the checkout again.
+* **A release goes through TestPyPI before it reaches PyPI.** The scratch-index upload was a rehearsal a
+  maintainer had to opt into, and the `v0.2.0` tag skipped it — so the files PyPI received were the first copy
+  of that version any index had ever served. Every tag now publishes to TestPyPI, installs those files back by
+  name into a clean environment, asserts that the installed CLI reports the version being released, and only
+  then uploads to PyPI. The check is a job of its own with no OIDC token, so the job that holds a credential
+  that can publish does nothing else, and `pypi` now depends on it. A dispatched run still rehearses when
+  *Publish to TestPyPI* is checked and stops before both uploads otherwise. `docs/releasing.md` records the
+  consequence this makes load-bearing: a filename an index has seen can never be uploaded again, so a commit
+  after a rehearsal means a new version number, not a re-run.
 
 ## [0.2.0] — 2026-09-17
 
@@ -564,7 +562,7 @@ hard limit; asyncio tasks only (wrap blocking code with `asyncio.to_thread`); on
 balance is statistical; a merged report is a union, not a sum; a pipeline is a linear chain; the HTTP endpoint
 is unauthenticated.
 
-[Unreleased]: https://github.com/Hazer-BJTU/pyattacker/compare/v0.2.0...HEAD
+[0.3.0]: https://github.com/Hazer-BJTU/pyattacker/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Hazer-BJTU/pyattacker/releases/tag/v0.2.0
 [0.1.1]: https://github.com/Hazer-BJTU/pyattacker/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Hazer-BJTU/pyattacker/releases/tag/v0.1.0
