@@ -545,6 +545,18 @@ class MemoryStore(VisitStore):
         ]
         return items[-limit:]
 
+    def count_events(
+        self, *, kind: str | None = None, run_id: str | None = None,
+        pipeline_id: str | None = None,
+    ) -> int:
+        """Count events matching the filters."""
+        return sum(
+            1 for e in self._events
+            if (pipeline_id is None or e.pipeline_id == pipeline_id)
+            and (run_id is None or e.run_id == run_id)
+            and (kind is None or e.kind == kind)
+        )
+
     def all_events(self) -> list[EventRecord]:
         return list(self._events)
 
@@ -589,14 +601,6 @@ class MemoryStore(VisitStore):
             ),
             "events_total": sum(
                 1 for e in self._events if run_id is None or e.run_id == run_id
-            ),
-            # Count failed terminal repair attempts from the event log, mirroring SqliteStore's
-            # aggregate query. This is a per-run observability metric: the live run still uses
-            # RunReport.repair_failures, which is run-local.
-            "repair_failures": sum(
-                1 for e in self._events
-                if (run_id is None or e.run_id == run_id)
-                and e.kind == "pipeline.terminal_repair_failed"
             ),
         }
 

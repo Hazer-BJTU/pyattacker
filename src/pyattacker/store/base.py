@@ -443,6 +443,26 @@ class Store(Protocol):
     def close(self) -> None: ...
 
 
+def count_events(
+    store: Store, *, kind: str | None = None, run_id: str | None = None,
+    pipeline_id: str | None = None,
+) -> int:
+    """Count events matching the filters, without materializing them.
+
+    Prefers a native aggregate method when the store has one (``count_events``);
+    otherwise falls back to ``len(events(...))`` — which materializes the matching
+    rows, but only as many as the store's own ``limit`` allows. For large stores
+    that need exact counts, the native method should be implemented.
+    """
+    native = getattr(store, "count_events", None)
+    if callable(native):
+        return int(native(kind=kind, run_id=run_id, pipeline_id=pipeline_id))
+    # Fallback: materialize and count. Use a large limit so we get the full count
+    # in the common case; for truly large stores the native method should exist.
+    return len(store.events(kind=kind, run_id=run_id, pipeline_id=pipeline_id,
+                           limit=_LIST_LIMIT_ALL))
+
+
 @runtime_checkable
 class PagedStore(Protocol):
     """Optional extension to :class:`Store`: batched, bounded-memory iteration over a whole kind.
@@ -589,15 +609,41 @@ def iter_events(
     cannot drop or duplicate a row. The iterator is bound to the high-water mark taken when its
     first page is read: events emitted after that are not part of this traversal (per iterator, not
     permanent — a new iterator sees them).
+
+    Backward compatibility: when ``kind`` is ``None``, the keyword is not passed to legacy
+    implementations (which may not accept it). When ``kind`` is provided but the native method
+    doesn't support it, we fall back to materializing and filtering in Python.
     """
     native = getattr(store, "iter_events", None)
     if callable(native):
-        yield from native(pipeline_id=pipeline_id, run_id=run_id, kind=kind)
+        # Try with kind first; if the legacy signature doesn't accept it, retry without kind
+        # and filter in Python.
+        try:
+            yield from native(pipeline_id=pipeline_id, run_id=run_id, kind=kind)
+        except TypeError:
+            if kind is None:
+                raise
+            # Legacy store without kind support: pull everything and filter
+            for event in native(pipeline_id=pipeline_id, run_id=run_id):
+                if event.kind == kind:
+                    yield event
     else:
         # The list API's own `limit` means "the most recent N" (default 200) and cannot express
         # "everything", so the fallback asks for the largest limit it can represent. Both built-in
         # stores return the selected events oldest first, which is the order the export documents.
-        yield from store.events(pipeline_id=pipeline_id, run_id=run_id, kind=kind, limit=_LIST_LIMIT_ALL)
+        kwargs: dict[str, Any] = {"pipeline_id": pipeline_id, "run_id": run_id, "limit": _LIST_LIMIT_ALL}
+        if kind is not None:
+            kwargs["kind"] = kind
+        try:
+            yield from store.events(**kwargs)
+        except TypeError:
+            if kind is None:
+                raise
+            # Legacy events() without kind support: pull everything and filter
+            del kwargs["kind"]
+            for event in store.events(**kwargs):
+                if event.kind == kind:
+                    yield event
 
 
 def iter_artifacts(store: Store, *, pipeline_id: str) -> Iterator[Artifact]:

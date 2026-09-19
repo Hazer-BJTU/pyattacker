@@ -1416,7 +1416,8 @@ Reading a live store while a run writes to it is supported — WAL allows one wr
 | `errors(*, run_id=None, limit=20)` | failures with task name, error type and message |
 | `export_rows(*, run_id=None)` | nested pipeline rows: tasks, artifacts and handoffs included |
 | `attempts(*, pipeline_id=None, ...)` | attempt history |
-| `events(*, pipeline_id=None, limit=...)` | the event stream |
+| `events(*, pipeline_id=None, run_id=None, kind=None, limit=...)` | the event stream, optionally filtered by event kind |
+| `count_events(*, kind=None, run_id=None, pipeline_id=None)` | exact count of matching events, via aggregate query (no materialization) |
 | `close()` | close the connection |
 
 ```python
@@ -1454,11 +1455,12 @@ the phase, so a later attempt still reports the original cause. Because such a r
 repairing run, that failure can never show up in the run-scoped `stats`; it is counted in
 `RunReport.repair_failures`, which is what makes the CLI exit `1` instead of reporting a clean run.
 
-A **post-hoc** `pyattacker report <store>` reconstructs its view from pipeline rows only, so it cannot say
-that a later run tried to repair such a pipeline and failed: the row still describes the original failure,
-and the repair attempt lives in the event stream (`pipeline.terminal_repair_failed`). Treat that command's
-output as the state of the pipelines, not as the history of every attempt; the live `run` exit code is the
-authoritative signal for the attempt it just made.
+A **post-hoc** `pyattacker report <store>` now surfaces failed terminal repair attempts: it queries
+the event log for `pipeline.terminal_repair_failed` events associated with the pipelines in the report
+scope, and prints a `Terminal repair failures: N pipeline(s)` section listing each affected pipeline
+and its failure phase. The count is de-duplicated by `pipeline_id`, so the same pipeline appearing in
+multiple stores does not double-count. The live `run` exit code remains the authoritative signal for the
+attempt it just made; the post-hoc report is a historical view.
 A control-enabled pipeline adds one branch, consulted **before** those rules
 ([handoffs](#advanced-handoffs-opt-in)): if the newest active ledger row's target is at or ahead of the cursor, the
 run resumes *at that target* with the recorded entry artifact and never re-runs the source task, and a
@@ -1518,7 +1520,7 @@ in memory (an export of a large store) goes through the `iter_*` helpers instead
 | `iter_pipelines(store, *, run_id=None, state=None)` | `PipelineRecord`, `created_at` then `pipeline_id` |
 | `iter_tasks(store, pipeline_id=None, *, run_id=None)` | `TaskRecord`, `pipeline_id`, `seq`, then `task_run_id` |
 | `iter_attempts(store, *, run_id=None, pipeline_id=None)` | `AttemptRecord`, `attempt_id` (write order) |
-| `iter_events(store, *, pipeline_id=None, run_id=None)` | `EventRecord`, `event_id` (write order, oldest first) |
+| `iter_events(store, *, pipeline_id=None, run_id=None, kind=None)` | `EventRecord`, `event_id` (write order, oldest first), optionally filtered by event kind |
 | `iter_artifacts(store, *, pipeline_id)` | `Artifact` of one pipeline, `seq` then `artifact_id` |
 
 Every one of those orders **ends in a unique key**, and that is not decoration: `tasks` is keyed by

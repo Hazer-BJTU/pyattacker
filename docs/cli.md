@@ -152,6 +152,11 @@ object. A run that recorded handoffs says so in its summary line (`... attempts:
 `--rows pipelines` on `export` carries the ledger itself (see
 [advanced: handoffs](reference.md#advanced-handoffs-opt-in)).
 
+If the store contains failed terminal repair attempts, the report lists them separately
+(`Terminal repair failures: N pipeline(s)`), each with the pipeline id and failure phase. This is a
+post-hoc observability metric: the live run's `RunReport.repair_failures` is run-local; the post-hoc view
+derives it from the event log, scoped to the pipelines in the report.
+
 ## `watch` — live monitoring
 
 ```bash

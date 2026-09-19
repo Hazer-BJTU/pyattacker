@@ -142,17 +142,26 @@ def merge_reports(
 ) -> MergedReport:
     """Merge pipeline rows from several stores. ``sources`` may be stores or SQLite paths."""
     if open_store is None:  # imported lazily so this module stays usable without SQLite
+        from .store.base import count_events as _count
         from .store.base import open_store as _open
 
         open_store = _open
+        count_ev = _count
+    else:
+        from .store.base import count_events as _count
+        count_ev = _count
+
     rows_by_id: dict[str, Mapping[str, Any]] = {}
     duplicates = 0
     events_total = 0
     attempts_total = 0
     handoffs_total = 0
-    repair_failures = 0
+    # Track which pipelines have at least one failed terminal repair.
+    # We collect this during the store loop, before stores are closed.
+    repair_failed_pids: set[str] = set()
     paths: list[str] = []
     run_ids: list[str] = []
+
     for source in sources:
         store = source if hasattr(source, "export_rows") else open_store(str(source))
         path = getattr(store, "path", None) or getattr(getattr(store, "inner", None), "path", None)
@@ -163,10 +172,6 @@ def merge_reports(
             events_total += int(counts.get("events_total") or 0)
             attempts_total += int(counts.get("attempts_total") or 0)
             handoffs_total += int(counts.get("handoffs_total") or 0)
-            # Repair failures are a post-hoc observability metric: we count them globally,
-            # not scoped to run_id, because the failed repair attempt may belong to a run
-            # that no longer owns any pipeline row.
-            repair_failures += len(store.events(kind="pipeline.terminal_repair_failed", limit=100000))
             for row in store.export_rows(run_id=run_id):
                 key = row["pipeline_id"]
                 run_ids.append(row["run_id"])
@@ -175,6 +180,11 @@ def merge_reports(
                     rows_by_id[key] = _winner(rows_by_id[key], row)
                 else:
                     rows_by_id[key] = row
+                # Collect repair-failed pipeline ids from this store.
+                # (A pipeline may appear in multiple stores if they were copied.)
+                if key not in repair_failed_pids:
+                    if count_ev(store, kind="pipeline.terminal_repair_failed", pipeline_id=key) > 0:
+                        repair_failed_pids.add(key)
         finally:
             if not hasattr(source, "export_rows"):
                 store.close()
@@ -188,5 +198,5 @@ def merge_reports(
         events_total=events_total,
         attempts_total=attempts_total,
         handoffs_total=handoffs_total,
-        repair_failures=repair_failures,
+        repair_failures=len(repair_failed_pids),
     )

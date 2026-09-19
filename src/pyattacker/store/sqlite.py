@@ -1076,6 +1076,24 @@ class SqliteStore(VisitStore):
         rows = self._conn.execute(sql, args).fetchall()
         return [_to_event(r) for r in reversed(rows)]
 
+    def count_events(
+        self, *, kind: str | None = None, run_id: str | None = None,
+        pipeline_id: str | None = None,
+    ) -> int:
+        """Count events matching the filters, using an aggregate query (no materialization)."""
+        sql = "SELECT COUNT(*) AS n FROM events WHERE 1=1"
+        args: list[Any] = []
+        if pipeline_id:
+            sql += " AND pipeline_id=?"
+            args.append(pipeline_id)
+        if run_id:
+            sql += " AND run_id=?"
+            args.append(run_id)
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
+        return int(self._conn.execute(sql, args).fetchone()["n"])
+
     def stats(self, run_id: str | None = None) -> dict[str, Any]:
         where, args = ("WHERE run_id=?", [run_id]) if run_id else ("", [])
         by_state = {
@@ -1138,13 +1156,6 @@ class SqliteStore(VisitStore):
             ),
             "events_total": self._conn.execute(
                 f"SELECT COUNT(*) AS n FROM events {task_where}", task_args
-            ).fetchone()["n"],
-            # Count failed terminal repair attempts from the event log, without materializing it.
-            # This is a per-run observability metric: the live run still uses RunReport.repair_failures.
-            "repair_failures": self._conn.execute(
-                f"SELECT COUNT(*) AS n FROM events {task_where} "
-                f"{'AND' if task_where else 'WHERE'} kind='pipeline.terminal_repair_failed'",
-                task_args,
             ).fetchone()["n"],
         }
 

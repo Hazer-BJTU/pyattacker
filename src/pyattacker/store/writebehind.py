@@ -306,6 +306,17 @@ class WriteBehindStore:
         self.flush()
         return self.inner.events(pipeline_id=pipeline_id, run_id=run_id, kind=kind, limit=limit)
 
+    def count_events(
+        self, *, kind: str | None = None, run_id: str | None = None,
+        pipeline_id: str | None = None,
+    ) -> int:
+        self.flush()
+        native = getattr(self.inner, "count_events", None)
+        if callable(native):
+            return int(native(kind=kind, run_id=run_id, pipeline_id=pipeline_id))
+        # Fallback for stores without native count_events
+        return len(self.inner.events(kind=kind, run_id=run_id, pipeline_id=pipeline_id, limit=1000000))
+
     def stats(self, run_id: str | None = None) -> dict[str, Any]:
         self.flush()
         return self.inner.stats(run_id)

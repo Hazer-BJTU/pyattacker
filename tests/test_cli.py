@@ -883,10 +883,11 @@ def test_posthoc_report_shows_repair_failures(
     assert main(["run", "-c", str(cfg), "--store", str(db)]) == 1
 
     # The run-local counter worked, but now we close and re-open the store
-    # (post-hoc view) and check that stats() and events(kind=...) expose the failure.
+    # (post-hoc view) and check that count_events() and events(kind=...) expose the failure.
+    from pyattacker.store.base import count_events
     store = SqliteStore(str(db))
-    stats = store.stats()
-    assert stats["repair_failures"] == 1
+    assert count_events(store, kind="pipeline.terminal_repair_failed") == 1
+    assert count_events(store, kind="pipeline.terminal_repair_failed", pipeline_id=pid) == 1
 
     # events(kind=...) filters correctly
     repair_events = store.events(kind="pipeline.terminal_repair_failed")
@@ -903,7 +904,7 @@ def test_posthoc_report_shows_repair_failures(
     out = capsys.readouterr().out  # clear previous output
     assert main(["report", str(db)]) == 0
     out = capsys.readouterr().out
-    assert "Terminal repair failures: 1" in out
+    assert "Terminal repair failures: 1 pipeline(s)" in out
 
 
 # ---------------------------------------------------------- worker liveness (#44)
