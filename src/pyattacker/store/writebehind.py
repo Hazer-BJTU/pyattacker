@@ -304,6 +304,9 @@ class WriteBehindStore:
         kind: str | None = None, limit: int = 200
     ) -> list[EventRecord]:
         self.flush()
+        # When kind is None, don't forward it to legacy inner stores that don't accept the kwarg.
+        if kind is None:
+            return self.inner.events(pipeline_id=pipeline_id, run_id=run_id, limit=limit)
         return self.inner.events(pipeline_id=pipeline_id, run_id=run_id, kind=kind, limit=limit)
 
     def count_events(

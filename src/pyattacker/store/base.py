@@ -622,14 +622,16 @@ def iter_events(
     """
     native = getattr(store, "iter_events", None)
     if callable(native):
-        # Try with kind first; if the legacy signature doesn't accept it, retry without kind
-        # and filter in Python. The try/except only wraps the *call*, not iteration, so
-        # TypeErrors raised inside the iterator body propagate normally.
+        # When kind is None, call the legacy-compatible signature directly (no kind kwarg).
+        # When kind is provided, try with it first; if the legacy signature doesn't accept it,
+        # retry without kind and filter in Python. The try/except only wraps the *call*,
+        # not iteration, so TypeErrors raised inside the iterator body propagate normally.
+        if kind is None:
+            yield from native(pipeline_id=pipeline_id, run_id=run_id)
+            return
         try:
             iterator = native(pipeline_id=pipeline_id, run_id=run_id, kind=kind)
         except TypeError:
-            if kind is None:
-                raise
             # Legacy store without kind support: pull everything and filter in Python.
             iterator = native(pipeline_id=pipeline_id, run_id=run_id)
             for event in iterator:

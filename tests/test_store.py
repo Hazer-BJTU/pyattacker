@@ -461,6 +461,37 @@ def test_iter_events_kind_filter(store):
     assert runs == ["run-1", "run-2"]
 
 
+def test_iter_events_legacy_store_without_kind_support():
+    """Backward compatibility: a legacy iter_events() that doesn't accept `kind` still works."""
+    from pyattacker.store.base import iter_events
+
+    class LegacyStore:
+        """A fake legacy store that doesn't accept `kind` in iter_events or events()."""
+        def __init__(self):
+            self.events_list = [
+                EventRecord(ts=1.0, kind="task.succeeded", run_id="run-1", pipeline_id="p1", data={}),
+                EventRecord(ts=2.0, kind="task.failed", run_id="run-1", pipeline_id="p2", data={}),
+            ]
+
+        def iter_events(self, *, pipeline_id=None, run_id=None):
+            # Legacy signature: no `kind` parameter
+            yield from self.events_list
+
+        def events(self, *, pipeline_id=None, run_id=None, limit=200):
+            # Legacy signature: no `kind` parameter
+            return self.events_list[:limit]
+
+    store = LegacyStore()
+
+    # kind=None: should work fine (no kind kwarg passed)
+    kinds = [e.kind for e in iter_events(store, kind=None)]
+    assert kinds == ["task.succeeded", "task.failed"]
+
+    # kind="task.failed": should fall back to full pull + Python filter
+    kinds = [e.kind for e in iter_events(store, kind="task.failed")]
+    assert kinds == ["task.failed"]
+
+
 # ------------------------------------------------------------- paged iteration
 
 
