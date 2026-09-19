@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import urllib.request
 
 import pytest
 
-from pyattacker import Handoff, Runner, SqliteStore, pipeline, task
+from pyattacker import Handoff, MemoryStore, Runner, SqliteStore, pipeline, task
 from pyattacker.errors import ConfigError, StoreFeatureUnsupported
+from pyattacker.monitor import read_snapshot
 from pyattacker.reported_metrics import read_reported_metrics, report_metric
 from pyattacker.server import StatsServer
 
 
 @task("reported.answer")
 def answer(seed, ctx):
-    ctx.report_metric("phase", "scored", display="text")
+    ctx.report_metric("phase", "correct" if seed["correct"] else "incorrect", display="text")
     return {"correct": seed["correct"]}
 
 
@@ -44,17 +46,25 @@ def test_live_accuracy_is_application_owned_and_visible_through_read_only_server
         with urllib.request.urlopen(f"{server.url}/metrics?run_id={run_id}") as response:
             assert json.load(response)["rows"][0]["name"] == "accuracy"
         assert runner.stats()["reported_metrics"]
-        pipeline_id = next(iter(scores))
+        pipeline_id = next(pid for pid, correct in scores.items() if correct)
         scoped = server.payload("/metrics", {"run_id": [run_id], "pipeline_id": [pipeline_id]})[1]
-        assert [(r["name"], r["value"]) for r in scoped["rows"]] == [("phase", "scored")]
+        assert [(r["name"], r["value"]) for r in scoped["rows"]] == [("phase", "correct")]
         selected = server.payload("/pipelines", {"run_id": [run_id]})[1]["rows"]
-        assert all(row["reported_metrics"][0]["value"] == "scored" for row in selected)
+        assert {row["reported_metrics"][0]["value"] for row in selected} == {"correct", "incorrect"}
 
         runner.config.retry_succeeded = True
         second = runner.run(spec.map([{"correct": True}, {"correct": False}]))
         assert second.run_id != run_id
         assert len(scores) == 2  # application deduplicates by pipeline ID
+        runner.report_metric("accuracy", 1.0, display="percent")  # a distinct second-run report
         assert server.payload("/metrics", {"run_id": [run_id]})[1]["rows"][0]["value"] == 0.5
+        assert server.payload("/metrics", {"run_id": [second.run_id]})[1]["rows"][0]["value"] == 1.0
+        assert server.payload("/stats", {})[1]["run_id"] == second.run_id
+        assert server.payload("/metrics", {})[1]["run_id"] == second.run_id
+        assert all(row["run_id"] == second.run_id for row in server.payload("/pipelines", {})[1]["rows"])
+        assert [row["event_id"] for row in server.payload("/events", {})[1]["rows"]] == [
+            event.event_id for event in runner.store.events(run_id=second.run_id)
+        ]
 
     readonly = SqliteStore(db, read_only=True)
     try:
@@ -112,3 +122,72 @@ def test_completion_observer_sees_failure_and_terminal_handoff():
         assert [state for state, _ in seen] == ["failed", "succeeded"]
         assert seen[0][1] is None
         assert seen[1][1].is_final
+
+
+def test_terminal_repair_notifies_once_after_success_is_durable():
+    store = MemoryStore()
+    observed = []
+    with Runner(store=store, handle_signals=False) as runner:
+        spec = pipeline("repair-report", answer).bind({"correct": True})
+        runner.run([spec])
+        store.finish_pipeline(spec.pipeline_id, "failed", n_tasks_done=1,
+                              error=RuntimeError("torn terminal write"))
+
+        def finished(active, record, artifact):
+            assert active.store.get_pipeline(record.pipeline_id).state == "succeeded"
+            assert artifact is not None and artifact.available and artifact.is_final
+            observed.append(active.registry.load(artifact.encoded()))
+
+        runner.on_pipeline_finished = finished
+        report = runner.run([spec])
+        assert report.stats["pipelines"]["by_state"] == {"succeeded": 1}
+        assert observed == [{"correct": True}]
+
+
+def test_default_scope_handles_pipeline_only_reports(tmp_path):
+    db = str(tmp_path / "pipeline-only.db")
+    with Runner(store=db, handle_signals=False) as runner:
+        spec = pipeline("pipeline-only", answer)
+        first = runner.run(spec.map([{"correct": True}]))
+        second = runner.run(spec.map([{"correct": False}]))
+        with StatsServer(db, port=0) as server:
+            assert server.payload("/stats", {})[1]["run_id"] == second.run_id
+            assert server.payload("/metrics", {})[1] == {"run_id": second.run_id, "rows": []}
+            rows = server.payload("/pipelines", {})[1]["rows"]
+            assert len(rows) == 1 and rows[0]["run_id"] == second.run_id
+            assert rows[0]["reported_metrics"][0]["value"] == "incorrect"
+            assert read_snapshot(runner.store)["run_id"] == second.run_id
+            assert server.payload("/stats", {"run_id": [first.run_id]})[1]["run_id"] == first.run_id
+            assert server.payload("/metrics", {"run_id": ["all"]})[1] == {"run_id": None, "rows": []}
+            assert server.payload("/stats", {"run_id": ["all"]})[1]["pipelines"]["total"] == 2
+
+
+def test_interruption_notifies_after_terminal_state_is_stored():
+    @task("reported.slow")
+    async def slow(seed):
+        await asyncio.sleep(10)
+        return seed
+
+    async def scenario():
+        observed = []
+
+        def finished(runner, record, artifact):
+            assert runner.store.get_pipeline(record.pipeline_id).state == "interrupted"
+            observed.append((record.state, artifact))
+
+        with Runner(on_pipeline_finished=finished, handle_signals=False) as runner:
+            spec = pipeline("reported-interrupted", slow).bind({"i": 1})
+            running = asyncio.create_task(runner.run_async([spec]))
+            for _ in range(100):
+                record = runner.store.get_pipeline(spec.pipeline_id)
+                if record is not None and record.state == "running":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("pipeline never started")
+            running.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await running
+            assert observed == [("interrupted", None)]
+
+    asyncio.run(scenario())

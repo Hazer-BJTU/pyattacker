@@ -2115,7 +2115,10 @@ runner.report_metric("accuracy", correct / completed, label="Accuracy", display=
 `/metrics?run_id=...` 返回 `{"run_id": ..., "rows": [{"run_id", "pipeline_id", "name",
 "value", "label", "display", "updated_at"}, ...]}`。加上 `pipeline_id=...` 可读取该流水线的
 自定义值；`/pipelines` 的每行也包含 `reported_metrics` 数组。未指定 run ID 时，
-`/metrics` 选择最近一次更新运行级指标的运行。HTML 面板将运行级值显示为卡片；终端
+`read_snapshot()`、`watch` 和 `StatsServer` 的各端点统一选择最近启动的运行，包括只汇报
+流水线级值的运行。HTML 面板先从 `/stats` 确定 run ID，再用同一个 ID 查询 `/metrics`、
+`/pipelines` 和 `/events`。需要全库运行统计时可用 `?run_id=all`（`watch`／`serve` 使用
+`--run-id all`）；全库视图不会任意挑一个运行的自定义指标来展示。HTML 面板将运行级值显示为卡片；终端
 `watch` 也会展示。HTTP 服务仍只读，指标通过正在运行的 Runner 的存储连接写入。
 
 ### `runner.stats()`
@@ -2152,7 +2155,7 @@ with StatsServer("runs/qa.db", port=8787) as server:
 | `/` | 一个小巧的自动刷新仪表盘 |
 | `/stats`, `/metrics`, `/events`, `/pipelines`, `/resources`, `/errors` | JSON |
 
-`/stats` 带 `handoffs_total`（所选运行的提交数，没运行过滤器则全部提交），每行 `/pipelines` 带
+`/stats` 带 `handoffs_total`（所选运行的提交数，`run_id=all` 则为全部提交），每行 `/pipelines` 带
 `handoffs`（活动执行记录的计数）、`handoffs_historical`（全部记录的计数）和
 `handoff_floor`，紧挨着 `n_tasks_done`/`n_tasks_total`——开控制流的流水线上，这两者是链中的
 **位置**，不是已跑任务数，所以非零的 `handoffs` 才说明"这条

@@ -485,6 +485,12 @@ class SqliteStore(VisitStore):
         row = self._conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
         return _to_run(row) if row else None
 
+    def latest_run_id(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT run_id FROM runs ORDER BY started_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        return str(row["run_id"]) if row else None
+
     # ------------------------------------------------------------- pipelines
     def get_pipeline(self, pipeline_id: str) -> PipelineRecord | None:
         row = self._conn.execute(

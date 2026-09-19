@@ -385,6 +385,8 @@ class Store(Protocol):
     # pipeline_id=None)`` are also optional. They store application-supplied latest
     # values for monitoring. A third-party store without them remains a valid Store;
     # requesting a write raises StoreFeatureUnsupported, and readers show an empty view.
+    # ``latest_run_id()`` is an optional monitor helper. A store without it keeps
+    # the legacy aggregate snapshot when no run_id was explicitly selected.
 
     # ``settle_pipeline(pipeline_id, *, state, n_tasks_done, run_id)`` is an optional capability in the
     # same spirit: one write that moves a row to its terminal state, rebinds the owning run and clears

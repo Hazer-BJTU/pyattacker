@@ -259,8 +259,8 @@ with Runner(store=":memory:", concurrency=4) as runner:
 * **It is a durable checkpoint.** The jump is committed atomically (source task, attempt, entry artifact,
   ledger row and cursor together), so a killed process resumes **at the target** with the recorded entry
   state and does not re-run the source task. On a control-enabled pipeline `n_tasks_done` is a *position*,
-  not a progress count: skipped stations have no task rows. `report`/`watch` count commits in the selected
-  scope (one run when filtered, all history otherwise); `/pipelines.handoffs` counts active execution records and `handoffs_historical` counts all ledger
+  not a progress count: skipped stations have no task rows. `watch` counts commits in the selected
+  run by default (`--run-id all` selects all history); `/pipelines.handoffs` counts active execution records and `handoffs_historical` counts all ledger
   records. A resume can use an earlier run's active handoff while recording no new handoffs. Pipeline
   exports include ledger identity and the watermark to distinguish the scopes.
 * **Opt-in and inert.** Without the `control` block nothing changes — not one row, not one counter, and not a

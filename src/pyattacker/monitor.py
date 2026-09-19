@@ -14,7 +14,7 @@ from typing import Any
 
 from .reported_metrics import read_reported_metrics
 
-__all__ = ["render_snapshot", "watch", "read_snapshot"]
+__all__ = ["render_snapshot", "watch", "read_snapshot", "resolve_run_id"]
 
 _BAR = "█"
 _EMPTY = "·"
@@ -80,8 +80,20 @@ def render_snapshot(snapshot: Mapping[str, Any], *, width: int = 20) -> str:
     return "\n".join(lines)
 
 
+def resolve_run_id(store: Any, run_id: str | None = None) -> str | None:
+    """Resolve the default monitor scope to the latest run; ``'all'`` requests aggregates."""
+    if run_id == "all":
+        return None
+    if run_id is not None:
+        return run_id
+    latest = getattr(store, "latest_run_id", None)
+    return latest() if callable(latest) else None
+
+
 def read_snapshot(store: Any, run_id: str | None = None, *, errors: int = 3) -> dict[str, Any]:
     """Read a snapshot from any store (including a read-only connection)."""
+    aggregate = run_id == "all"
+    run_id = resolve_run_id(store, run_id)
     data = store.stats(run_id)
     snapshot = dict(data)
     snapshot["run_id"] = run_id
@@ -89,7 +101,7 @@ def read_snapshot(store: Any, run_id: str | None = None, *, errors: int = 3) -> 
     snapshot["reported_metrics"] = [
         {"name": row.name, "value": row.value, "label": row.label, "display": row.display}
         for row in read_reported_metrics(store, run_id=run_id)
-    ]
+    ] if run_id is not None and not aggregate else []
     run = store.get_run(run_id) if run_id else None
     if run is not None:
         snapshot["elapsed_s"] = round((run.ended_at or time.time()) - run.started_at, 2)

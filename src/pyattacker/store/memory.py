@@ -173,6 +173,12 @@ class MemoryStore(VisitStore):
     def get_run(self, run_id: str) -> RunRecord | None:
         return self._runs.get(run_id)
 
+    def latest_run_id(self) -> str | None:
+        if not self._runs:
+            return None
+        return max(enumerate(self._runs.values()),
+                   key=lambda entry: (entry[1].started_at, entry[0]))[1].run_id
+
     # ------------------------------------------------------------- pipelines
     def get_pipeline(self, pipeline_id: str) -> PipelineRecord | None:
         return self._pipelines.get(pipeline_id)

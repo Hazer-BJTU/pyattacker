@@ -23,7 +23,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import ConfigError
-from .monitor import read_snapshot
+from .monitor import read_snapshot, resolve_run_id
 from .reported_metrics import read_reported_metrics
 from .store.base import Store, open_store
 
@@ -61,18 +61,20 @@ function showMetrics(rows){
   }
 }
 async function tick(){
-  const s = await (await fetch('stats')).json();
-  document.getElementById('run').textContent = s.run_id || '';
+  const requested = new URLSearchParams(location.search).get('run_id');
+  const statsPath = requested ? 'stats?run_id=' + encodeURIComponent(requested) : 'stats';
+  const s = await (await fetch(statsPath)).json();
+  const scope = 'run_id=' + encodeURIComponent(requested === 'all' ? 'all' : (s.run_id || 'all'));
+  document.getElementById('run').textContent = s.run_id || 'all runs';
   const states = (s.pipelines||{}).by_state||{};
   const cards = [['total',(s.pipelines||{}).total||0],
     ...Object.entries(states).map(([k,v])=>[k,v]),
     ['attempts', s.attempts_total||0], ['events', s.events_total||0]];
   document.getElementById('cards').innerHTML = cards.map(([k,v])=>
     `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
-  const metrics = await (await fetch('metrics')).json();
+  const metrics = await (await fetch('metrics?' + scope)).json();
   showMetrics(metrics.rows);
-  const pipelines = await (await fetch('pipelines?limit=50' +
-    (metrics.run_id ? '&run_id=' + encodeURIComponent(metrics.run_id) : ''))).json();
+  const pipelines = await (await fetch('pipelines?limit=50&' + scope)).json();
   const reports = document.getElementById('pipeline-metrics');
   reports.replaceChildren();
   for(const row of pipelines.rows){
@@ -85,7 +87,7 @@ async function tick(){
     ).join(' · ');
     tr.append(id, details); reports.append(tr);
   }
-  const ev = await (await fetch('events?limit=40')).json();
+  const ev = await (await fetch('events?limit=40&' + scope)).json();
   document.getElementById('events').innerHTML = ev.rows.map(r=>{
     const cls = r.kind.includes('failed')?'f':(r.kind.includes('succeeded')?'s':'');
     return `<tr><td class="${cls}">${r.kind}</td><td>${(r.pipeline_id||'').slice(0,12)}</td>`+
@@ -208,12 +210,8 @@ class StatsServer:
             pipeline_id = (query.get("pipeline_id") or [None])[0]
 
             def _metrics(store: Any) -> Any:
-                rows = read_reported_metrics(store, run_id=run_id, pipeline_id=pipeline_id)
-                # With no selected run, show the most recently updated reporting run.
-                selected = run_id
-                if selected is None and rows:
-                    selected = max(rows, key=lambda row: row.updated_at).run_id
-                    rows = [row for row in rows if row.run_id == selected]
+                selected = resolve_run_id(store, run_id)
+                rows = read_reported_metrics(store, run_id=selected, pipeline_id=pipeline_id) if selected else []
                 return selected, [
                     {"run_id": row.run_id, "pipeline_id": row.pipeline_id,
                      "name": row.name, "value": row.value, "label": row.label,
@@ -236,7 +234,7 @@ class StatsServer:
                         "pool": event.pool,
                         "data": event.data,
                     }
-                    for event in store.events(run_id=run_id, limit=limit)
+                    for event in store.events(run_id=resolve_run_id(store, run_id), limit=limit)
                 ]
             )
             return 200, {"rows": rows, "limit": limit}
@@ -246,7 +244,8 @@ class StatsServer:
 
             def _pipelines(store: Any) -> Any:
                 rows = []
-                for record in store.pipelines(run_id=run_id, state=state, limit=limit):
+                selected = resolve_run_id(store, run_id)
+                for record in store.pipelines(run_id=selected, state=state, limit=limit):
                     # `handoffs` costs one small indexed read per returned row, and is how this view says
                     # "the cursor below is a position, not progress": a pipeline with handoffs skipped
                     # stations, so n_tasks_done is where it is, not how many tasks ran.
@@ -304,7 +303,9 @@ class StatsServer:
             return 200, {"rows": rows}
 
         if path == "/errors":
-            return 200, {"rows": self._read(lambda store: store.errors(run_id=run_id, limit=limit))}
+            return 200, {"rows": self._read(lambda store: store.errors(
+                run_id=resolve_run_id(store, run_id), limit=limit
+            ))}
 
         return 404, {"error": f"unknown path {path!r}", "paths": _PATHS}
 

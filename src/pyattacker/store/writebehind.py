@@ -148,6 +148,10 @@ class WriteBehindStore:
         self.flush()
         return self.inner.get_run(run_id)
 
+    def latest_run_id(self) -> str | None:
+        reader = getattr(self.inner, "latest_run_id", None)
+        return reader() if callable(reader) else None
+
     # ----------------------------------------------------- pipelines (synchronous)
     def get_pipeline(self, pipeline_id: str) -> PipelineRecord | None:
         self.flush()

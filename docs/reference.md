@@ -2198,7 +2198,11 @@ third-party stores: reporting on a store without it raises `StoreFeatureUnsuppor
 `/metrics?run_id=...` returns `{"run_id": ..., "rows": [{"run_id", "pipeline_id", "name",
 "value", "label", "display", "updated_at"}, ...]}`. Add `pipeline_id=...` to read a pipeline's
 reported values; `/pipelines` also includes a `reported_metrics` array in each row. With no run ID,
-`/metrics` selects the run with the most recently updated run-level metric. The HTML dashboard shows
+`read_snapshot()`, `watch`, and every `StatsServer` endpoint select the latest started run, including
+runs that reported only pipeline-scoped values. The HTML dashboard resolves that run through `/stats`
+and passes its ID to `/metrics`, `/pipelines`, and `/events` for a consistent refresh. Use
+`?run_id=all` (or `--run-id all` for `watch`/`serve`) for aggregate operational data; that view
+does not show application metrics from an arbitrarily chosen run. The HTML dashboard shows
 run-level values as cards; the terminal `watch` view shows them too. The HTTP server remains read-only,
 and metric writes use the active Runner's store connection.
 
@@ -2236,7 +2240,7 @@ with StatsServer("runs/qa.db", port=8787) as server:
 | `/` | a small auto-refreshing dashboard |
 | `/stats`, `/metrics`, `/events`, `/pipelines`, `/resources`, `/errors` | JSON |
 
-`/stats` carries `handoffs_total` (commits by the selected run, or all commits without a run filter), and each `/pipelines` row carries a
+`/stats` carries `handoffs_total` (commits by the selected run, or all commits with `run_id=all`), and each `/pipelines` row carries a
 `handoffs` count of active-execution records, `handoffs_historical` count of all records and
 `handoff_floor`, next to `n_tasks_done`/`n_tasks_total` — on a control-enabled pipeline those two are a
 **position** in the chain, not a count of tasks that ran, so a non-zero `handoffs` is what says "this
