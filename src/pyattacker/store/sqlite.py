@@ -973,7 +973,8 @@ class SqliteStore(VisitStore):
         )
 
     def iter_events(
-        self, *, pipeline_id: str | None = None, run_id: str | None = None
+        self, *, pipeline_id: str | None = None, run_id: str | None = None,
+        kind: str | None = None
     ) -> Iterator[EventRecord]:
         """``event_id`` (total, monotonic); bounded by the mark taken when iteration starts."""
         where: list[str] = []
@@ -984,6 +985,9 @@ class SqliteStore(VisitStore):
         if run_id:
             where.append("run_id=?")
             args.append(run_id)
+        if kind:
+            where.append("kind=?")
+            args.append(kind)
         yield from self._iter_keyset(
             "events", where, args,
             columns=("event_id",), mapper=_to_event, bound="event_id",
@@ -1053,7 +1057,8 @@ class SqliteStore(VisitStore):
         return [_to_attempt(r) for r in self._conn.execute(sql, args).fetchall()]
 
     def events(
-        self, *, pipeline_id: str | None = None, run_id: str | None = None, limit: int = 200
+        self, *, pipeline_id: str | None = None, run_id: str | None = None,
+        kind: str | None = None, limit: int = 200
     ) -> list[EventRecord]:
         sql = "SELECT * FROM events WHERE 1=1"
         args: list[Any] = []
@@ -1063,6 +1068,9 @@ class SqliteStore(VisitStore):
         if run_id:
             sql += " AND run_id=?"
             args.append(run_id)
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
         sql += " ORDER BY event_id DESC LIMIT ?"
         args.append(limit)
         rows = self._conn.execute(sql, args).fetchall()
@@ -1130,6 +1138,13 @@ class SqliteStore(VisitStore):
             ),
             "events_total": self._conn.execute(
                 f"SELECT COUNT(*) AS n FROM events {task_where}", task_args
+            ).fetchone()["n"],
+            # Count failed terminal repair attempts from the event log, without materializing it.
+            # This is a per-run observability metric: the live run still uses RunReport.repair_failures.
+            "repair_failures": self._conn.execute(
+                f"SELECT COUNT(*) AS n FROM events {task_where} "
+                f"{'AND' if task_where else 'WHERE'} kind='pipeline.terminal_repair_failed'",
+                task_args,
             ).fetchone()["n"],
         }
 

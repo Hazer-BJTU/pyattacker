@@ -354,6 +354,14 @@ def _cmd_report(args: argparse.Namespace) -> int:
                     ["pipeline", "task", "error", "message"],
                 )
             )
+        # Repair failures are a post-hoc observability metric: they may belong to a run
+        # that no longer owns any pipeline row (the row stays owned by the original failed run).
+        # So we query globally, not scoped to the latest run_id.
+        repair_events = store.events(kind="pipeline.terminal_repair_failed", limit=100)
+        if repair_events:
+            print(f"\nTerminal repair failures: {len(repair_events)}")
+            for event in repair_events:
+                print(f"  - {event.pipeline_id}: {event.data.get('phase', '?')}")
         if args.json:
             print(json.dumps(stats, ensure_ascii=False, indent=2))
     finally:

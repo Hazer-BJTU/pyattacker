@@ -37,6 +37,7 @@ class MergedReport:
     events_total: int = 0
     attempts_total: int = 0
     handoffs_total: int = 0
+    repair_failures: int = 0
 
     # ----------------------------------------------------------------- views
     def stats(self) -> dict[str, Any]:
@@ -70,6 +71,7 @@ class MergedReport:
             "attempts_total": self.attempts_total,
             "handoffs_total": self.handoffs_total,
             "events_total": self.events_total,
+            "repair_failures": self.repair_failures,
             "duplicates_folded": self.duplicates,
         }
 
@@ -83,7 +85,8 @@ class MergedReport:
             + (f"  (folded {self.duplicates} duplicate rows)" if self.duplicates else ""),
             "  " + " ".join(f"{k}={v}" for k, v in sorted(by_state.items()))
             + f"  attempts={stats['attempts_total']} events={stats['events_total']}"
-            + (f"  handoffs={stats['handoffs_total']}" if stats["handoffs_total"] else ""),
+            + (f"  handoffs={stats['handoffs_total']}" if stats["handoffs_total"] else "")
+            + (f"  repair_failures={stats['repair_failures']}" if stats["repair_failures"] else ""),
             f"  pipeline latency ms: p50={durations['p50']} p95={durations['p95']} max={durations['max']}",
         ]
         tasks = stats["tasks"]["by_name"]
@@ -147,6 +150,7 @@ def merge_reports(
     events_total = 0
     attempts_total = 0
     handoffs_total = 0
+    repair_failures = 0
     paths: list[str] = []
     run_ids: list[str] = []
     for source in sources:
@@ -159,6 +163,10 @@ def merge_reports(
             events_total += int(counts.get("events_total") or 0)
             attempts_total += int(counts.get("attempts_total") or 0)
             handoffs_total += int(counts.get("handoffs_total") or 0)
+            # Repair failures are a post-hoc observability metric: we count them globally,
+            # not scoped to run_id, because the failed repair attempt may belong to a run
+            # that no longer owns any pipeline row.
+            repair_failures += len(store.events(kind="pipeline.terminal_repair_failed", limit=100000))
             for row in store.export_rows(run_id=run_id):
                 key = row["pipeline_id"]
                 run_ids.append(row["run_id"])
@@ -180,4 +188,5 @@ def merge_reports(
         events_total=events_total,
         attempts_total=attempts_total,
         handoffs_total=handoffs_total,
+        repair_failures=repair_failures,
     )

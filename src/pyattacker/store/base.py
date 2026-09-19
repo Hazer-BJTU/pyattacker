@@ -430,7 +430,8 @@ class Store(Protocol):
     ) -> list[PipelineRecord]: ...
 
     def events(
-        self, *, pipeline_id: str | None = None, run_id: str | None = None, limit: int = 200
+        self, *, pipeline_id: str | None = None, run_id: str | None = None,
+        kind: str | None = None, limit: int = 200
     ) -> list[EventRecord]: ...
 
     def stats(self, run_id: str | None = None) -> dict[str, Any]: ...
@@ -478,7 +479,8 @@ class PagedStore(Protocol):
     ) -> Iterator[AttemptRecord]: ...
 
     def iter_events(
-        self, *, pipeline_id: str | None = None, run_id: str | None = None
+        self, *, pipeline_id: str | None = None, run_id: str | None = None,
+        kind: str | None = None
     ) -> Iterator[EventRecord]: ...
 
     def iter_artifacts(self, *, pipeline_id: str) -> Iterator[Artifact]: ...
@@ -578,7 +580,8 @@ def iter_attempts(
 
 
 def iter_events(
-    store: Store, *, pipeline_id: str | None = None, run_id: str | None = None
+    store: Store, *, pipeline_id: str | None = None, run_id: str | None = None,
+    kind: str | None = None
 ) -> Iterator[EventRecord]:
     """Stream events in insertion order (``event_id``), oldest first.
 
@@ -589,12 +592,12 @@ def iter_events(
     """
     native = getattr(store, "iter_events", None)
     if callable(native):
-        yield from native(pipeline_id=pipeline_id, run_id=run_id)
+        yield from native(pipeline_id=pipeline_id, run_id=run_id, kind=kind)
     else:
         # The list API's own `limit` means "the most recent N" (default 200) and cannot express
         # "everything", so the fallback asks for the largest limit it can represent. Both built-in
         # stores return the selected events oldest first, which is the order the export documents.
-        yield from store.events(pipeline_id=pipeline_id, run_id=run_id, limit=_LIST_LIMIT_ALL)
+        yield from store.events(pipeline_id=pipeline_id, run_id=run_id, kind=kind, limit=_LIST_LIMIT_ALL)
 
 
 def iter_artifacts(store: Store, *, pipeline_id: str) -> Iterator[Artifact]:

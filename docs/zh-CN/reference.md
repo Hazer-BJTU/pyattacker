@@ -1344,11 +1344,11 @@ with closing(open_store("runs/qa.db")) as store:      # reopen a finished run, a
 
 | 方法 | 返回值 |
 |---|---|
-| `stats(run_id=None)` | 计数、状态分布、延迟百分位；`handoffs_total` 统计记下来的跳转次数（普通运行为 0） |
+| `stats(run_id=None)` | 计数、状态分布、延迟百分位；`handoffs_total` 统计记下来的跳转次数（普通运行为 0）；`repair_failures` 统计按 run 过滤的终端修复失败次数 |
 | `errors(*, run_id=None, limit=20)` | 失败项，含任务名、错误类型和消息 |
 | `export_rows(*, run_id=None)` | 嵌套的流水线行：含任务、工件和交接 |
 | `attempts(*, pipeline_id=None, ...)` | 尝试历史 |
-| `events(*, pipeline_id=None, limit=...)` | 事件流 |
+| `events(*, pipeline_id=None, run_id=None, kind=None, limit=...)` | 事件流，可按事件类型过滤 |
 | `close()` | 关连接 |
 
 ```python
@@ -1449,7 +1449,7 @@ handoffs，对反向流水线还有访问计数器，所以历史发生实例仍
 | `iter_pipelines(store, *, run_id=None, state=None)` | `PipelineRecord`，先按 `created_at` 再按 `pipeline_id` |
 | `iter_tasks(store, pipeline_id=None, *, run_id=None)` | `TaskRecord`，按 `pipeline_id`、`seq`，再按 `task_run_id` |
 | `iter_attempts(store, *, run_id=None, pipeline_id=None)` | `AttemptRecord`，按 `attempt_id`（写入顺序） |
-| `iter_events(store, *, pipeline_id=None, run_id=None)` | `EventRecord`，按 `event_id`（写入顺序，最旧在前） |
+| `iter_events(store, *, pipeline_id=None, run_id=None, kind=None)` | `EventRecord`，按 `event_id`（写入顺序，最旧在前），可按事件类型过滤 |
 | `iter_artifacts(store, *, pipeline_id)` | 某条流水线的 `Artifact`，先按 `seq` 再按 `artifact_id` |
 
 每种顺序都**以唯一键结尾**，不是装饰性细节：`tasks` 以

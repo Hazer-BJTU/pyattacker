@@ -118,6 +118,8 @@ pyattacker report STORE [STORE ...] [--run-id ID] [--errors N] [--json] [--artif
 
 多个存储会合并成一个一致的视图：按 `pipeline_id` 去重（状态最好的胜出，平局按最新完成时间判），统计量从合并后的行重算，还会告诉你折叠了多少行。`--errors N` 打印前 N 个失败和错误类别。`--json` 用对象格式输出同样的数字。
 
+如果存储里有过终端修复失败的尝试，report 会单独列出（`Terminal repair failures: N`），每条注明流水线和失败阶段。这是事后可观测性指标：实时运行的 `RunReport.repair_failures` 是运行本地的计数器，事后视图从事件日志里全局统计。
+
 开了交接的运行会在摘要行里注明（`... attempts: total=12 handoffs=2`），`export` 的 `--rows pipelines` 会带上账本本身（见[进阶：交接](reference.md#进阶交接可选启用)）。
 
 ## `watch` —— 实时监控

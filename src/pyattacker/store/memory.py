@@ -488,7 +488,8 @@ class MemoryStore(VisitStore):
                 yield record
 
     def iter_events(
-        self, *, pipeline_id: str | None = None, run_id: str | None = None
+        self, *, pipeline_id: str | None = None, run_id: str | None = None,
+        kind: str | None = None
     ) -> Iterator[EventRecord]:
         """``event_id`` (total, monotonic); bounded by the mark taken when iteration starts."""
         mark = max(
@@ -498,6 +499,7 @@ class MemoryStore(VisitStore):
                 if event.event_id is not None
                 and (pipeline_id is None or event.pipeline_id == pipeline_id)
                 and (run_id is None or event.run_id == run_id)
+                and (kind is None or event.kind == kind)
             ),
             default=None,
         )
@@ -508,7 +510,7 @@ class MemoryStore(VisitStore):
                 return  # appended after the mark: bounded, like the SQLite side
             if (pipeline_id is None or event.pipeline_id == pipeline_id) and (
                 run_id is None or event.run_id == run_id
-            ):
+            ) and (kind is None or event.kind == kind):
                 yield event
 
     def iter_artifacts(self, *, pipeline_id: str) -> Iterator[Artifact]:
@@ -531,13 +533,15 @@ class MemoryStore(VisitStore):
         return items[:limit] if limit else items
 
     def events(
-        self, *, pipeline_id: str | None = None, run_id: str | None = None, limit: int = 200
+        self, *, pipeline_id: str | None = None, run_id: str | None = None,
+        kind: str | None = None, limit: int = 200
     ) -> list[EventRecord]:
         items = [
             e
             for e in self._events
             if (pipeline_id is None or e.pipeline_id == pipeline_id)
             and (run_id is None or e.run_id == run_id)
+            and (kind is None or e.kind == kind)
         ]
         return items[-limit:]
 
@@ -585,6 +589,14 @@ class MemoryStore(VisitStore):
             ),
             "events_total": sum(
                 1 for e in self._events if run_id is None or e.run_id == run_id
+            ),
+            # Count failed terminal repair attempts from the event log, mirroring SqliteStore's
+            # aggregate query. This is a per-run observability metric: the live run still uses
+            # RunReport.repair_failures, which is run-local.
+            "repair_failures": sum(
+                1 for e in self._events
+                if (run_id is None or e.run_id == run_id)
+                and e.kind == "pipeline.terminal_repair_failed"
             ),
         }
 

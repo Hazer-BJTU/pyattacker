@@ -869,6 +869,43 @@ def test_a_failed_terminal_repair_is_visible_to_the_caller_and_exits_non_zero(
     assert payload["pipelines"]["by_state"] == {}
 
 
+def test_posthoc_report_shows_repair_failures(
+    tmp_path, monkeypatch, capsys
+):
+    """Issue #46: a post-hoc `report` must surface failed repair attempts from the event log."""
+    db = tmp_path / "repair.db"
+    cfg = _write_config(tmp_path, "repair.json", REPAIR_CONFIG)
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 0
+    pid = _poison_terminal_row(db)
+
+    # Inject a failing repair attempt
+    monkeypatch.setattr("pyattacker.runner.open_store", _failing_open_store)
+    assert main(["run", "-c", str(cfg), "--store", str(db)]) == 1
+
+    # The run-local counter worked, but now we close and re-open the store
+    # (post-hoc view) and check that stats() and events(kind=...) expose the failure.
+    store = SqliteStore(str(db))
+    stats = store.stats()
+    assert stats["repair_failures"] == 1
+
+    # events(kind=...) filters correctly
+    repair_events = store.events(kind="pipeline.terminal_repair_failed")
+    assert len(repair_events) == 1
+    assert repair_events[0].pipeline_id == pid
+
+    # Other kinds are excluded
+    all_events = store.events()
+    assert len(all_events) > len(repair_events)
+
+    store.close()
+
+    # Now run `pyattacker report` on the store and check it shows the repair failure
+    out = capsys.readouterr().out  # clear previous output
+    assert main(["report", str(db)]) == 0
+    out = capsys.readouterr().out
+    assert "Terminal repair failures: 1" in out
+
+
 # ---------------------------------------------------------- worker liveness (#44)
 class _WorkerDied(BaseException):
     """A direct ``BaseException``: nothing in the worker's own handler chain can contain it."""
