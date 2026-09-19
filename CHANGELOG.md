@@ -56,6 +56,24 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+* **`merge_reports` no longer inflates its counters when it folds a duplicate** (issue #59). Rows were
+  always de-duplicated by `pipeline_id`, but `attempts_total` and `handoffs_total` were summed over the
+  sources — before de-duplication — so `pyattacker report a.db a.db`, or one pipeline living in two shards
+  after a shard-count change, doubled them while `pipelines.total` stayed put, contradicting the documented
+  promise that merging is idempotent. Both are now recomputed from the surviving rows (attempts from the
+  row's own `attempts_total`, handoffs from the nested ledger it carries), which is also what the module
+  docstring, `docs/design.md` §9 and `docs/reference.md` already claimed. The event log genuinely cannot be
+  re-derived — an event is not part of a pipeline row — so instead of pretending, it is renamed
+  `source_events_total` and documented as a raw per-source total; `summary()` prints it as
+  `source_events=`. Regression tests cover the same store passed twice (as two paths and as two objects),
+  one pipeline present in two shards, and the run-filtered handoff count; `tutorial.md` step 12 now shows
+  the identical `attempts=` on both sides of a duplicated merge (whose printed transcript had also drifted
+  from what the program actually prints). Counting from rows strengthens what a custom store must export,
+  so the two fields it reads are now explicit: `attempts_total` is required and a row without it raises a
+  `ConfigError` naming the row and source instead of quietly counting `0`, while a row that does not nest
+  the optional `handoffs` ledger is read through the store's own `handoffs()` capability when it has one
+  (a store with neither has no jumps, which is a true `0`).
+
 * Backward-traversal follow-up: an explicit fresh start now resets a backward pipeline's control budget
   while preserving durable visit counters and audit history (the counters were never reset — reusing visit
   IDs would collide with historical occurrences), so a pipeline that failed *because* it spent its budget
@@ -97,6 +115,15 @@ All notable changes to this project are documented here. The format follows
   escape to return unions containing `Handoff`.
 
 ### Changed
+
+* **`MergedReport.events_total` is renamed `source_events_total`** (issue #59). The old name sat in the same
+  report as the de-duplicated counters without saying that it was the one number which was not de-duplicated;
+  the new name states the scope, `stats()` carries it under the same key, and `summary()` labels it
+  `source_events=`. Nothing else on `MergedReport` changed name. `MergedReport.events_total` survives as a
+  deprecated read-only alias (removed at 1.0) so an attribute read keeps working, but it is deliberately not a
+  second key in `stats()`: the point is that the JSON a report emits names one scope per number. Note that
+  `store.stats()["events_total"]` is untouched and is not the asymmetry it looks like — for a single store it
+  is the same measurement as the merged report's `source_events_total`, which the new test pins.
 
 * **The backward-traversal guide is merged into the tutorial and the reference.** `docs/backward.md` was a
   seventh document that a reader had to find before they could use the feature; its usage now lives where

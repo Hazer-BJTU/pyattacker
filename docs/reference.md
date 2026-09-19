@@ -1414,7 +1414,7 @@ Reading a live store while a run writes to it is supported — WAL allows one wr
 |---|---|
 | `stats(run_id=None)` | counts, state distribution, latency percentiles; `handoffs_total` counts recorded jumps (0 for ordinary runs) |
 | `errors(*, run_id=None, limit=20)` | failures with task name, error type and message |
-| `export_rows(*, run_id=None)` | nested pipeline rows: tasks, artifacts and handoffs included |
+| `export_rows(*, run_id=None)` | nested pipeline rows: tasks, artifacts and handoffs included; each row carries `attempts_total`, which `merge_reports` counts from |
 | `attempts(*, pipeline_id=None, ...)` | attempt history |
 | `events(*, pipeline_id=None, run_id=None, kind=None, limit=...)` | the event stream, optionally filtered by event kind |
 | `count_events(*, kind=None, run_id=None, pipeline_id=None)` | exact count of matching events, via aggregate query (no materialization) |
@@ -1741,15 +1741,33 @@ when you are driving a cluster yourself.
 merge_reports(paths) -> MergedReport
 ```
 
-De-duplicates by `pipeline_id` (best state wins, latest finish breaks ties), then **recomputes** statistics
-from the merged rows. Merging is idempotent, so a store counted twice does not inflate anything.
+De-duplicates by `pipeline_id` (best state wins, latest finish breaks ties), then **recomputes** the
+workload counters from the surviving rows: `pipelines`, `tasks`, `attempts_total` and `handoffs_total`
+describe the union, so merging is idempotent — a store counted twice, or one pipeline present in two
+shards after a shard-count change, cannot inflate them.
+
+`source_events_total` is the deliberate exception, and is named for it: events do not hang off a pipeline
+row, so nothing in the merged rows says which of two copies owns an event. It is a raw total over the
+sources you passed, duplicates included.
+
+Reading the counters off the rows strengthens what a custom store's `export_rows()` has to provide, so it is
+worth being precise about the two fields:
+
+* **`attempts_total` is required.** It is a core part of a pipeline row (`PipelineRecord.attempts_total`);
+  a row without it raises a `ConfigError` naming the row and its source, rather than silently counting `0`.
+* **The nested `handoffs` ledger is optional**, because the ledger itself is an optional capability. A row
+  that does not nest it is read through the store's own `handoffs(pipeline_id=...)` when the store has one —
+  the same capability the nesting comes from — and a store with neither has no jumps, which is `0` and true.
 
 | `MergedReport` member | Meaning |
 |---|---|
 | `rows` | the merged pipeline rows |
 | `duplicates` | how many rows were folded away |
 | `sources` | which stores contributed |
-| `stats()` | recomputed statistics |
+| `attempts_total`, `handoffs_total` | recomputed from the surviving rows, so de-duplicated |
+| `source_events_total` | raw event-log rows across the given sources, **not** de-duplicated |
+| `events_total` | deprecated alias of `source_events_total`, on the object only (removed at 1.0) |
+| `stats()` | the same counters, plus the recomputed pipeline and task statistics |
 | `summary()` | human-readable |
 | `errors(limit=20)` | failures across all shards |
 | `export(path, *, fmt="jsonl", kind="pipelines")` | write the merged view |
@@ -1914,8 +1932,8 @@ read through the paged helpers in batches of `ITER_BATCH_SIZE` (1000) rows, and 
 pipelines and then streams each one's artifacts, so the memory unit is **one pipeline**, not the store. A
 `pipelines` row is itself nested, so exporting that kind materializes one pipeline's tasks and artifacts at
 a time. `merge_reports` is the deliberate exception: de-duplicating by `pipeline_id` needs the winning row
-of every pipeline, so the merged rows are held in memory (it counts events/attempts with aggregate queries
-instead of reading the log).
+of every pipeline, so the merged rows are held in memory (the one counter that is not read off those rows —
+`source_events_total` — comes from each source's aggregate query instead of materializing the log).
 
 ---
 

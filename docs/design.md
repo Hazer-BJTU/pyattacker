@@ -916,8 +916,10 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
    With 4 shards and 20 pipelines, expect the split to look like 6/14 sometimes; it evens out at scale.
 9. **A merged report is a union, not a sum**: the same pipeline can exist in two shards after a shard-count
    change, so `merge_reports` de-duplicates by `pipeline_id` (best state wins, latest finish breaks ties) and
-   *recomputes* statistics from the merged rows. It reports how many rows it folded so the number is never
-   hidden.
+   *recomputes* its workload counters — `attempts_total`, `handoffs_total` — from the surviving rows. It
+   reports how many rows it folded so the number is never hidden. The event log cannot be attributed to one
+   of two copies of a pipeline, so it is not recomputed and not silently mixed in: it is reported raw as
+   `source_events_total`, which says what it is.
 10. **A pipeline is a linear chain**: the kernel is implemented in terms of "nodes + dependency edges", so
     adding `Parallel/Gather` is just syntactic sugar, but it is deliberately not exposed. Use `fanout(...)`
     inside a task instead: branches stay one step in the record, at the cost of group-level retry granularity.

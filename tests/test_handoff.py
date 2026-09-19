@@ -1101,10 +1101,15 @@ def test_the_record_exposes_the_handoff_everywhere(tmp_path):
         for kind in ("tasks", "attempts", "events", "artifacts"):
             assert list(iter_rows(store, kind=kind)), kind
 
-        # a merged report recomputes the counter from the merged rows' owner stats
+        # a merged report recomputes the counter from each surviving pipeline's nested ledger
         merged = merge_reports([store])
         assert merged.stats()["handoffs_total"] == 1
         assert "handoffs=1" in merged.summary()
+        # ... so folding the same store twice counts the jump once, like every other workload counter
+        twice = merge_reports([store, store])
+        assert twice.duplicates == 1
+        assert twice.stats()["handoffs_total"] == 1
+        assert twice.stats()["attempts_total"] == merged.stats()["attempts_total"]
 
         # and the HTTP view names the count next to the cursor it explains
         server = StatsServer(store, port=0)
