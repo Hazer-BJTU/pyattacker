@@ -1074,9 +1074,9 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
   (a counterpart exists, fenced code blocks are byte-identical in order, heading levels, language switchers,
   runnable markers and every relative link and anchor match); and the facts that rot silently are asserted
   instead of trusted — the version in this document against `pyproject.toml`, every "N runnable steps" claim
-  against the number of `# tutorial/` blocks, and every monitoring route the reference names against
-  `StatsServer`'s real route table. Prose accuracy stays a review question: the machine checks what has a
-  source of truth.
+  against the number of `# tutorial/` blocks, and every route the monitoring endpoint table advertises against
+  the routes `StatsServer` actually answers. Prose accuracy stays a review question: the machine checks what
+  has a source of truth.
 
 All time-related logic (backoff, circuit-break cooldown) goes through an injectable `Clock`, and tests use
 `tests/helpers.py::FakeClock` to turn time into a controllable variable, making them both deterministic and fast.

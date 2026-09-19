@@ -11,7 +11,9 @@ Issue #60 was exactly that drift, and the answer is to give each of those claims
 
 * the version in the header of both design documents, against ``pyproject.toml``;
 * every "N runnable steps" claim, against the number of ``# tutorial/<name>.py`` blocks in the tutorial;
-* every route the monitoring section names, against the routes ``StatsServer`` actually answers.
+* every route in the monitoring section's endpoint table, against the routes ``StatsServer`` actually
+  answers (the table, not the prose: a sentence saying there is no ``/artifacts`` endpoint is not an
+  advertisement for one).
 
 The checks are deliberately narrow, and each fails only when a number or a name genuinely disagrees with
 the code. Whether prose is *accurate* remains a review question — there is no test for "the warning
@@ -43,7 +45,15 @@ NUMBER_WORDS = {
     "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
     "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
 }
+# The version a design document states about itself, compared for equality (never as a substring):
+# "> Version: 0.2.0 ..." / the Chinese header line. The fullwidth colon is escaped because ruff flags it
+# in a literal (RUF001). `\d+(?:\.\d+)*` also rejects "0.2.0.1" and "pre-0.2.0".
+VERSION_CLAIM = re.compile(r">\s*(?:Version:|版本\uff1a)\s*v?(\d+(?:\.\d+)*)")
+# Routes are read from the monitoring section's endpoint table, not from prose: `\`/x\`` appearing in a
+# sentence ("there is no `/artifacts` endpoint") is not an advertisement, and a parser that cannot tell the
+# difference would demand a route that does not exist.
 ROUTE = re.compile(r"`(/[A-Za-z0-9_.\-/]*)`")
+ROUTE_TABLE_ROW = re.compile(r"^\|.*`/")
 
 
 def _read(relative: str) -> str:
@@ -55,10 +65,14 @@ def _tutorial_step_programs() -> int:
 
 
 def test_the_version_the_design_documents_state_is_the_packaged_one():
-    """A release bumps ``pyproject.toml``; the design header is what everyone forgets to bump with it."""
-    version = re.search(r'^version = "([^"]+)"', _read("pyproject.toml"), re.MULTILINE)
-    assert version, "pyproject.toml has no version"
-    expected = version.group(1)
+    """A release bumps ``pyproject.toml``; the design header is what everyone forgets to bump with it.
+
+    The documented version is extracted and compared for **equality** — a substring test would accept
+    ``10.2.0`` or ``0.2.0.1`` for ``0.2.0``, which is exactly the drift this guard exists to catch.
+    """
+    packaged = re.search(r'^version = "([^"]+)"', _read("pyproject.toml"), re.MULTILINE)
+    assert packaged, "pyproject.toml has no version"
+    expected = packaged.group(1)
 
     for document in DESIGN_DOCS:
         header = [
@@ -66,7 +80,9 @@ def test_the_version_the_design_documents_state_is_the_packaged_one():
             if line.startswith("> Version:") or line.startswith("> 版本\uff1a")
         ]
         assert len(header) == 1, f"{document}: expected exactly one version line, found {header}"
-        assert expected in header[0], f"{document}: states {header[0]!r}, package is {expected}"
+        stated = VERSION_CLAIM.search(header[0])
+        assert stated, f"{document}: no version number in {header[0]!r}"
+        assert stated.group(1) == expected, f"{document} states {stated.group(1)!r}, package is {expected!r}"
 
 
 @pytest.mark.parametrize("document", STEP_CLAIM_DOCS)
@@ -84,20 +100,27 @@ def test_every_runnable_step_claim_counts_the_tutorial_programs(document):
 
 
 @pytest.mark.parametrize("document", REFERENCE_DOCS)
-def test_every_monitoring_route_the_reference_names_is_actually_served(document):
-    """Issue #60: the reference promised payloads on routes that did not exist."""
+def test_every_monitoring_route_the_reference_advertises_is_actually_served(document):
+    """Issue #60: the reference promised payloads on routes that did not exist.
+
+    Only the monitoring section's endpoint table counts as an advertisement. Route-looking code spans in the
+    prose around it do not: "there is no `/artifacts` endpoint" must not make the guard demand one, which is
+    why the parser reads table rows instead of every backticked ``/…`` in the section.
+    """
     body = _read(document)
     heading = re.compile(r"^## (?:Monitoring|监控)\s*$", re.MULTILINE)
     match = heading.search(body)
     assert match, f"{document}: no monitoring section"
     section = body[match.end():].split("\n## ", 1)[0]
-    documented = set(ROUTE.findall(section))
-    assert documented, f"{document}: no routes extracted — the section moved or the formatting changed"
+    table = [line for line in section.splitlines() if ROUTE_TABLE_ROW.match(line)]
+    assert table, f"{document}: no route table found in the monitoring section"
+    documented = set(ROUTE.findall("\n".join(table)))
+    assert documented, f"{document}: the endpoint table names no routes"
 
     server = StatsServer(MemoryStore(), port=0)
     try:
         for path in sorted(documented):
             status, _ = server.payload(path, {})
-            assert status == 200, f"{document} documents {path!r}, which the server answers {status} for"
+            assert status == 200, f"{document} advertises {path!r}, which the server answers {status} for"
     finally:
         server.stop()
