@@ -6,35 +6,27 @@
 pyattacker {run,resume,report,watch,export,serve,plugins,validate,demo}
 ```
 
-这里的一切同样可以通过 `python -m pyattacker ...` 访问。命令分为三组：
-**执行工作**（`run`、`resume`、`demo`）、**读取结果**（`report`、`watch`、`export`、`serve`），以及
-**检查环境**（`validate`、`plugins`）。
+所有命令也可以通过 `python -m pyattacker ...` 调用。分三组：
+**跑任务**（`run`、`resume`、`demo`）、**看结果**（`report`、`watch`、`export`、`serve`）、**查环境**（`validate`、`plugins`）。
 
 ## 退出码
 
 | 代码 | 含义 |
 |---|---|
-| `0` | 所有流水线都成功（或因已完成而被跳过） |
-| `1` | 本次运行已结束但部分流水线失败，或本次运行无法修复其中一条（`repair_failures`） |
-| `2` | 配置错误 —— 什么都没运行；以具名框架错误（`WorkerCrashed`、`StoreUnavailable`）结束的运行也计入此类 |
-| `130` | 被中断（SIGINT）；挂起和执行中的流水线都被记录为可恢复 |
+| `0` | 全部流水线成功（或已完成被跳过） |
+| `1` | 运行结束但部分流水线失败，或者有流水线修不好（`repair_failures`） |
+| `2` | 配置错误——啥都没跑；以 `WorkerCrashed`、`StoreUnavailable` 这类框架级错误结束的也算 |
+| `130` | 被中断（SIGINT）；挂起和正在跑的流水线都会标记为可恢复 |
 
-`2` 意味着“修好配置”（或“读错误信息”）；`1` 意味着“读报告”。`130` 的运行总是可以安全地
-`resume`。
+`2` 的意思是"改配置"（或者"看错误信息"）；`1` 的意思是"看报告"。`130` 退出的随时可以 `resume`。
 
-`1` 涵盖两种不同的情况，报告会说明是哪一种：一条流水线在本次运行中进入了失败的
-终态（计入 `pipelines.by_state`），以及一条本次运行无法将其从撕裂终态中写入最终状态的
-流水线 —— 即报告（以及 `--summary-format json`）中的 `repair_failures`，因为它的
-行有意保留最初的失败以及产生该失败的那次运行。
+`1` 涵盖两种情况，报告里会写清楚：一种是本次运行中流水线进了失败终态（算在 `pipelines.by_state` 里），另一种是本次运行没法把某条流水线从撕裂状态写回终态——就是报告（和 `--summary-format json`）里的 `repair_failures`，因为它的记录故意保留了最初的失败和那次运行的信息。
 
-`run` 返回 `2` 并不总是配置错误：在自身处理器之外死掉的 worker 会抛出
-`WorkerCrashed`（打印为 `WorkerCrashed: worker for pipeline … died with …`），此时它持有的
-流水线已被记录为失败，运行记录也已关闭。运行自身的记录在错误之后仍然存在，因此
-`pyattacker report <store>` 仍能显示发生了什么；修好根因后用 `--resume` 重新运行。
+`run` 退出 `2` 不一定是配置问题：worker 在自己的处理逻辑之外挂了会抛 `WorkerCrashed`（打印出来是 `WorkerCrashed: worker for pipeline … died with …`），它持有的流水线已经记为失败，运行记录也已经关了。运行记录在错误之后还在，所以 `pyattacker report <store>` 还能看到发生了什么；修好根因后用 `--resume` 接着跑。
 
 ---
 
-## `run` —— 执行声明式配置
+## `run` —— 运行声明式配置
 
 ```bash
 pyattacker run -c config.yaml [options]
@@ -42,53 +34,41 @@ pyattacker run -c config.yaml [options]
 
 | 参数 | 作用 |
 |---|---|
-| `-c, --config PATH` | 配置文件：yaml、toml 或 json。后缀决定使用哪个解析器；yaml 需要可选额外依赖（extra） |
-| `--limit N` | 只运行前 N 条流水线（在真实数据集上做冒烟测试） |
-| `--store PATH` | 覆盖 `run.store`。与 `--shard` 一起使用时原样使用；否则会追加分片后缀 |
-| `--concurrency N` | 覆盖 `run.concurrency` —— 指执行中的尝试数，而不是存活的流水线数 |
-| `--journal {full,summary}` | `full`（默认）存储工件载荷，正是它让恢复能在任务粒度上工作；`summary` 只保留摘要 |
-| `--label TEXT` | 记录在本次运行上的标签，便于日后区分不同的运行 |
-| `--resume` | 跳过已完成的流水线，让失败的流水线从检查点重新开始 |
-| `--retry-succeeded` | 与 `--resume` 一起使用时，连已成功的流水线也重跑。它只扩大*哪些*流水线符合条件，绝不会丢弃未完成流水线的检查点 |
-| `--fresh-restart` | 让已准入的流水线从种子重新开始：丢弃检查点/遍历状态，重置控制预算。只追加的历史（尝试/事件/交接）保留；启用反向的流水线还额外保留其访问发生实例与计数器 |
-| `--strict-leases` | 泄漏的租约会让其任务失败（`LeaseLeakError`），而不是被悄悄强制回收。值得在 CI 中开启 |
-| `--stop-after-failures N` | N 条流水线失败后停止准入新工作（尽力而为：已准入的流水线仍会完成） |
-| `--no-signals` | 不安装 SIGINT/SIGTERM 处理器 |
-| `--artifact-backend SPEC` | 载荷字节存放的位置：`inline`（默认）、`null`、`file:///path` 或 JSON 规格 |
-| `--progress` | 通过对同一存储的第二个连接打印实时进度 |
-| `--shard I/N` | 只运行 `N` 个分片中的第 `I` 个。每个分片写自己的存储文件 |
-| `--shards N` | 在本地派生 N 个子进程，每个分片一个，然后打印合并后的报告 |
-| `--jobs N` | 同时运行多少个分片子进程（配合 `--shards`） |
-| `--summary-format {text,json}` | `json` 为每次运行打印一个摘要对象 |
-| `--no-write-behind` | 每次尝试和事件都立即提交，而不是批处理 |
-| `--strict-env` | 配置中未设置的 `${VAR}` 直接以 `2` 退出，而不是发出警告 |
+| `-c, --config PATH` | 配置文件：yaml、toml 或 json。按后缀选解析器，yaml 需要装可选的 `yaml` extra |
+| `--limit N` | 只跑前 N 条流水线（在真实数据集上做冒烟测试用） |
+| `--store PATH` | 覆盖 `run.store`。和 `--shard` 一起用就直接用这个路径，否则自动加分片后缀 |
+| `--concurrency N` | 覆盖 `run.concurrency`——指的是*同时在跑的尝试数*，不是存活的流水线数 |
+| `--journal {full,summary}` | `full`（默认）存完整产物，这是任务级恢复的基础；`summary` 只存摘要 |
+| `--label TEXT` | 给这次运行打个标签，方便以后区分 |
+| `--resume` | 跳过已完成的流水线，失败的从检查点接着跑 |
+| `--retry-succeeded` | 配 `--resume` 用，连成功的也重跑。它只是扩大*哪些*流水线参与，不会丢未完成流水线的检查点 |
+| `--fresh-restart` | 让已经入队的流水线从种子重新开始：丢检查点和遍历状态，重置交接预算。只追加的历史（尝试/事件/交接记录）保留；开了反向遍历的流水线还额外保留访问实例和计数器 |
+| `--strict-leases` | 租约泄漏直接让任务失败（`LeaseLeakError`），不偷偷强制回收。CI 里建议开 |
+| `--stop-after-failures N` | 攒够 N 条失败就不再接新活（尽力而为：已经接了的会跑完） |
+| `--no-signals` | 不装 SIGINT/SIGTERM 处理器 |
+| `--artifact-backend SPEC` | 产物字节存哪：`inline`（默认）、`null`、`file:///path`，或 JSON 规格 |
+| `--progress` | 开第二条连接实时打印进度 |
+| `--shard I/N` | 只跑 N 个分片中的第 I 个。每个分片写自己的存储文件 |
+| `--shards N` | 本地 fork N 个子进程，每个分片一个，最后合并出报告 |
+| `--jobs N` | 同时跑多少个分片子进程（配合 `--shards`） |
+| `--summary-format {text,json}` | `json` 的话每次运行输出一个摘要对象 |
+| `--no-write-behind` | 每次尝试和事件都立即提交，不批量写 |
+| `--strict-env` | 配置里没设的 `${VAR}` 直接退出码 2，不只是警告 |
 
-`--shard` 和 `--shards` 是两种替代方案：前者是一个进程完成自己那份工作（其余由你编排），
-后者是便捷路径，由 pyattacker 在本地编排。分片分配是内容寻址的流水线键的
-纯函数，因此同一数据集总是以相同方式切分，`--resume`
-会让每条流水线回到拥有它的那个分片。每个子进程的环境变量里还会带上
-`PYATACKER_SHARD=I/N`。
+`--shard` 和 `--shards` 是两种用法：前者是一个进程跑自己那份（其他你自己编排），后者是 pyattacker 本地帮你编排。分片分配是流水线 key 的纯函数——同一批数据永远按同样的方式切分，`--resume` 会把每条流水线放回原来的分片。每个子进程的环境变量里会带 `PYATACKER_SHARD=I/N`。
 
 ## `resume` —— `run --resume`
 
-参数与 `run` 完全相同。把最初使用的那条命令原样重跑，只把 `run` 换成 `resume`：
+参数和 `run` 完全一样。把原来的命令原样再跑一遍，把 `run` 换成 `resume`：
 
 ```bash
 pyattacker run    -c qa.yaml --shards 4 --store runs/qa.db
 pyattacker resume -c qa.yaml --shards 4 --store runs/qa.db
 ```
 
-实际会重跑的内容：成功的流水线什么都不重跑；失败或被中断的流水线，则从第一个没有产出工件的
-任务开始，及其之后的全部任务。工件已在磁盘上的任务绝不会被重新执行，因此
-已经花过钱的请求不会被重发。有两种情况会破坏这一点，二者都会留下一个
-`pipeline.checkpoint_missing` 事件：`journal: summary` 与 `null` 工件后端，两者都不保留
-检查点所需的载荷。
+实际会重跑什么：成功的流水线啥都不重跑；失败或被中断的，从第一个没产出 artifact 的任务开始，后面的全部重跑。产物已经在盘上的任务绝不会再执行一遍——已经花过钱的请求不会重发。有两种情况会打破这个保证，都会留一条 `pipeline.checkpoint_missing` 事件：`journal: summary` 和 `null` 产物后端，这两种都不存检查点需要的载荷。
 
-`--resume` 也是用来认领那些行状态仍写着 `running` 的流水线的 —— 这是硬杀进程留下的形态。
-启用反向的流水线在没有它时绝不会被接管：本次运行会跳过那一行（`pipeline.skipped`，
-`reason="owned_by_another_run"`），而不是分叉出另一场运行可能仍拥有的遍历。应当*丢弃*检查点
-而不是恢复它的重启方式是 `--fresh-restart`（`fresh_restart=True`），它还会
-重置已用尽的交接预算；见[反向遍历](reference.md#恢复与所有权)。
+`--resume` 也是用来认领那些状态还写着 `running` 的流水线的——这是硬杀进程留下的痕迹。开了反向遍历的流水线没它不会被接管：本次运行会跳过那一行（`pipeline.skipped`，`reason="owned_by_another_run"`），不会再分叉出另一场可能还在跑的遍历。要*丢*检查点而不是续跑，用 `--fresh-restart`（`fresh_restart=True`），它还会重置已经用完的交接预算。见[反向遍历](reference.md#恢复与所有权)。
 
 ## `demo` —— 零配置验证安装
 
@@ -96,8 +76,7 @@ pyattacker resume -c qa.yaml --shards 4 --store runs/qa.db
 pyattacker demo [--store PATH] [--pipelines N] [--concurrency N] [--fail-rate F] [--export PATH]
 ```
 
-模拟任务，无网络、无配置文件。`--fail-rate`（例如 `0.3`）会制造失败，这样你就能观察
-重试并读取产生的重试决策记录。适合用作 CI 冒烟测试。
+模拟任务，不联网、不要配置文件。`--fail-rate`（比如 `0.3`）会故意制造失败，方便你观察重试和重试决策记录。CI 冒烟测试够用。
 
 ---
 
@@ -109,48 +88,37 @@ pyattacker bench [--scenario NAME] [--list] [--algorithms A,B] [--seeds N]
                  [--clock {virtual,real}] [--speedup F] [--json PATH] [--markdown PATH] [--quiet]
 ```
 
-无网络，也没有提供方：场景是一个写定的世界（容量周期、令牌桶、延迟
-尾部、故障风暴、三个性格不同的端点），客户端是一组 worker 构成的闭环，
-驱动真实的 `Pool` 和真实的算法，而时间是模拟的。`docs/benchmark.md` 解释了
-各种假设、各项指标以及如何读表；而这里的表格是参数总览。
+不联网，也没有真实接口方：场景是个写死的世界（容量周期、令牌桶、延迟尾部、故障风暴、三个性格不同的端点），客户端是 worker 组成的闭环，跑的是真 `Pool` 和真算法，时间是模拟的。`docs/benchmark.md` 讲场景假设、指标含义和怎么读表；这里只列参数。
 
 | 参数 | 作用 |
 |---|---|
-| `--scenario NAME` | 在哪个模拟世界中运行；默认 `bursty_provider` |
-| `--list` | 打印全部场景、全部算法以及每个指标及其单位和方向，然后以 0 退出 |
-| `--algorithms A,B` | 逗号分隔的子集；默认包含场景能演练的每个算法 —— 若请求一个它声明不适用的算法，仍会运行它，只是该列显示 N/A（例如 `failover`，单资源池场景无法展现它的最佳状态） |
-| `--seeds N` | 对多少个种子取平均，形式为 `scenario.seed + 0 .. N-1`（默认 3；至少 1） |
+| `--scenario NAME` | 用哪个模拟世界，默认 `bursty_provider` |
+| `--list` | 打印所有场景、所有算法、每个指标的单位和方向，然后退出码 0 |
+| `--algorithms A,B` | 逗号分隔的子集；默认跑场景支持的所有算法——就算请求一个它声明不适用的算法，还是会跑，只是那列显示 N/A（比如单资源池场景跑 `failover` 看不出效果） |
+| `--seeds N` | 跑 N 个种子取平均，种子是 `scenario.seed + 0 .. N-1`（默认 3，至少 1） |
 | `--jobs N` | 覆盖场景的作业数（至少 1） |
-| `--concurrency N` | 覆盖 worker 数量 —— 即客户端的执行中数量，因此它既是假设也是成本调节项（至少 1） |
-| `--horizon S` | 覆盖模拟时间视界，它会停止接纳新作业，而不是截断某个作业（正数） |
-| `--wall-budget S` | 任何单次运行可花费的真实秒数（默认 600，正数）；无法完成的运行会抛出错误，而不是返回部分指标 |
-| `--clock {virtual,real}` | `virtual`（默认）是不花任何代价的模拟时间；`real` 以压缩后的真实时间重放场景来验证模拟器，速度慢得多 |
-| `--speedup F` | `--clock real` 的压缩系数（默认 10，正数） |
-| `--json PATH` | 把完整报告写成 JSON（`-` 表示 stdout） |
-| `--markdown PATH` | 把报告写成 markdown 表格，包含每个端点的准入情况 |
-| `--quiet` | stderr 上不输出进度 |
+| `--concurrency N` | 覆盖 worker 数量——也就是客户端的并发度，既是假设也是成本调节项（至少 1） |
+| `--horizon S` | 覆盖模拟时间范围，到点就不接新作业了，不会中途截断正在跑的作业（正数） |
+| `--wall-budget S` | 单次运行最多花多少真实秒（默认 600，正数）；跑不完直接报错，不返回半截指标 |
+| `--clock {virtual,real}` | `virtual`（默认）是零成本的模拟时间；`real` 用压缩后的真实时间重放场景来验证模拟器，慢得多 |
+| `--speedup F` | `--clock real` 的压缩倍数（默认 10，正数） |
+| `--json PATH` | 完整报告写成 JSON（`-` 表示 stdout） |
+| `--markdown PATH` | 报告写成 markdown 表格，含每个端点的准入情况 |
+| `--quiet` | stderr 不打进度 |
 
-表格输出到 stdout，进度输出到 stderr，因此 `pyattacker bench --json - --quiet | jq .` 可以组合使用。
-退出码遵循 CLI 其余部分的约定：`0` 表示扫描完成，`2` 表示场景或
-算法未知。无法完成的基准测试同样是 `2` —— 绝不输出部分表格。预算超出其
-范围也会以同样方式被拒绝（`--seeds 0` 会提示 "at least 1"），而不是被夹到范围内：一次悄悄
-跑了与所宣称不同的实验的扫描，会在正确的标题下报出错误的数字，
-因为标题本身并没有写错。
+表格输出到 stdout，进度输出到 stderr，所以 `pyattacker bench --json - --quiet | jq .` 可以串起来用。退出码和其他命令一致：`0` 跑完了，`2` 是场景或算法名不对。跑不完的基准也是 `2`——绝不会吐半截表格。参数越界也直接拒（`--seeds 0` 会提示 "at least 1"），不会偷偷夹到范围内：一个悄悄跑了和你说的不一样的实验，在正确的标题下报了错的数字——因为标题本身没错。
 
 ---
 
-## `report` —— 统计与失败
+## `report` —— 统计和失败详情
 
 ```bash
 pyattacker report STORE [STORE ...] [--run-id ID] [--errors N] [--json] [--artifact-backend SPEC]
 ```
 
-多个存储会合并成一个一致的视图：按 `pipeline_id` 去重（最佳状态胜出，最新的
-完成时间用于平局裁决），统计值由合并后的行重新计算，并且它会告诉你折叠了多少行。
-`--errors N` 打印前 N 个失败及其错误类别。`--json` 以对象形式给出同样的数字。
-记录了交接的运行会在摘要行中说明（`... attempts: total=12 handoffs=2`），而
-`export` 上的 `--rows pipelines` 会带上账本本身（见
-[进阶：交接](reference.md#进阶交接可选启用)）。
+多个存储会合并成一个一致的视图：按 `pipeline_id` 去重（状态最好的胜出，平局按最新完成时间判），统计量从合并后的行重算，还会告诉你折叠了多少行。`--errors N` 打印前 N 个失败和错误类别。`--json` 用对象格式输出同样的数字。
+
+开了交接的运行会在摘要行里注明（`... attempts: total=12 handoffs=2`），`export` 的 `--rows pipelines` 会带上账本本身（见[进阶：交接](reference.md#进阶交接可选启用)）。
 
 ## `watch` —— 实时监控
 
@@ -158,12 +126,7 @@ pyattacker report STORE [STORE ...] [--run-id ID] [--errors N] [--json] [--artif
 pyattacker watch STORE [--run-id ID] [--interval S] [--iterations N] [--no-clear]
 ```
 
-对同一个 SQLite 文件的只读连接，因此它能在正在运行的流水线旁边运行（WAL 允许一个写入者和多个
-读取者）。它显示流水线状态分布、延迟百分位、每个资源池的 `active/capacity`、
-`ready/degraded/dead`、有多少流水线在等待或挂起，以及最近的错误。带交接的运行还会
-在 attempts 行上显示 `handoffs=N`（所选范围内的提交数，不带 run 过滤器时是全部历史；一次恢复可能复用更早的活动交接）—— 在启用控制的流水线上，游标是位置而非
-进度计数，所以正是这个数字解释了任务列表为何很短。`--iterations N` 让它
-自行退出，这正是脚本中想要的。
+对同一个 SQLite 文件开只读连接，所以能和正在跑的流水线并存（WAL 允许一个写入者多个读取者）。显示流水线状态分布、延迟百分位、每个资源池的 `active/capacity`、`ready/degraded/dead`、多少流水线在等待或挂起、最近的错误。开了交接的运行还会在 attempts 行显示 `handoffs=N`（选定范围内的提交数，不带 run 过滤就是全部历史；续跑可能复用更早的活跃交接）——开了控制流的流水线，游标是位置不是进度计数，所以任务列表很短的时候就是这个数字在起作用。`--iterations N` 让它自己退出，脚本里用很方便。
 
 ## `export` —— 导出记录
 
@@ -173,20 +136,15 @@ pyattacker export STORE [STORE ...] OUTPUT [--rows SHAPE] [--format FMT] [--run-
 
 | `--rows` | 每行对应 |
 |---|---|
-| `pipelines`（默认） | 一条流水线，嵌套 —— 包含任务和最终工件 |
-| `tasks` | 一个任务：终态、耗时、错误、使用的租约 |
-| `attempts` | 一次尝试，包含每次重试的 `decision` |
+| `pipelines`（默认） | 一条流水线，嵌套——带任务和最终产物 |
+| `tasks` | 一个任务：终态、耗时、错误、用了哪个租约 |
+| `attempts` | 一次尝试，含每次重试的 `decision` |
 | `events` | 一个结构化事件 |
-| `artifacts` | 一个工件，包含中间工件 |
+| `artifacts` | 一个产物，包括中间产物 |
 
-`--format` 可以是 `jsonl`（默认）、`json` 或 `csv`。CSV 从首批行取得表头，并把后续出现的键
-折叠进 `extra` 列，因此内存占用保持平稳，也不会有字段被悄悄丢弃。
+`--format` 可以是 `jsonl`（默认）、`json` 或 `csv`。CSV 从第一批行取表头，后面出现的新 key 折进 `extra` 列，内存占用平稳，也不会悄悄丢字段。
 
-每种类型都会完整导出：过去，事件超过 100 000 条的存储会从 `--rows events` 中丢失比最新
-100 000 条更早的全部内容。`events`/`attempts` 的行按最旧优先输出，`tasks`/`artifacts` 按
-流水线/`seq` 顺序输出，从存储中按有界批读取 —— [export
-参考](reference.md#export)给出了每种类型的准确顺序、`limit` 规则、内存说明，以及当存储
-仍在被写入时导出能保证什么、不能保证什么。
+每种类型都会完整导出：以前的版本事件超过 10 万条的存储，`--rows events` 只会导最新 10 万条。`events`/`attempts` 按最旧在前输出，`tasks`/`artifacts` 按流水线/`seq` 顺序输出，从存储里按有界批次读——[导出参考](reference.md#导出)里写了每种类型的准确顺序、`limit` 规则、内存说明，以及存储还在写的时候导出能保证什么、不能保证什么。
 
 ## `serve` —— 只读 HTTP 视图
 
@@ -194,11 +152,9 @@ pyattacker export STORE [STORE ...] OUTPUT [--rows SHAPE] [--format FMT] [--run-
 pyattacker serve STORE [--host HOST] [--port PORT] [--run-id ID]
 ```
 
-`/` 是一个会自动刷新的小型仪表盘；`/stats`、`/events`、`/pipelines`、`/resources`、`/errors` 返回 JSON。
-每个请求都新建一个只读连接，因此它在正在运行的流水线旁边是安全的。
+`/` 是个自动刷新的小仪表盘；`/stats`、`/events`、`/pipelines`、`/resources`、`/errors` 返回 JSON。每个请求都新开一个只读连接，所以和正在跑的流水线并存是安全的。
 
-**它没有身份验证，并会暴露你的工件载荷。** 正因如此它只绑定回环地址。若要把它绑定到
-其他地址，请先在前面放上你自己的代理。
+**没有认证，会暴露你的产物内容。** 所以默认只绑回环地址。要绑别的地址？前面自己加个代理。
 
 ---
 
@@ -208,51 +164,37 @@ pyattacker serve STORE [--host HOST] [--port PORT] [--run-id ID]
 pyattacker validate -c config.yaml [--strict-env]
 ```
 
-解析配置，解析每个 `use:` 目标和资源池，检查整个文档并打印
-生效后的配置。有任何问题就以 `2` 退出并给出原因。`--strict-env` 会把未设置的
-`${VAR}` 从警告提升为错误 —— 在 CI 中值得这么做，因为静默为空的 API key 比
-失败的作业更糟。
+解析配置、解析每个 `use:` 目标和资源池引用，检查整个文件，打印生效后的配置。有问题就退出码 2 并告诉你原因。`--strict-env` 把没设的 `${VAR}` 从警告升级成错误——CI 里建议开，静默为空的 API key 比直接失败更糟。
 
-`run` 和 `resume` 在创建存储之前会经过同样的检查，因此 `validate` 拒绝的配置在它们那里
-同样是 `2`，并且不会启动任何任务。检查的内容如下，每条消息都带字段路径：
+`run` 和 `resume` 在创建存储之前也走同样的检查，所以 `validate` 拒的配置它们也会拒（退出码 2），一个任务都不会启动。检查的内容如下，每条消息都带字段路径：
 
-| 方面 | 示例 |
+| 检查项 | 例子 |
 |---|---|
 | 未知字段 | `run.concurency`（附带 "did you mean `run.concurrency`?"）、`pools.apis.capcity` |
 | 字段类型 | `run.concurrency: "8"`、`pipeline.tasks[0].use: 5` |
 | 数值范围 | `run.concurrency: 0`、`run.heartbeat_s` 小于等于 0、`pools.apis.capacity: 0` |
 | 资源池引用 | `pipeline.resource`、`pipeline.tasks[0].resource`，以及 `use:` 工厂自己声明的 `resource` |
 | 算法 | `algorithm: nosuchalgorithm`、`algorithm: {name: backoff, bse: 1}` |
-| 工件后端 | 没有 `root` 的 `artifact_backend: {kind: file}`、未知的 `kind`、无法解析的 JSON 字符串规格，或不是非负整数的 `min_bytes` |
-| 各节 | `pipeline:`（以及其他每一节）必须是映射 —— 标量或列表属于配置错误，而不是回溯 |
-| source | `source.kind` 必须是 `range`/`jsonl`；`jsonl` 需要 `source.path`；`source.repeats` 至少为 1 |
-| 重试 | `"on"` 名称，以及重试块的数值/布尔字段 |
+| 产物后端 | `artifact_backend: {kind: file}` 缺 `root`、未知的 `kind`、解析不了的 JSON 字符串规格、或 `min_bytes` 不是非负整数 |
+| 各节结构 | `pipeline:`（以及每一节）必须是 map——标量或列表都算配置错误，不会走到运行时 |
+| source | `source.kind` 必须是 `range`/`jsonl`；`jsonl` 要 `source.path`；`source.repeats` 至少 1 |
+| 重试 | `"on"` 里的名字、重试块的数值/布尔字段 |
 
-它只是*声明*检查：不会打开 `source.path`、遍历数据集、构建
-`artifact_backend`（构建它会创建对应目录），也不会调用任务。但它确实会检查
-`artifact_backend` 是 `resolve_backend` 能构造出来的 —— 必填字段（例如文件后端的
-`root`）也包含在内 —— 因此 `validate` 与 `run` 接受和拒绝的规格完全一致。`${VAR}` 值
-按下文所述展开。
+它只做*声明式*检查：不会打开 `source.path`、不会遍历数据集、不会构建 `artifact_backend`（构建它会创建目录）、不会调任务。但它确实会检查 `artifact_backend` 是 `resolve_backend` 能造出来的——必填字段（比如文件后端的 `root`）也查——所以 `validate` 和 `run` 接受/拒绝的规格是完全一致的。`${VAR}` 的展开方式见下文。
 
-## `plugins` —— 已安装了什么
+## `plugins` —— 已安装的插件
 
 ```bash
 pyattacker plugins [--json]
 ```
 
-列出为 `pyattacker.tasks`、`pyattacker.algorithms`、`pyattacker.codecs` 和
-`pyattacker.stores` 发现的所有入口点，**包括加载失败的那些以及失败原因**。损坏的插件会被记录，
-绝不会被抛出，因此它永远不会让一次运行崩溃 —— 但它也绝不会静默失败。
+列出为 `pyattacker.tasks`、`pyattacker.algorithms`、`pyattacker.codecs`、`pyattacker.stores` 发现的所有入口点，**包括加载失败的和失败原因**。坏插件会被记下来，不会抛异常让运行崩——但也绝不会静默失败。
 
 ---
 
 ## 配置文件参考
 
-下面的示例是 YAML，但每个接受 `-c` 的命令都接受同样的文档以 `.json` 或
-`.toml` 形式给出；加载器根据后缀选择解析器。只有 YAML 解析器是可选额外依赖
-（`pip install "pyattacker[yaml]"`）—— 缺少它会被报告为配置错误并指明该额外依赖，
-退出码为 2，且发生在任何东西运行之前。这个配置块是完整的（每个 `use:` 目标都是内置的），
-测试套件会让它通过 `validate`。
+下面的例子是 YAML，但每个接 `-c` 的命令都吃同样的内容，写成 `.json` 或 `.toml` 也行；加载器按后缀选解析器。只有 YAML 解析器是可选的 extra（`pip install "pyattacker[yaml]"`）——缺了会报配置错误并告诉你装哪个 extra，退出码 2，而且在任何东西跑起来之前就报了。这个配置块是完整的（每个 `use:` 都是内置的），测试套件会拿它过 `validate`。
 
 ```yaml
 # example/cli_config_reference.yaml
@@ -287,40 +229,23 @@ pipeline:
 source: { kind: jsonl, path: data.jsonl, limit: 100, key_field: id, repeats: 1 }
 ```
 
-`run:` 块接受的字段与 CLI 映射到 `RunConfig` 的字段完全一致：`store`、`journal`、
+`run:` 块接的字段和 CLI 映射到 `RunConfig` 的字段完全一致：`store`、`journal`、
 `concurrency`、`label`、`heartbeat_s`、`grace_s`、`stale_after_s`、`strict_leases`、
 `stop_after_failures`、`stop_after_s`、`max_handoffs`、`retry_succeeded`、`fresh_restart`、`seed`、`notes`、
 `write_behind`、
-`write_batch`、`flush_interval`、`artifact_backend` 和 `meta`。其他任何字段都是配置错误，而不是
-被悄悄忽略的一行。优先级是明确的：命令行上的参数胜过 `run:` 块，
-而 `run:` 块胜过内置默认值。
+`write_batch`、`flush_interval`、`artifact_backend` 和 `meta`。其他字段都是配置错误，不会被静默忽略。优先级很明确：命令行参数 > `run:` 块 > 内置默认值。
 
-`artifact_backend` 取与 `--artifact-backend` 相同的值：`"inline"`（默认，载荷留在
-存储中）、`"null"`（保留摘要，丢弃字节）、`"file:///data/blobs"`，或上面的映射
-形式。在 YAML 中要为它加引号：裸写的 `artifact_backend: null` 是 null *值*，其含义是 `inline`（与
-省略该字段相同），而 `"null"` 是丢弃载荷字节的后端。恢复的运行需要
-构成检查点的那些载荷，因此 `journal: summary` 和 null 后端都会让你失去任务级
-恢复。
+`artifact_backend` 的取值和 `--artifact-backend` 一样：`"inline"`（默认，产物留在存储里）、`"null"`（只存摘要，丢字节）、`"file:///data/blobs"`，或上面的 map 形式。YAML 里记得加引号：裸写的 `artifact_backend: null` 是 null *值*，等于 `inline`（和不写一样）；`"null"` 才是丢字节的后端。续跑需要构成检查点的那些产物，所以 `journal: summary` 和 null 后端都会让你失去任务级恢复。
 
-任务条目还接受 `config: {model: model-a}` 和 `version: "prompt-v2"`，用于表达无法
-从源码推断的行为。它们会加入恢复指纹；工厂参数仍然
-独立。使用 `source.key_field` 时，在已有键下改变任务同一性或种子内容
-会引发配置错误（退出码 2）并保留旧结果。对改动过的工作请使用新的键/存储。
-升级已有存储前请先看[恢复同一性](reference.md#恢复同一性)。
+任务条目还接 `config: {model: model-a}` 和 `version: "prompt-v2"`，用来表达没法从源码推断的行为。它们会进恢复指纹；工厂参数还是独立算。用了 `source.key_field` 时，在已有 key 下改任务同一性或种子内容会报配置错误（退出码 2），旧结果保留。改了就用新的 key/存储。升级已有存储前先看[恢复同一性](reference.md#恢复同一性)。
 
-任务条目是**对解析后的 `use:` 目标的覆盖**，两种情况截然不同：条目没有提到的字段
-保留目标声明的值（它自己的 `resource`、`algorithm`、
-`timeout_s`、`retry`……），而显式的 `field: null` 会清空支持为空的字段
-（`resource`、`algorithm`、`timeout_s`、`version`）。这与 SDK 中
-[`TaskSpec.with_overrides`](reference.md#taskspec) 的规则相同。
+任务条目是**对解析后的 `use:` 目标的覆盖**，两种情况不一样：条目里没提的字段保持目标自己声明的值（它自己的 `resource`、`algorithm`、`timeout_s`、`retry`……），显式写 `field: null` 会清空支持为空的字段（`resource`、`algorithm`、`timeout_s`、`version`）。规则和 SDK 里的 [`TaskSpec.with_overrides`](reference.md#taskspec) 一样。
 
-`${VAR}` 从环境变量展开（见 `--strict-env`）。`source.kind` 为 `jsonl` 或 `range`；
-`repeats: k` 即 pass@k —— 每个种子 k 条独立流水线。CLI 参数覆盖 `run:` 块。
+`${VAR}` 从环境变量展开（见 `--strict-env`）。`source.kind` 是 `jsonl` 或 `range`；`repeats: k` 就是 pass@k——每个种子 k 条独立流水线。CLI 参数覆盖 `run:` 块。
 
-### `pipeline.control` —— 进阶、可选的交接
+### `pipeline.control` —— 进阶可选的交接
 
-配置还可以声明哪个任务允许通过返回
-[`Handoff`](reference.md#进阶交接可选启用) 来**交接**（向前跳过），从而同一条流水线可以用声明式表达：
+配置还能声明哪个任务允许通过返回 [`Handoff`](reference.md#进阶交接可选启用) 来**交接**（向前跳过），这样同一条流水线就能用声明式表达：
 
 ```yaml
 pipeline:
@@ -336,45 +261,21 @@ pipeline:
     - { use: my_pkg.tasks:report, name: report }
 ```
 
-目标可以是任务名、任务的数字 seq，或 `end`，并且必须严格晚于它的来源
-（`edges` 操作仅向前）。在链中出现两次的名称必须以 seq 给出。从*最后一个*
-任务声明 `end` 会被拒绝，因为它不会产生任何效果。每个问题都以字段
-路径报告 —— `pipeline.control.edges['judge'][0]: destination 'fetch' (seq 0) is not later than the source
-'judge' (seq 2); v1 handoffs are forward-only` —— 在 `validate`（退出码 2）和 `run` 下都会如此，因为两者
-走的是同一个校验入口。在 `edges` 块内没有其他键，本版本也没有 `mode`；
-反向遍历改用它自己的 `rewind` / `retry_all` / `max_handoffs` 键（见
-[进阶反向控制声明](cli.md#进阶反向控制声明)）。
+目标可以是任务名、任务的数字 seq，或 `end`，必须严格晚于来源（`edges` 只向前）。链里出现两次的同名任务必须用 seq 指定。*最后一个*任务声明 `end` 会被拒，因为没意义。每个问题都带字段路径报出来——`pipeline.control.edges['judge'][0]: destination 'fetch' (seq 0) is not later than the source 'judge' (seq 2); v1 handoffs are forward-only`——`validate`（退出码 2）和 `run` 都走同一个校验入口，表现一致。`edges` 块里没有别的 key，本版本也没有 `mode`；反向遍历用自己的 `rewind` / `retry_all` / `max_handoffs` key（见[进阶反向控制声明](cli.md#进阶反向控制声明)）。
 
-数字来源键在 YAML、JSON 和 TOML 中都可用：JSON/TOML 把 seq 0 写成键 `"0"`
-（例如 `"edges": {"0": [2]}`）。精确的任务名优先于数字字符串。数字
-目标仍是整数。通过名称和 seq 重复声明同一个来源属于错误，
-而不是悄悄替换其中一个列表。生效后的配置对重复的或
-保留的（`end`）名称使用数字 seq，而不是发明一种 `name#N` 语法。
+数字源 key 在 YAML、JSON、TOML 里都能用：JSON/TOML 把 seq 0 写成 key `"0"`（比如 `"edges": {"0": [2]}`）。精确任务名优先于数字字符串。数字目标还是整数。同一个来源既用名称又用 seq 声明是错的，不会悄悄替换其中一个。生效后的配置对重名的或 `end` 这种保留名用数字 seq 表示，不会发明 `name#N` 语法。
 
-该特性属于**进阶**：它改变执行模型，因此是可选的、在 1.0 之前标记为实验性，
-并且需要一个能原子提交交接的存储（两个内置后端都可以）。不带该
-配置块的流水线在任何方面都不受影响。API 见
-[参考 → 进阶：交接](reference.md#进阶交接可选启用)，模型见
-[设计 §4.8](design.md#48-进阶交接--声明式正向跳转可选启用实验性)。
+这个功能属于**进阶**：它改执行模型，所以是可选的、1.0 之前标记实验性，还需要支持原子提交交接的存储（两个内置后端都支持）。不带这个配置块的流水线完全不受影响。API 见[参考 → 进阶：交接](reference.md#进阶交接可选启用)，模型见[设计 §4.8](design.md#48-进阶交接--声明式正向跳转可选启用实验性)。
 
-声明式层只描述**组合与资源**；逻辑仍留在 Python 中、位于 `use:` 之后。
-它无法表达的东西，都是使用 SDK 的理由，而不是增加 YAML 的理由 —— 这条界线画在哪里，
-参见 [`docs/tutorial.md`](tutorial.md)（见第 11 步）。
+声明式层只管**组装和资源**；逻辑还在 Python 里，在 `use:` 后面。它表达不了的东西，都该用 SDK 而不是往 YAML 里加东西——这条界线画在哪，看 [`docs/tutorial.md`](tutorial.md)（第 11 步）。
 
 ### 进阶反向控制声明
 
-`pipeline.control` 还接受 `rewind: {source: [earlier_targets]}`、`retry_all: [sources]`，以及
-反向遍历所必需的、必须为正的 `max_handoffs`。对于仅反向的方案，`edges` 是可选的；
-已有的仅向前声明保持不变。`run.max_handoffs` 设置运行时的上限（默认
-1000）。校验复用 Python 的名称/seq 解析，并报告配置字段路径。回退载荷
-由任务代码而非配置选择。语法、访问模型、预算生命周期和载荷缺失恢复见
-[reference → 进阶：反向遍历](reference.md#进阶反向遍历rewindretry-allvisits)；
-可运行的 Python 示例（含 `HistoryArtifact`）见
-[tutorial 第 16–17 步](tutorial.md#第-16-步--高级用回退和全部重试重新生成)。
+`pipeline.control` 还接 `rewind: {source: [earlier_targets]}`、`retry_all: [sources]`，以及反向遍历必须的正整数 `max_handoffs`。纯反向的方案里 `edges` 是可选的；已有的纯向前声明不变。`run.max_handoffs` 设运行时上限（默认 1000）。校验复用 Python 的名称/seq 解析，报配置字段路径。回退载荷由任务代码选，不是配置选。语法、访问模型、预算生命周期和载荷缺失恢复见 [reference → 进阶：反向遍历](reference.md#进阶反向遍历rewindretry-allvisits)；可运行的 Python 示例（含 `HistoryArtifact`）见 [tutorial 第 16–17 步](tutorial.md#第-16-步--高级用回退和全部重试重新生成)。
 
 ## 另见
 
-* [`docs/tutorial.md`](tutorial.md) —— 引导式路线，含可运行程序
+* [`docs/tutorial.md`](tutorial.md) —— 引导式教程，带可运行程序
 * [`docs/reference.md`](reference.md) —— SDK 暴露的每个类和函数
-* [`docs/design.md`](design.md) —— 为什么 CLI 是这些命令而没有别的
+* [`docs/design.md`](design.md) —— 为什么 CLI 是这些命令、没有别的
 * [`README.md`](../../README.zh-CN.md) —— 简明导览
