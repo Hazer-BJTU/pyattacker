@@ -2205,8 +2205,12 @@ with StatsServer("runs/qa.db", port=8787) as server:
 **position** in the chain, not a count of tasks that ran, so a non-zero `handoffs` is what says "this
 pipeline skipped stations".
 
-**It has no authentication and it serves your artifact payloads.** It binds to loopback for that reason. Put
-your own proxy in front before exposing it anywhere else. `pyattacker serve` is the same thing from the
+**There is no artifact endpoint, and the endpoint has no authentication.** What the JSON views expose is what
+the run *recorded*: `/events` returns each event's `data` verbatim, and `/pipelines`, `/errors` and `/stats`
+(via `recent_errors`) return the stored `error_message`. A task that logs a row, or raises with one in the
+message, publishes it there — so treat this as a debug view over your own data, and note that artifact payloads
+themselves are reachable only through the store or `pyattacker export`. It binds to loopback for that reason.
+Put your own proxy in front before exposing it anywhere else. `pyattacker serve` is the same thing from the
 command line.
 
 `pyattacker.monitor.render_snapshot(snapshot)` and `read_snapshot(store)` are the terminal renderer behind
@@ -2219,7 +2223,7 @@ command line.
 
 | Document | What is in it |
 |---|---|
-| [`docs/tutorial.md`](tutorial.md) | the guided path: fourteen runnable steps |
+| [`docs/tutorial.md`](tutorial.md) | the guided path: seventeen runnable steps |
 | [`docs/cli.md`](cli.md) | commands, flags, exit codes, config file format |
 | [`docs/design.md`](design.md) | the model, the invariants, and the tradeoffs behind these APIs |
 | [`examples/`](../examples) | complete programs, including a measured comparison of pipeline shapes |

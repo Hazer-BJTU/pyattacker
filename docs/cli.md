@@ -204,8 +204,9 @@ pyattacker serve STORE [--host HOST] [--port PORT] [--run-id ID]
 `/` is a small auto-refreshing dashboard; `/stats`, `/events`, `/pipelines`, `/resources`, `/errors` are JSON.
 A fresh read-only connection per request means it is safe beside a live run.
 
-**It has no authentication and exposes your artifact payloads.** It binds to loopback for that reason. Put
-your own proxy in front before binding it anywhere else.
+**It has no authentication, and there is no artifact route.** What it exposes is what the run recorded —
+event `data` verbatim and stored `error_message` fields, which is why it binds to loopback. Put your own proxy
+in front before binding it anywhere else.
 
 ---
 
