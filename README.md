@@ -494,11 +494,16 @@ every known tradeoff with its reason.
 
 ## Status
 
-**Unreleased — advanced control flow (opt-in).** Tasks can now
+**0.3.0 — advanced control flow (opt-in), and the documentation in Chinese.** Tasks can now
 [hand off](#advanced-handoffs-opt-in): return a `Handoff` to skip declared stations or finish the pipeline
 early, recorded in a durable ledger that recovery resumes from. It is opt-in and inert — a pipeline without a
 `control` block writes no new rows and keeps a byte-identical `spec_digest` — and marked experimental until
-1.0. Backward traversal now adds declared rewind and retry-all with visits and optional payload history.
+1.0. Backward traversal now adds declared rewind and retry-all with visits and optional payload history. The
+whole documentation set also ships in Simplified Chinese ([`README.zh-CN.md`](README.zh-CN.md),
+[`docs/zh-CN/`](https://github.com/Hazer-BJTU/pyattacker/tree/main/docs/zh-CN)), kept in sync by CI. One
+rename to know about when upgrading: `MergedReport.events_total` is now `source_events_total`, because that
+is the one counter a merged report does **not** de-duplicate (the old name still works as a deprecated
+alias).
 
 **0.2.0 — a benchmark, stricter identity, and three correctness fixes.** New: `pyattacker bench`, a
 simulated provider world that compares the acquire algorithms on a vector of metrics instead of a weighted

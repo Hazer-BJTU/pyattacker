@@ -389,7 +389,7 @@ uv run pyattacker run -c examples/qa_eval.yaml --limit 40
 
 ## 当前状态
 
-**未发布——高级控制流（可选）。** 任务现在可以做[交接](README.zh-CN.md#进阶交接可选启用)：返回一个 `Handoff` 跳过声明的后续步骤或提前收尾，记录在持久化账本里，续跑时从账本接着走。需要手动开启，不开完全没影响——没有 `control` 块的流水线不写新数据，`spec_digest` 逐字节不变。1.0 之前标记为实验性。反向遍历现在支持声明式回退和全量重试，带 visits 和可选的载荷历史。
+**0.3.0——高级控制流（可选），以及中文文档。** 任务现在可以做[交接](README.zh-CN.md#进阶交接可选启用)：返回一个 `Handoff` 跳过声明的后续步骤或提前收尾，记录在持久化账本里，续跑时从账本接着走。需要手动开启，不开完全没影响——没有 `control` 块的流水线不写新数据，`spec_digest` 逐字节不变。1.0 之前标记为实验性。反向遍历现在支持声明式回退和全量重试，带 visits 和可选的载荷历史。整套文档也提供了简体中文版（[`README.zh-CN.md`](README.zh-CN.md)、[`docs/zh-CN/`](https://github.com/Hazer-BJTU/pyattacker/tree/main/docs/zh-CN)），由 CI 保持同步。升级时有一个改名要知道：`MergedReport.events_total` 现在叫 `source_events_total`，因为它是合并报告里**唯一**不去重、按源库原始累加的计数（旧名字仍可作为废弃别名使用）。
 
 **0.2.0——基准测试、更严格的身份校验、三处正确性修复。** 新增 `pyattacker bench`：一个模拟接口方的世界，用一组指标对比各获取算法，而不是一个加权分数（[`docs/benchmark.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/benchmark.md)）。新增 `Retrying.decide`：把重试决策暴露为策略上的方法。新增分页的整类读取（`pyattacker.store.iter_*`，由可选的 `PagedStore` 扩展提供），导出大存储不再需要全量加载。0.1.x 已经实现了 M0–M4 计划的全部内容：内核、持久化和任务级恢复、重试和错误分类、带 7 种获取算法的资源池、延迟延续和 write-behind 批处理、分片和合并报告、三种格式五种导出形状、入口点插件、外部产物后端、fan-out 辅助函数、HTTP 监控端点。
 
