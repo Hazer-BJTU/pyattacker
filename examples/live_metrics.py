@@ -35,32 +35,37 @@ def rebuild(db: str) -> dict[str, bool]:
     return results
 
 
+class AccuracyMonitor:
+    """Own the cross-pipeline reduction; Runner supplies committed completions."""
+
+    def __init__(self, results: dict[str, bool]) -> None:
+        self.results = results
+
+    def __call__(self, runner: Runner, record, artifact) -> None:
+        if artifact is not None and artifact.available:
+            self.results[record.pipeline_id] = bool(runner.registry.load(artifact.encoded())["correct"])
+        elif artifact is None:
+            self.results.pop(record.pipeline_id, None)
+        # A failed pipeline does not enter this example's accuracy denominator.
+        evaluated = len(self.results)
+        correct = sum(self.results.values())
+        runner.report_metric("evaluated", evaluated, label="Evaluated")
+        runner.report_metric("correct", correct, label="Correct")
+        if evaluated:
+            runner.report_metric("accuracy", correct / evaluated,
+                                 label="Accuracy", display="percent")
+
+
 def main() -> None:
     db = "runs/live_metrics.db"
     Path(db).parent.mkdir(exist_ok=True)
-    results = rebuild(db) if Path(db).exists() else {}
-    runner = None
+    monitor = AccuracyMonitor(rebuild(db) if Path(db).exists() else {})
 
-    def completed(record, artifact) -> None:
-        if artifact is not None and artifact.available:
-            results[record.pipeline_id] = bool(runner.registry.load(artifact.encoded())["correct"])
-        elif artifact is None:
-            results.pop(record.pipeline_id, None)
-        # A failed pipeline does not enter this example's accuracy denominator.
-        evaluated = len(results)
-        runner.report_metric("evaluated", evaluated, label="Evaluated")
-        runner.report_metric("correct", sum(results.values()), label="Correct")
-        if evaluated:
-            runner.report_metric("accuracy", sum(results.values()) / evaluated,
-                                 label="Accuracy", display="percent")
-
-    with Runner(store=db, on_pipeline_finished=completed, retry_succeeded=True,
-                handle_signals=False) as active:
-        runner = active
-        with StatsServer(db, port=0) as server:
-            print(f"Monitor: {server.url}")
-            rows = ({"answer": i, "expected": i if i % 3 else i + 1} for i in range(100))
-            runner.run(pipeline("live-eval", judge).map(rows))
+    with Runner(store=db, on_pipeline_finished=monitor, retry_succeeded=True,
+                handle_signals=False) as runner, StatsServer(db, port=0) as server:
+        print(f"Monitor: {server.url}")
+        rows = ({"answer": i, "expected": i if i % 3 else i + 1} for i in range(100))
+        runner.run(pipeline("live-eval", judge).map(rows))
 
 
 if __name__ == "__main__":

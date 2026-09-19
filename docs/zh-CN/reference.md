@@ -2099,8 +2099,9 @@ runner.report_metric("accuracy", correct / completed, label="Accuracy", display=
 ```
 
 `Runner(..., on_pipeline_finished=callback)` 在流水线终态持久化后调用
-`callback(record, artifact)`。成功时传入最终 `Artifact`，失败或中断时传入 `None`。
-可以用 `runner.registry.load(artifact.encoded())` 解码保存的产物。回调在调度线程中运行，
+`callback(runner, record, artifact)`。成功时传入最终 `Artifact`，失败或中断时传入 `None`。
+传入的 `runner` 可用于 `report_metric()`，也可以用
+`runner.registry.load(artifact.encoded())` 解码保存的产物。回调在调度线程中运行，
 应尽快返回。回调异常记录为 `monitor.callback_failed`，不会改变流水线结果。进程崩溃可能
 导致回调遗漏或重放，因此应用应按 pipeline ID 去重，并在需要时从持久化的最终产物重建
 统计。恢复运行使用新的 run ID，汇报值也属于新的作用域。

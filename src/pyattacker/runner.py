@@ -398,7 +398,7 @@ class Runner:
         clock: Any = None,
         bus: Bus | None = None,
         registry: CodecRegistry | None = None,
-        on_pipeline_finished: Callable[[PipelineRecord, Artifact | None], None] | None = None,
+        on_pipeline_finished: Callable[[Runner, PipelineRecord, Artifact | None], None] | None = None,
         config: RunConfig | None = None,
         **config_overrides: Any,
     ) -> None:
@@ -2496,7 +2496,7 @@ class Runner:
             artifact = None
             if record.state == "succeeded":
                 artifact = next((a for a in self.store.artifacts(pipeline_id) if a.is_final), None)
-            callback(record, artifact)
+            callback(self, record, artifact)
         except Exception as exc:
             self._counters["monitor_callback_errors"] += 1
             with contextlib.suppress(Exception):

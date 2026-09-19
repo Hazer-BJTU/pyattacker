@@ -2179,9 +2179,10 @@ runner.report_metric("accuracy", correct / completed, label="Accuracy", display=
 # Inside a task, ctx.report_metric("phase", "scoring", display="text")
 ```
 
-`Runner(..., on_pipeline_finished=callback)` calls `callback(record, artifact)` after a pipeline's
+`Runner(..., on_pipeline_finished=callback)` calls `callback(runner, record, artifact)` after a pipeline's
 terminal state is stored. `artifact` is its final `Artifact` for success and `None` for failure or
-interruption. Decode a retained artifact with `runner.registry.load(artifact.encoded())`. The callback
+interruption. The passed `runner` provides `report_metric()` and can decode a retained artifact with
+`runner.registry.load(artifact.encoded())`. The callback
 runs in the scheduler thread and should finish quickly. Exceptions in it are recorded as
 `monitor.callback_failed` and do not change the pipeline outcome. A process crash may miss or replay
 the callback, so applications should deduplicate by pipeline ID and rebuild from stored final
