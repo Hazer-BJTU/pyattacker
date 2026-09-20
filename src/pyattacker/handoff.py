@@ -1,25 +1,27 @@
-"""Handoff —— **advanced, opt-in**: a task may *skip ahead* by returning a directive instead of a value.
+"""Supported pipeline control flow: forward jumps, early completion, rewind and retry-all.
 
-Ordinary pipelines never touch this module: without a ``control`` declaration on the pipeline, a task
-that returns a :class:`Handoff` is a configuration error and nothing else changes (see
-``pipeline.pipeline`` and ``docs/design.md`` §4.8).
+Tasks return :class:`Handoff` directives; pipelines explicitly declare allowed transfers in
+``control``. An undeclared transfer is a configuration error, and pipelines without control
+keep ordinary linear execution (see ``pipeline.pipeline`` and ``docs/design.md`` §4.8).
 
 The two moving parts:
 
-* :class:`Handoff` —— the value a task returns instead of its artifact. Because it is a return, it is
-  never a failure: the retry policy is not consulted, no exception class is involved, and a task-side
-  ``except Exception:`` cannot swallow the control transfer. The runner intercepts the directive before
-  it is ever encoded as an artifact.
-* :class:`ControlPlan` —— the resolved form of the pipeline's ``control={"edges": {...}}`` declaration.
-  Edges are **declared, not derived**: a handoff along an undeclared edge is a fatal error instead of a
-  silent jump, and every declared edge is range-checked against the chain when the pipeline is built.
+* :class:`Handoff` is a return value, never a retryable failure or a control-flow exception.
+  The runner intercepts it before artifact encoding and durably records the transfer.
+* :class:`ControlPlan` resolves and validates ``control`` declarations against the task chain.
+  ``edges`` permits forward jumps and early completion; ``rewind`` permits earlier targets;
+  ``retry_all`` permits restarting from the bound seed. Backward-enabled declarations require
+  a finite ``max_handoffs`` budget and track separate visits to each task.
 
-Invariants (v1):
-* forward only —— a destination is always strictly later than its source, so traversal stays acyclic and
-  terminates structurally;
-* no joins, no cross-pipeline transfer, no target invented at runtime;
-* the entry state always has a durable reference: ``Handoff.to(target)`` with no value reuses the
-  artifact this task received, an explicit value becomes a payload artifact of its own.
+Execution and recovery contracts:
+
+* ``Handoff.to()`` only moves forward; ``Handoff.end()`` finishes successfully. Forward-only
+  traversal stays acyclic and terminates structurally.
+* ``Handoff.rewind()`` requires an explicit entry value; ``Handoff.retry_all()`` uses the original
+  seed. Both require a declared source and use the backward traversal budget.
+* There are no joins, cross-pipeline transfers or undeclared targets.
+* Every transfer has a durable entry artifact. A forward jump with no value reuses the input;
+  an explicit value becomes its own payload artifact. Visits preserve backward traversal history.
 """
 
 from __future__ import annotations
@@ -39,14 +41,14 @@ END = "end"
 """The destination spelling for "finish the pipeline here" —— ``Handoff.end()`` is its runtime form."""
 
 CONTROL_KEYS = frozenset({"edges"})
-"""Keys a ``control=`` block may set. v1 has exactly one mode, so ``mode`` is deliberately absent."""
+"""Keys accepted by the forward-only declaration parser; ``build_control`` also handles backward keys."""
 
 
 @dataclass(frozen=True, slots=True)
 class Handoff:
     """A task's directive: "this pipeline continues over there, with this entry state".
 
-    Built through :meth:`to` / :meth:`end` rather than by hand, and returned from a task like any other
+    Built through :meth:`to`, :meth:`end`, :meth:`rewind` or :meth:`retry_all`, and returned like any other
     value::
 
         @task("judge")
@@ -62,6 +64,7 @@ class Handoff:
         value: The target's entry state; :data:`~pyattacker.task.UNSET` means "reuse the artifact this
             task received" (an explicit ``None`` is a real payload, not "no value").
         reason: Free-form explanation, recorded in the handoff ledger and the ``pipeline.handoff`` event.
+        operation: ``forward``, ``rewind`` or ``retry_all``, selected by the factory method.
     """
 
     target: str | int | None

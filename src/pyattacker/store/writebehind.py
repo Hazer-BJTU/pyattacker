@@ -218,7 +218,7 @@ class WriteBehindStore:
         self.flush()
         return self.inner.attempts(run_id=run_id, pipeline_id=pipeline_id, limit=limit)
 
-    # ------------------------------------------------- handoffs (advanced, passthrough)
+    # ------------------------------------------------- handoffs (passthrough)
     # Both methods are forwarded *and* defined explicitly, because a forwarded call would skip the
     # flush: the commit must never land on top of buffered facts (a crash would then lose the attempt
     # trail of a handoff that is durably committed), and a read must see what is buffered. The

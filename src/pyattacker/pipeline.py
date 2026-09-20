@@ -136,7 +136,7 @@ class PipelineTemplate:
     tags: dict[str, Any] = field(default_factory=dict)
     spec_digest: str = ""
     registry: CodecRegistry = field(default=DEFAULT_REGISTRY, compare=False, repr=False)
-    # The resolved ``control=`` declaration (**advanced**), or None for an ordinary linear pipeline. Kept
+    # The resolved ``control=`` declaration, or None for an ordinary linear pipeline. Kept
     # after ``registry`` so positional construction keeps its meaning, and excluded from comparison like
     # the registry: identity lives in ``spec_digest``, which folds the plan in when there is one.
     control: ControlPlan | None = field(default=None, compare=False)
@@ -266,14 +266,17 @@ def pipeline(
 ) -> PipelineTemplate:
     """Declare a pipeline: ``pipeline("qa", fetch | ask | judge | metrics)``.
 
-    ``control`` (**advanced**, opt-in) declares which task may hand off where::
+    ``control`` declares allowed forward jumps, rewinds and whole-pipeline restarts.
+    Omit it for a linear chain; backward declarations require a finite ``max_handoffs`` budget::
 
         pipeline("qa", retrieve | ask | judge | report,
                  control={"edges": {"judge": ["report", "end"], "ask": ["report"]}})
 
-    A destination is a task name, a task's seq or ``"end"``, and it must be strictly later than its
-    source (v1 is forward-only). Without the block nothing changes: a returned ``Handoff`` is then a
-    configuration error, not a silent jump. See ``docs/design.md`` §4.8.
+    An ``edges`` destination is a task name, a task's seq or ``"end"``, strictly later than its source.
+    ``rewind={source: [earlier_targets]}`` allows a task to return ``Handoff.rewind(target, value)``;
+    ``retry_all=[sources]`` allows ``Handoff.retry_all()`` to restart from the original seed.
+    Both backward operations require ``max_handoffs`` in the declaration. Without ``control``, a
+    returned ``Handoff`` is a configuration error, not a silent jump. See ``docs/design.md`` §4.8.
     """
     if not tasks_or_chain:
         raise PipelineBuildError("pipeline needs at least one task")

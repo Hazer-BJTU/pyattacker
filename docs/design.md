@@ -2,8 +2,8 @@
 
 **English** | [简体中文](zh-CN/design.md)
 
-> Version: 0.3.1 — M0–M5 complete, including the opt-in advanced control flow of §4.8 (forward handoffs and
-> backward traversal), which stays experimental until 1.0. See "Implemented / Left for later" in Section 9.
+> Version: 0.3.1 — M0–M5 complete, including the supported control flow of §4.8 (forward handoffs and
+> backward traversal), enabled through explicit declarations. See "Implemented / Left for later" in Section 9.
 > In one sentence: **an async task orchestration framework centered on the artifact, using the pipeline as the unit of completion, and the resource pool as the only shared surface.**
 > It does not touch the network, does not do reduction, and does not do DAG scheduling — it is only responsible for "running tens of thousands of mutually independent pipelines to completion, reliably, recoverably, and observably".
 
@@ -43,9 +43,9 @@ These six are the foundation of the design; no change may break them:
    signals). Concurrency is therefore trivial: one coroutine per pipeline, with no global dependency graph.
 2. **Task = a unary `(Artifact) -> Artifact` function**, chained linearly, with no branching and no joining.
    When you need fan-out/loops/batching, the task does its own `asyncio.gather` internally. A task may
-   instead **hand off** (§4.8, advanced, opt-in): the chain is still a chain of unary tasks with no joins,
+   instead **hand off** (§4.8, explicitly declared): the chain is still a chain of unary tasks with no joins,
    and the task is literally still `(Artifact) -> Artifact | Handoff`; what changes is the *traversal order*
-   along declared forward edges, not the topology or the artifact contract.
+   along declared forward or backward edges, not the topology or the artifact contract.
 3. **Artifacts are persisted as soon as they are produced**, so the **checkpoint granularity = task**, not pipeline.
 4. **Failure is an exception**, and no state machine is introduced. Retry has two orthogonal boundaries: the
    task level (replay with the same input artifact) and the pipeline level (a full rerun).
@@ -373,10 +373,12 @@ own handling contains it, exactly like an ordinary exception. Cancellation is un
 worker still marks its pipeline `interrupted` and re-raises, and supervision does not turn a deliberate cancel
 into a crash.
 
-### 4.8 Advanced: Handoffs —— Declared Forward Jumps (Opt-In, Experimental)
+<a id="48-advanced-handoffs--declared-forward-jumps-opt-in-experimental"></a>
+
+### 4.8 Handoffs —— Declared Forward Jumps (Opt-In)
 
 The forward-only contract below remains the v1 path. Backward-enabled declarations use the visit-aware
-contract in §4.8.8 and [the backward reference](reference.md#advanced-backward-traversal-rewind-retry-all-visits); forward-only traversal still uses its existing
+contract in §4.8.8 and [the backward reference](reference.md#backward-traversal-rewind-retry-all-visits); forward-only traversal still uses its existing
 ledger/cursor recovery without new identity or budget requirements.
 
 Everything above describes an ordinary pipeline: a chain walked one task at a time, each task returning the
@@ -384,17 +386,16 @@ artifact the next one consumes. This section describes the one feature that chan
 chain: a step that can tell the rest of the chain no longer needs to run — the answer is good enough, the
 sample is out of scope, a cached result exists — can **skip ahead** instead of running stations it does not
 need, or hiding the branch inside one task, or raising (which would record the pipeline as failed, which is a
-lie). The feature is deliberately fenced off from the rest:
+lie). The control-flow contract is explicit:
 
 * **opt-in** — without a `control` declaration a pipeline behaves exactly as before, down to a byte-identical
   `spec_digest` (see §3.1). Nothing in this section applies to a pipeline that does not ask for it;
-* **advanced tier** — not because it is hard to call, but because it changes the execution model. It is
-  documented under its own heading, released as a minor, and marked *experimental until 1.0*: the guarantees
-  below are the stable part, while the spelling (`Handoff`, `control`) may still change;
+* **supported public API** — `Handoff` and `control` are regular framework features and follow the
+  project's versioning policy, including the execution and recovery contracts below;
 * **forward-only in this model** — a handoff may only skip *ahead*: `control.edges` and `Handoff.to()` never
   acquire implicit backward semantics. The motivating case for the capability is the opposite direction (a
-  validator sends a bad model output **back** to the generator for another sample). §4.8.7 specifies that
-  model and §4.8.8 implements it as a *separately declared* opt-in tier, so the forward contract described
+  validator sends a bad model output **back** to the generator for another sample). §4.8.8 implements that
+  model as a *separately declared* control-flow mode, so the forward contract described
   in this section is unchanged rather than extended.
 
 #### 4.8.1 The transport is a return value, not a control-flow exception
@@ -563,40 +564,31 @@ a task that returned that invalid directive.
 
 #### 4.8.7 What is deliberately not in this version
 
-The motivating case for the whole capability is the **opposite** direction, and writing it down is part of
-committing to it:
+Backward traversal is supported through the separate declarations in §4.8.8. A validator can
+return `Handoff.rewind("ask", feedback)` to request another generation, with each visit recorded
+separately. Visit-aware identities, atomic entry records, deterministic visit-aware randomness and
+finite budgets make this loop observable and resumable.
 
-```
-ask(temperature=0.2) ─▶ validate ─▶ (invalid) ⇢ revoke to ask(temperature=0.7) ─▶ validate ─▶ …
-```
+The following remain outside the control-flow contract:
 
-Model evaluation is sampling, not function application: a structured-output step regularly produces a
-structurally invalid result, and the validator can tell. The pipeline should then *go back* to the generator
-and try again, possibly with different parameters carried in the artifact. A task-internal loop cannot express
-that well — it collapses generation, validation and the intermediate steps into one record, one lease history,
-one retry policy and one timeout, which makes "how many regenerations did this sample need" invisible exactly
-where it is the measurement. A revoke handoff would make each regeneration a real visit of the generation step
-with its own attempt records, and keep the whole thing crash-resumable, so a run over thousands of samples
-still resumes mid-sample instead of restarting it. It is the reason several record decisions here are shaped
-the way they are, and it is the reason the model below is specified now rather than discovered later:
-
-| Not included | Why, and what would be needed |
+| Not included | Why |
 |---|---|
-| Backward / revoke handoffs | The motivating case for the capability: a validator sends work **back** to the generator. It needs a visit model — `(seq, visit)` identity on tasks and attempts, a durable per-seq counter advanced in the same commit as the entry record, visit-aware RNG (`ctx.seed` is currently `digest(pipeline_id\|seq\|attempt)`, so a revisit would see identical randomness), a loop budget (termination is no longer structural), and progress reporting that does not present a visit count as completion. The record decisions here — the ledger, the entry-artifact address, the atomic commit, the position cursor — were chosen so that model can be added without changing them, and §4.8.8 adds it as a separately declared opt-in tier. |
 | Declared DAGs, joins, fan-in | The chain stays a chain. A handoff is a scheduling statement about one pipeline, not a graph edge. |
 | Cross-pipeline handoffs | Pipelines stay semantically independent; the only shared surface is still the resource pool. |
 | Runtime-invented targets | Edges are declared, so a typed or misspelled target fails loudly instead of silently reshaping the pipeline. |
 | Handoffs from `fanout` branches | A group is one step in the record (`fanout` runs its children inside one task), so a control transfer cannot be attributed to one of N concurrent branches. A returned directive fails the group with a clear `FatalError` instead of travelling inside a collected payload. |
 | Payload type checking | See §4.8.6: it has no sound definition without a declared payload contract of its own. |
 
-#### 4.8.8 Advanced v2: rewind, retry-all and optional payload history
+<a id="488-advanced-v2-rewind-retry-all-and-optional-payload-history"></a>
+
+#### 4.8.8 Rewind, retry-all and optional payload history
 
 Implemented as a separate opt-in capability: `control.rewind` declares strictly earlier destinations,
 `control.retry_all` declares sources, and `control.max_handoffs` bounds traversal. Rewind requires explicit
 author-selected entry state; retry-all decodes the original seed captured at binding. History-bearing
 payloads are optional and never drive scheduling. The
-[backward reference](reference.md#advanced-backward-traversal-rewind-retry-all-visits) specifies the
-interface, and [tutorial steps 16–17](tutorial.md#step-16--advanced-regenerating-with-rewind-and-retry-all)
+[backward reference](reference.md#backward-traversal-rewind-retry-all-visits) specifies the
+interface, and [tutorial steps 16–17](tutorial.md#step-16--regenerating-with-rewind-and-retry-all)
 build it up from a working program.
 
 A persisted traversal record owns per-seq counters, effective slot-to-visit mappings and pending entry,
@@ -643,7 +635,7 @@ Three layers of facts with non-overlapping responsibilities:
 | `attempts` | **Append-only history** | one row per attempt, numbered continuously across resumes, never overwritten |
 | `artifacts` | The state carrier | content-addressed + `payload BLOB`; `is_final` marks the final product. `seq` is a task position for the chain, `-1` for the seed, and a **handoff payload address at or above `n_tasks`** on a control-enabled pipeline (§4.8.3) |
 | `events` | **Structured log** | `scope ∈ run/pipeline/task/pool/resource`; the complete story of one pipeline = a query by `pipeline_id` |
-| `handoffs` | **Control-flow history** (advanced, opt-in) | append-only: one row per task-initiated jump, naming the from/to positions and the durable entry artifact; the authoritative record recovery resumes from (§4.8) |
+| `handoffs` | **Control-flow history** (explicitly declared) | append-only: one row per task-initiated jump, naming the from/to positions and the durable entry artifact; the authoritative record recovery resumes from (§4.8) |
 | `resources` | The pool's final state | resource specs (keys masked) + health statistics |
 
 **The complete record of one pipeline**:
@@ -871,7 +863,7 @@ src/pyattacker/
   errors.py       exception hierarchy + pure error-classification functions
   task.py         @task / TaskSpec / TaskContext / lease tracking and force-reclaim
   pipeline.py     Chain composition / artifact type chaining checks / pipeline_key / map(repeats)
-  handoff.py      the Handoff directive + the resolved, validated control-edge plan (M5, advanced)
+  handoff.py      the Handoff directive + the resolved, validated control-edge plan (M5)
   resource.py     Resource / Pool / Lease / Bus / state machine and event stream
   algorithm.py    acquisition algorithms (immediate/wait/backoff/least_busy/failover)
   runner.py       pipeline coroutine scheduling / task-level checkpoint / retry / graceful shutdown / stats
@@ -968,13 +960,13 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
     `asyncio` cannot send `CTRL_BREAK_EVENT` to a child's group), so only the direct child is terminated
     there and a descendant may outlive the task. The offline tests verify the descendant guarantee on POSIX
     and skip those two cases elsewhere with that reason stated.
-16. **Handoffs are opt-in and fenced off** (§4.8). A pipeline that declares `control` trades
+16. **Handoffs require explicit declarations** (§4.8). A pipeline that declares `control` trades
     one guarantee for another: its cursor becomes a *position* rather than a progress count (skipped slots
     have no task rows, and `n_tasks_done / n_tasks_total` is not a completion percentage for such a
     pipeline), and its recovery depends on the `handoffs` ledger being readable — which is why a store
     without the atomic `commit_handoff` capability is refused up front instead of being downgraded to a
-    non-durable jump. The feature is marked experimental until 1.0: the guarantees above are the stable
-    part, the spelling may still change. The forward-only path has no revisits; joins and cross-pipeline transfers are not
+    non-durable jump. The public API and its execution and recovery contracts follow the project's
+    versioning policy. The forward-only path has no revisits; joins and cross-pipeline transfers are not
     included; a pipeline that is mostly handoffs is a sign the problem wants a graph engine, which this is
     not.
 
@@ -1041,7 +1033,7 @@ and never enters a run, which is what keeps its simulated clock exact (see §8.1
 * `tests/test_errors.py` — `error_class_of`/`is_retryable_class`/`retry_after_of` as pure functions: every
   `_STATUS_RULES` bracket, the `FatalError`/`TimeoutError`/`ConnectionError` branches, explicit `.error_class`
   precedence, and extracting a server-suggested `retry_after` from both a direct attribute and response headers.
-* `tests/test_handoff.py` — the advanced feature end to end: a control-free run is provably untouched
+* `tests/test_handoff.py` — the control-flow feature end to end: a control-free run is provably untouched
   (a literal `spec_digest` and no new rows), a forward handoff skips stations and a returned directive along
   an undeclared edge is fatal without being retried, `END` finalizes its entry artifact, a **real SIGKILLed
   process** resumes at the target without re-running the source task, a consumed ledger row falls back to the
@@ -1101,7 +1093,7 @@ checkpoint and recovery, retry and error classification, the resource pool state
 pool wait-time metrics, deterministic sharding with merged reports, five row shapes in three export formats,
 entry-point plugins, external artifact backends, a fan-out helper, and a read-only HTTP monitoring endpoint.
 
-**Implemented (M5, opt-in, experimental until 1.0)**: declared control flow — the `Handoff` directive with
+**Implemented (M5, supported, explicitly declared)**: declared control flow — the `Handoff` directive with
 `control=` on the pipeline, the append-only `handoffs` ledger, atomic `commit_handoff` /
 `commit_control_transition`, ledger-first recovery that resumes a killed process at the target, backward
 traversal (`rewind`, `retry_all`, finite control budgets), visit-aware occurrence identity with effective
@@ -1123,7 +1115,7 @@ is provably untouched: no new rows and a byte-identical `spec_digest`.
 | **M2 Smarter resources and retries** ✅ | write-behind, backoff that yields the worker, per-resource targeted wakeups, quota-aware algorithms, finer `acquire` metrics | backoff is observable when the pool is saturated, and can be replayed from `events` |
 | **M3 Scale and ergonomics** ✅ | `--shard i/N` + `--shards N`, merged reports, shard utilities, multi-shape/multi-format export | multiple processes run the same dataset |
 | **M4 Ecosystem** ✅ | entry-point plugins, external artifact backends, fan-out helper, HTTP monitoring endpoint, 0.1.0 packaging | third parties can publish task packages |
-| **M5 Advanced control flow (opt-in)** ✅ | declared forward handoffs (`Handoff`, `control=`, the `handoffs` ledger, atomic `commit_handoff`, ledger-first recovery) and backward traversal (rewind, retry-all, visits, finite control budgets, optional `HistoryArtifact` payload history) | a handoff is a durable checkpoint: a killed process resumes at the target with the entry state, and a control-free pipeline is provably unchanged |
+| **M5 Control flow (opt-in)** ✅ | declared forward handoffs (`Handoff`, `control=`, the `handoffs` ledger, atomic `commit_handoff`, ledger-first recovery) and backward traversal (rewind, retry-all, visits, finite control budgets, optional `HistoryArtifact` payload history) | a handoff is a durable checkpoint: a killed process resumes at the target with the entry state, and a control-free pipeline is provably unchanged |
 
 ---
 

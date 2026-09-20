@@ -37,9 +37,9 @@
 | 在步骤内分支 | [第 13 步](tutorial.md#第-13-步--压轴一个小型模型评估) | [`fanout`](reference.md#fanout) |
 | 存自定义类型或大载荷，发插件 | [第 14 步](tutorial.md#第-14-步--自定义类型blob插件) | [编解码器](reference.md#codecregistry)、[后端](reference.md#工件后端)、[插件](reference.md#插件) |
 | 监控正在跑的运行 | [第 14 步](tutorial.md#第-14-步--自定义类型blob插件) | [监控](reference.md#监控) |
-| 在任务内部跳过链中剩余部分（高级） | [第 15 步](tutorial.md#第-15-步--高级跳过站点交接) | [交接](reference.md#进阶交接可选启用) |
-| 把工作送回更早的站点（高级） | [第 16 步](tutorial.md#第-16-步--高级用回退和全部重试重新生成) | [反向遍历](reference.md#进阶反向遍历rewindretry-allvisits) |
-| 在载荷内部快照与恢复状态（高级） | [第 17 步](tutorial.md#第-17-步--高级让载荷自带历史) | [`HistoryArtifact`](reference.md#historyartifact) |
+| 在任务内部跳过链中剩余部分 | [第 15 步](tutorial.md#第-15-步--跳过站点交接) | [交接](reference.md#交接可选启用) |
+| 把工作送回更早的站点 | [第 16 步](tutorial.md#第-16-步--用回退和全部重试重新生成) | [反向遍历](reference.md#反向遍历rewindretry-allvisits) |
+| 在载荷内部快照与恢复状态 | [第 17 步](tutorial.md#第-17-步--让载荷自带历史) | [`HistoryArtifact`](reference.md#historyartifact) |
 
 ---
 
@@ -1477,15 +1477,17 @@ blobs on disk: 3 files, [11, 27, 1536] bytes
 
 ---
 
-## 第 15 步 —— 高级：跳过站点（交接）
+<a id="第-15-步--高级跳过站点交接"></a>
 
-**这是框架里唯一的进阶特性：可选启用，改执行模型，1.0 之前都标实验性。** 这步之前的东西都不依赖它，没声明它的流水线和这个特性不存在时完全一样。当你的某个步骤判断*链的其余部分不用跑了*，再读这步。
+## 第 15 步 —— 跳过站点（交接）
+
+**交接是正式的控制流特性，通过 `control` 显式声明后启用。** 这步之前的东西都不依赖它，没声明它的流水线和这个特性不存在时完全一样。当你的某个步骤判断*链的其余部分不用跑了*，再读这步。
 
 场景是这样：`judge` 能看出某个答案已经够好了，或者 `metrics` 这一步对这一行没必要。以前的选择是要么照常跑完剩余任务，要么用 `fanout` 把所有东西折进一个任务（丢了逐步记录），要么抛错——抛错会把流水线记成 **failed**，这是在撒谎。**交接**（handoff）说清楚实际发生了什么：这一行跳过了站点 3–5，从站点 6 继续，或者就在这里结束。
 
 ```python
 # tutorial/step_15_handoff.py
-"""Step 15 (advanced) - a task hands off: skip stations, or finish the pipeline, and nothing lies about it."""
+"""Step 15 - a task hands off: skip stations, or finish the pipeline, and nothing lies about it."""
 
 import json
 from contextlib import closing
@@ -1578,23 +1580,25 @@ cdce72ca  state=succeeded  ran=['prepare', 'ask', 'judge', 'report']  skipped=['
 * **交接就是检查点，所以恢复从目标处继续。** 进程在跳转后死了，下次 `resume=True` 会带着记下来的入口状态从目标开始，**不会**重跑源任务。`handoffs` 行让这事可能：它记了目标和入口工件，入口工件要么是源任务收到的那个（不带值的 `Handoff.to(target)`），要么是存在链之上自己地址处的新载荷（`seq >= n_tasks`）。
 * **`n_tasks_done` 变成了一个位置。** 跳过的槽位没有任务行，所以开了 control 的流水线上，`n_tasks_done / n_tasks_total` 不是完成百分比——要看实际发生了什么，靠 `store.handoffs()` 和 `stats()["handoffs_total"]`。`report`、`watch`、`/pipelines` 和每种导出都会在旁边显示交接计数。
 * **别一上来就用它。** 交接是关于当前流水线的*调度声明*："这一行应该从那边继续"。条件还是写在任务代码里，步骤内分支还是 `fanout`，遍历数据集还是 `map`。一条几乎全是交接的流水线说明这个问题要的是图引擎，这个框架不是。
-* **进阶层级。** 可选启用、改执行模型、1.0 前实验性：上面这些保证是稳定的，写法还可能变。单独声明的反向操作用访问和有限预算；见[第 16 步](tutorial.md#第-16-步--高级用回退和全部重试重新生成)和 [reference → 进阶：反向遍历](reference.md#进阶反向遍历rewindretry-allvisits)。两个内置存储都能提交交接；不能提交的自定义存储一开始就被拒，抛 `ConfigError`，不会写一次崩溃后活不下来的跳转。
+* **正式控制流特性。** `Handoff` API、`control` 声明及上述保证都遵循项目的版本管理策略。单独声明的反向操作用访问和有限预算；见[第 16 步](tutorial.md#第-16-步--用回退和全部重试重新生成)和 [reference → 反向遍历](reference.md#反向遍历rewindretry-allvisits)。两个内置存储都能提交交接；不能提交的自定义存储一开始就被拒，抛 `ConfigError`，不会写一次崩溃后活不下来的跳转。
 
 整条流水线重启（显式 `fresh_restart=True`、在 `retry_succeeded=True` 下已经成功的流水线，或入口载荷丢失）会把之前的交接、尝试和事件留作历史，但在从 seq 0 重新开始之前，连同持久账本水位一起原子地清掉当前的任务/链工件状态。之后失败没法恢复旧的跳转，也找不回旧的 END 结果。后续的目标恢复保留当前水位，反复中断时还在用生效中的交接。完成时留下一个最终工件。实现后端时见
 [存储恢复契约](reference.md#表与读取器)。
 
 ---
 
-## 第 16 步 —— 高级：用回退和全部重试重新生成
+<a id="第-16-步--高级用回退和全部重试重新生成"></a>
 
-**和第 15 步一样，进阶、可选启用、1.0 前实验性。** 它改了链的遍历方式：校验器可以把工作*送回*更早的站点，而不是让这一行失败，或者在一个任务内部循环。当某个步骤判断更早的步骤该带着不同状态重新跑，再读这步。
+## 第 16 步 —— 用回退和全部重试重新生成
+
+**与正向跳转一样，回退和全量重试也是通过 `control` 声明启用的正式特性。** 它改了链的遍历方式：校验器可以把工作*送回*更早的站点，而不是让这一行失败，或者在一个任务内部循环。当某个步骤判断更早的步骤该带着不同状态重新跑，再读这步。
 
 场景是这样：`validate` 拒了一个结构化答案，修复方式是带着同样的提示词再加错误反馈重新生成一次。把这个循环折进一个任务，会把生成和校验压成一条记录——"这一行需要重新生成几次"恰恰会在它本身就是度量指标的地方变得不可见。
 **回退**（rewind）会把两次生成保留成彼此独立的访问，各自有自己的任务、尝试和工件行。
 
 ```python
 # tutorial/step_16_backward.py
-"""Step 16 (advanced) - a validator rewinds to the generator; state is what the author chose."""
+"""Step 16 - a validator rewinds to the generator; state is what the author chose."""
 
 from pyattacker import Handoff, Runner, pipeline, task
 
@@ -1681,19 +1685,21 @@ effective outputs: {0: 0, 1: 1, 2: 1, 3: 0}
 * **普通字典还是普通字典。** `HistoryArtifact` 是可选的载荷基类，做快照/恢复的簿记；运行器里没有任何东西会读它来决定下一步去哪。
 
 完整接口——访问/发生实例（occurrence）模型、预算生命周期、存储能力和
-`HistoryArtifact` 编解码器——见 [reference → 进阶：反向遍历](reference.md#进阶反向遍历rewindretry-allvisits)，可选的载荷历史在下一步。
+`HistoryArtifact` 编解码器——见 [reference → 反向遍历](reference.md#反向遍历rewindretry-allvisits)，可选的载荷历史在下一步。
 
 ---
 
-## 第 17 步 —— 高级：让载荷自带历史
+<a id="第-17-步--高级让载荷自带历史"></a>
 
-**同样是高级、可选启用，而且完全不改调度。** 第 15、16 步决定流水线*去哪里*；这步是回退的可选搭档，用于你送回的那个状态本身需要带具名检查点的场合。
+## 第 17 步 —— 让载荷自带历史
+
+**载荷历史是控制流的可选配套功能，完全不改调度。** 第 15、16 步决定流水线*去哪里*；这步是回退的可选搭档，用于你送回的那个状态本身需要带具名检查点的场合。
 
 场景：`validate` 想把 `generate` 送回**那个失败样本之前**的状态，而不是作者手搓的字典。手搓那个字典很常见，第 16 步就是这么做的，本身没任何问题。但当载荷*本身*就是应用的状态机——它有若干阶段，早先阶段值得留着，"从阶段 2 重新生成，同时让阶段 3 留在记录里"才是你要的操作——`HistoryArtifact` 就是这个可选的载荷基类：它带着应用状态的分离快照，以及对应的版本化编解码器。
 
 ```python
 # tutorial/step_17_history.py
-"""Step 17 (advanced) - optional payload history: named checkpoints carried inside the payload."""
+"""Step 17 - optional payload history: named checkpoints carried inside the payload."""
 
 from pyattacker import CodecRegistry, Handoff, HistoryArtifact, Runner, pipeline, task
 
@@ -1816,9 +1822,9 @@ prune refused: cannot prune the selected snapshot
 | 用四个进程 | `--shards 4 --jobs 4`，然后对分片文件跑 `report`/`export` |
 | 在步骤内分支 | `fanout(task_a, task_b)` |
 | 有记录地向前跳 / 提前结束 | 在声明了 `control={"edges": {...}}` 的流水线上 `return Handoff.to("report", v)` / `Handoff.end(v)` |
-| 把一个站点送回更早的站点（高级） | 在声明了 `control={"rewind": {...}, "max_handoffs": N}` 的流水线上 `return Handoff.rewind("generate", chosen_state)` |
-| 让整条流水线从自己的种子重新开始（高级） | 在声明了 `control={"retry_all": [...], "max_handoffs": N}` 的流水线上 `return Handoff.retry_all()` |
-| 在载荷内部保留具名状态检查点（高级） | `class S(HistoryArtifact)`，然后 `s.checkpoint("label")` / `.restore(...)` / `.prune(...)`，并在两个注册表里登记 |
+| 把一个站点送回更早的站点 | 在声明了 `control={"rewind": {...}, "max_handoffs": N}` 的流水线上 `return Handoff.rewind("generate", chosen_state)` |
+| 让整条流水线从自己的种子重新开始 | 在声明了 `control={"retry_all": [...], "max_handoffs": N}` 的流水线上 `return Handoff.retry_all()` |
+| 在载荷内部保留具名状态检查点 | `class S(HistoryArtifact)`，然后 `s.checkpoint("label")` / `.restore(...)` / `.prune(...)`，并在两个注册表里登记 |
 | 让我的代码能从 YAML 用 | 不用插件：`use: my_pkg.tasks:my_task`；在 `pyattacker.tasks` 有入口点：`use: my_task` |
 
 所有类和函数，含签名和参数表：[`docs/reference.md`](reference.md)。

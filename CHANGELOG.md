@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+* **Handoffs and forward/backward jumps are supported public features.** `Handoff.to`,
+  `Handoff.end`, `Handoff.rewind`, `Handoff.retry_all` and their `control` declarations now
+  follow the project's regular versioning policy, without a separate experimental tier.
+  Code documentation and both language editions use this status consistently, including
+  the companion payload-history guide. Explicit declarations, finite backward budgets,
+  atomic store capabilities, execution semantics and persisted identities remain unchanged.
+  Documentation links use the new headings; legacy anchors preserve published bookmarks.
+  Earlier release entries below describe their status at the time of release.
+
 ### Added
 
 * **Experiment suites** (#68): reference existing configurations and schedule their inputs
@@ -65,7 +76,7 @@ All notable changes to this project are documented here. The format follows
   keeps the append-only history, and a store that has committed its first revisit records a `base` → `visits-v1`
   feature level (`store.feature_level()`, `StoreFeatureUnsupported`) so lineage-unaware writers are refused
   rather than silently mutating the wrong occurrence. See
-  [reference → advanced: backward traversal](docs/reference.md#advanced-backward-traversal-rewind-retry-all-visits).
+  [reference → advanced: backward traversal](docs/reference.md#backward-traversal-rewind-retry-all-visits).
 
 * **Advanced feature: handoffs — a task can skip ahead, on the record (opt-in, experimental).** A task may
   return `Handoff.to(target, value)` to continue at a declared later station, or `Handoff.end(value)` to
@@ -88,9 +99,9 @@ All notable changes to this project are documented here. The format follows
   commit them atomically; both built-in backends can, and a store that cannot is refused up front with a
   `ConfigError` rather than silently writing a non-durable jump. Marked *experimental until 1.0*;
   the forward declaration excludes backward targets; joins and cross-pipeline jumps are not included. See
-  [`docs/design.md` §4.8](docs/design.md#48-advanced-handoffs--declared-forward-jumps-opt-in-experimental),
-  the [API reference](docs/reference.md#advanced-handoffs-opt-in) and
-  [tutorial step 15](docs/tutorial.md#step-15--advanced-skipping-stations-handoffs).
+  [`docs/design.md` §4.8](docs/design.md#48-handoffs--declared-forward-jumps-opt-in),
+  the [API reference](docs/reference.md#handoffs-opt-in) and
+  [tutorial step 15](docs/tutorial.md#step-15--skipping-stations-handoffs).
 
 ### Fixed
 
@@ -226,9 +237,9 @@ All notable changes to this project are documented here. The format follows
 
 * **The backward-traversal guide is merged into the tutorial and the reference.** `docs/backward.md` was a
   seventh document that a reader had to find before they could use the feature; its usage now lives where
-  the rest of the API does. [Tutorial step 16](docs/tutorial.md#step-16--advanced-regenerating-with-rewind-and-retry-all)
+  the rest of the API does. [Tutorial step 16](docs/tutorial.md#step-16--regenerating-with-rewind-and-retry-all)
   keeps the rewind/retry-all walkthrough and a new step 17 builds an optional `HistoryArtifact` payload,
-  while [reference → advanced: backward traversal](docs/reference.md#advanced-backward-traversal-rewind-retry-all-visits)
+  while [reference → advanced: backward traversal](docs/reference.md#backward-traversal-rewind-retry-all-visits)
   gains the `Handoff.rewind`/`Handoff.retry_all` signatures, the backward `control` keys, the visit and
   occurrence model, the budget and recovery rules, and the inspection surface; `HistoryArtifact` is
   documented next to the codecs it belongs to, and the store capability and compatibility/backup rules moved

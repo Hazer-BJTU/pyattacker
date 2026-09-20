@@ -1264,8 +1264,7 @@ class Runner:
 
         if spec.control is not None and spec.control.backward_enabled:
             if self._owned_by_another_run(record, resume=self._run_resume):
-                # Explicit ownership rule for backward traversal (`docs/reference.md`, "Advanced:
-        # backward traversal"): a durable
+                # Explicit ownership rule for backward traversal (`docs/reference.md`): a durable
                 # pending visit can be continued after a crash, so taking over a row that another
                 # run may still own would silently fork one traversal into two writers. `resume=True`
                 # is the operator's claim that the previous owner is gone; without it the row is left

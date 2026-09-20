@@ -1,4 +1,4 @@
-"""Advanced backward traversal: user state, exact visits, atomic recovery and bounded loops."""
+"""Backward traversal: user state, exact visits, atomic recovery and bounded loops."""
 
 from __future__ import annotations
 

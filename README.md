@@ -68,7 +68,7 @@ Five concepts, and that is the whole vocabulary:
 | Concept | Meaning | In one line |
 |---|---|---|
 | **artifact** | the persisted state of a task | content-addressed, **persisted as soon as it is produced** → checkpoint granularity = task |
-| **task** | the smallest unit of scheduling | a unary `(artifact) -> artifact` function, sync or async — or `-> artifact \| Handoff`, to skip ahead ([advanced](#advanced-handoffs-opt-in)) |
+| **task** | the smallest unit of scheduling | a unary `(artifact) -> artifact` function, sync or async — or `-> artifact \| Handoff`, to skip ahead ([handoffs](#handoffs-opt-in)) |
 | **pipeline** | the unit of completion | `fetch \| ask \| judge \| metrics` chained linearly, semantically independent of each other |
 | **resource** | a leasable external capability | one endpoint / one key; once pooled, it can be published and subscribed to concurrency-safely |
 | **algorithm** | the policy for acquiring resources | `wait`, `backoff`, `least_busy`, `failover`, `sticky`, `quota_aware`, `immediate` — orthogonal to "retry on failure" |
@@ -177,7 +177,7 @@ runner.run(template.map(rows), resume=True)   # or pyattacker resume -c config.y
 * Failed pipelines → continue from **the first task that produced no artifact**: **if task C died, only task C
   reruns when task B's checkpoint is durable**;
 * The seed artifact is persisted too → recovery **does not depend on the original dataset file**;
-* A pipeline that **handed off** ([advanced](#advanced-handoffs-opt-in)) resumes at the station it jumped to,
+* A pipeline that **handed off** ([handoffs](#handoffs-opt-in)) resumes at the station it jumped to,
   with the entry state the ledger recorded — the task that handed off is not re-run;
 * Changed a task's source code (`spec_digest` includes source digests) → treated as a new pipeline, so old
   results are not incorrectly reused. Factory parameters, fanout children, retry/algorithm policies and
@@ -188,10 +188,13 @@ rerun and old explicit keys conflict. Finish old runs with the old package, then
 [resume identity and idempotency reference](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md#resume-identity)
 for migration guidance, dynamic functions and external configuration.
 
-## Advanced: Handoffs (Opt-In)
+<a id="advanced-handoffs-opt-in"></a>
 
-**Advanced tier: opt-in, changes the execution model, not needed for ordinary pipelines, experimental until
-1.0.** A task can decide that the rest of the chain no longer needs to run, and *say so* instead of inventing a
+## Handoffs (Opt-In)
+
+**Handoffs, forward jumps and rewinds are supported control-flow features, enabled explicitly through `control`.**
+
+A task can decide that the rest of the chain no longer needs to run, and *say so* instead of inventing a
 failure or hiding the branch inside one step. It **returns** a directive — `Handoff.to(target, value)` to
 continue at a declared later station, `Handoff.end(value)` to finish the pipeline right there:
 
@@ -271,16 +274,16 @@ with Runner(store=":memory:", concurrency=4) as runner:
   payloads provide explicit snapshots and restoration; ordinary dictionaries remain author-controlled.
   Visits and exact artifact occurrences retain history and make recovery safe. The APIs, budgets and
   recovery boundaries are in
-  [reference → advanced: backward traversal](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md#advanced-backward-traversal-rewind-retry-all-visits),
+  [reference → backward traversal](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md#backward-traversal-rewind-retry-all-visits),
   with working programs in
-  [tutorial steps 16–17](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md#step-16--advanced-regenerating-with-rewind-and-retry-all).
+  [tutorial steps 16–17](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md#step-16--regenerating-with-rewind-and-retry-all).
 
-The API is one class ([`Handoff`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md#advanced-handoffs-opt-in)),
+The API is one class ([`Handoff`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md#handoffs-opt-in)),
 one declaration — `control={"edges": {...}}` for forward jumps, `control.rewind` / `control.retry_all` /
 `control.max_handoffs` for backward traversal — and one optional store capability; a custom store that cannot
 commit a handoff atomically is refused up front instead of writing a jump that would not survive a crash.
-Walkthrough: [tutorial step 15](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md#step-15--advanced-skipping-stations-handoffs).
-Model and rules: [design §4.8](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/design.md#48-advanced-handoffs--declared-forward-jumps-opt-in-experimental).
+Walkthrough: [tutorial step 15](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md#step-15--skipping-stations-handoffs).
+Model and rules: [design §4.8](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/design.md#48-handoffs--declared-forward-jumps-opt-in).
 
 When a pipeline restarts from the seed, previous task rows and chain artifacts are reset atomically with the cursor/watermark;
 previous handoffs stay in its history but no longer act as
@@ -451,8 +454,8 @@ what they do not say.
 
 | Document | What is in it |
 |---|---|
-| [`docs/tutorial.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md) | seventeen runnable steps, from "one task" to sharded evaluation and the advanced handoff/backward tiers — rewinds, retry-all and payload history included; each one executed by the test suite |
-| [`docs/reference.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md) | every public class and function: signatures, parameters, examples — including the advanced backward-traversal tier and `HistoryArtifact` |
+| [`docs/tutorial.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md) | seventeen runnable steps, from "one task" to sharded evaluation, handoffs and backward traversal — rewinds, retry-all and payload history included; each one executed by the test suite |
+| [`docs/reference.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md) | every public class and function: signatures, parameters, examples — including backward traversal and `HistoryArtifact` |
 | [`docs/cli.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/cli.md) | every subcommand, every flag, exit codes, config reference |
 | [`docs/design.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/design.md) | conceptual model, the six invariants, the lease contract, data model, tradeoffs |
 | [`docs/benchmark.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/benchmark.md) | the algorithm benchmark: what the scenarios assume, what the metrics mean, how to read the table |
@@ -485,7 +488,7 @@ These are design decisions, not missing features:
 * **Semantic reduction** — accuracy, pass@k, F1 and any cross-pipeline aggregation. Export the artifacts and
   compute it outside, or write a sink pipeline out of the primitives.
 * **DAG orchestration** — a pipeline is a linear chain; branch inside a task with `fanout`. The one
-  qualification is the opt-in [handoff](#advanced-handoffs-opt-in): it changes the traversal of
+  qualification is the opt-in [handoff](#handoffs-opt-in): it changes the traversal of
   the chain along declared edges, never its topology (no joins, no second entry point, no cross-pipeline
   jumps).
 * **A serving gateway** — the only HTTP surface is the read-only debug endpoint above.
@@ -501,11 +504,12 @@ read-only monitoring dashboard through `Runner.report_metric()` or `TaskContext.
 callback receives committed pipeline results; the application owns the calculation. The dashboard and
 `watch` now follow one run consistently by default. See [`examples/live_metrics.py`](examples/live_metrics.py).
 
-**0.3.0 — advanced control flow (opt-in), and the documentation in Chinese.** Tasks can now
-[hand off](#advanced-handoffs-opt-in): return a `Handoff` to skip declared stations or finish the pipeline
+**0.3.0 — control flow (opt-in), and the documentation in Chinese.** Tasks can now
+[hand off](#handoffs-opt-in): return a `Handoff` to skip declared stations or finish the pipeline
 early, recorded in a durable ledger that recovery resumes from. It is opt-in and inert — a pipeline without a
-`control` block writes no new rows and keeps a byte-identical `spec_digest` — and marked experimental until
-1.0. Backward traversal now adds declared rewind and retry-all with visits and optional payload history. The
+`control` block writes no new rows and keeps a byte-identical `spec_digest`. Handoffs and backward traversal
+are now maintained as supported features. Backward traversal adds declared rewind and retry-all with visits
+and optional payload history. The
 whole documentation set also ships in Simplified Chinese ([`README.zh-CN.md`](README.zh-CN.md),
 [`docs/zh-CN/`](https://github.com/Hazer-BJTU/pyattacker/tree/main/docs/zh-CN)), kept in sync by CI. One
 rename to know about when upgrading: `MergedReport.events_total` is now `source_events_total`, because that

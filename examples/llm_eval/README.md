@@ -49,7 +49,7 @@ DAG.
 The chain is linear here for a reason: this demo wants *every* judge to run for every row, and its
 point is checkpoint granularity, not routing. If a step instead decides that the rest of the chain is
 unnecessary for a row — a confident answer that needs no metrics, a sample that is out of scope — the
-opt-in [handoff](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md#advanced-handoffs-opt-in)
+opt-in [handoff](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/reference.md#handoffs-opt-in)
 expresses that on the record (`Handoff.to("reduce", ...)` skips ahead, `Handoff.end(...)` finishes the
 row), with the skipped stations left without task rows and recovery resuming at the target. It does not
 turn the pipeline into a DAG either: edges are declared, forward-only, and there are still no joins.
