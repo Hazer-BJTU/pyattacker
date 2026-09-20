@@ -160,7 +160,7 @@ def test_stop_closes_source_before_store_and_resume(tmp_path, layout):
         assert report.status == "interrupted"
         assert not report.stats["experiments"][0]["source_exhausted"]
     specs.close()  # already closed; no late write into a closed catalog
-    assert run(suite, resume=True).stats["pipelines"]["by_state"] == {"succeeded": 100}
+    assert run(suite, resume=True).stats["pipelines"]["by_state"] == {"succeeded": 99, "skipped": 1}
 
 
 def test_definition_change_rejected_addition_reordering_safe(tmp_path, layout):
@@ -463,10 +463,16 @@ with suite.runner(handle_signals=False, concurrency=1, on_pipeline_finished=lamb
     assert child.returncode == 23, child.stderr.decode()
     reader = SuiteStore(suite.output_root, read_only=True)
     assert reader.stats()["pipelines"]["by_state"].get("succeeded") == 1
+    crashed_run = reader.latest_run_id()
+    assert reader.stats(crashed_run)["pipelines"]["by_state"].get("succeeded") == 1
+    assert reader.stats(crashed_run)["attempts_total"] == 1
     reader.close()
     report = run(suite, resume=True)
     assert report.skipped == 1
-    assert report.stats["pipelines"]["by_state"] == {"succeeded": 4}
+    assert report.stats["pipelines"]["by_state"] == {"succeeded": 3, "skipped": 1}
+    reader = SuiteStore(suite.output_root, read_only=True)
+    assert reader.stats(crashed_run)["pipelines"]["by_state"].get("succeeded") == 1
+    reader.close()
 
 
 def test_suite_guide_python_example_runs(tmp_path, monkeypatch):
@@ -593,3 +599,172 @@ def test_missing_member_config_is_a_configuration_error(tmp_path):
     config = write_config(tmp_path)
     (tmp_path / "configs/child.json").unlink()
     assert main(["validate", "-c", str(config)]) == 2
+
+
+def test_run_outcomes_survive_resume_and_skips(tmp_path, layout):
+    failing = {"yes": True}
+
+    @task("flaky")
+    def flaky(seed):
+        if failing["yes"]:
+            raise ValueError("first invocation failure")
+        return seed + 1
+
+    tpl = pipeline("history", flaky)
+    suite = make_suite(tmp_path, layout, experiments=[ExperimentSpec("a", lambda: tpl.map([1]), "v1")])
+    first = run(suite)
+    reader = SuiteStore(suite.output_root, read_only=True)
+    before = list(iter_rows(reader, run_id=first.run_id))
+    before_stats = reader.stats(first.run_id)
+    first_tasks = list(iter_rows(reader, kind="tasks", run_id=first.run_id))
+    reader.close()
+    assert before[0]["state"] == "failed"
+    # Deliberately age cumulative timestamps: resumed execution latency must use
+    # this invocation's own start, not the original checkpoint's start.
+    store = SuiteStore(suite.output_root)
+    record = store.pipelines()[0]
+    record.started_at -= 86400
+    store.upsert_pipeline(record)
+    store.close()
+    failing["yes"] = False
+    second = run(suite, resume=True)
+    third = run(suite, resume=True)
+    reader = SuiteStore(suite.output_root, read_only=True)
+    try:
+        old = list(iter_rows(reader, run_id=first.run_id))
+        assert old[0]["state"] == "failed"
+        for key in ("run_id", "error_message", "started_at", "finished_at", "duration_ms", "attempts_total"):
+            assert old[0][key] == before[0][key]
+        assert reader.stats(first.run_id) == before_stats
+        assert list(iter_rows(reader, kind="tasks", run_id=first.run_id)) == first_tasks
+        assert next(iter_rows(reader, kind="results", run_id=first.run_id))["result"] is None
+        assert reader.stats(second.run_id)["pipelines"]["duration_ms"]["max"] < 10000
+        assert reader.pipelines(run_id=second.run_id)[0].attempts_total == 1
+        skipped = reader.pipelines(run_id=third.run_id)[0]
+        assert skipped.state == "skipped" and skipped.started_at is None and skipped.attempts_total == 0
+        assert reader.stats(third.run_id)["attempts_total"] == 0
+        assert reader.pipelines()[0].state == "succeeded"
+    finally:
+        reader.close()
+
+
+def test_selective_run_leaves_other_database_bytes_unchanged(tmp_path):
+    suite = make_suite(tmp_path, "by_experiment")
+    run(suite)
+    path = Path(suite.output_root) / "experiments/b/state.db"
+    before = path.read_bytes()
+    before_mtime = path.stat().st_mtime_ns
+    with suite.runner(handle_signals=False) as runner:
+        runner.store.max_open = 1
+        report = runner.run(suite.pipelines(runner.store, experiments=["a"]), resume=True)
+        runner.store.stats()  # full reads must not register an unselected child
+        runner.store.heartbeat(report.run_id)
+    assert path.read_bytes() == before
+    assert path.stat().st_mtime_ns == before_mtime
+    child = SqliteStore(str(path), read_only=True)
+    assert child.get_run(report.run_id) is None
+    child.close()
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_pool_credentials_can_rotate_without_changing_identity(tmp_path, monkeypatch, shared):
+    config = write_config(tmp_path)
+    child = tmp_path / "configs/child.json"
+    target = config if shared else child
+    raw = json.loads(target.read_text())
+    raw["pools"] = {"apis": {"resources": [{"id": "api", "options": {"api_key": "${ROTATING_TOKEN}"}}]}}
+    if shared:
+        raw["experiments"]["a"]["pool_bindings"] = {"apis": "apis"}
+    target.write_text(json.dumps(raw))
+    monkeypatch.setenv("ROTATING_TOKEN", "first-secret")
+    first = load_spec(config)
+    run(first)
+    monkeypatch.setenv("ROTATING_TOKEN", "second-secret")
+    second = load_spec(config)
+    assert [e.definition_digest for e in first.experiments] == [
+        e.definition_digest for e in second.experiments
+    ]
+    assert run(second, resume=True).skipped == 6
+    raw["pools"]["apis"]["resources"][0]["id"] = "different-resource"
+    target.write_text(json.dumps(raw))
+    with pytest.raises(ConfigError, match="definition changed"):
+        run(load_spec(config), resume=True)
+
+
+def test_backend_override_cannot_change_persisted_interpretation(tmp_path, layout):
+    suite = make_suite(tmp_path, layout)
+    run(suite, artifact_backend="file")
+    manifest = (Path(suite.output_root) / "manifest.json").read_bytes()
+    for read_only in (False, True):
+        with pytest.raises(ConfigError, match="backend conflicts"):
+            SuiteStore(suite.output_root, backend="inline", read_only=read_only)
+    with pytest.raises(ConfigError, match="backend conflicts"):
+        run(suite, resume=True, artifact_backend="inline")
+    assert (Path(suite.output_root) / "manifest.json").read_bytes() == manifest
+    assert run(suite, resume=True, artifact_backend="file").skipped == 4
+    reader = SuiteStore(suite.output_root, read_only=True)
+    assert all(r["result"] for r in iter_rows(reader, kind="results"))
+    reader.close()
+
+
+def test_split_export_names_follow_row_kind(tmp_path):
+    suite = make_suite(tmp_path, "combined")
+    run(suite)
+    destination = tmp_path / "exports"
+    assert main(["export", suite.output_root, str(destination), "--by-experiment", "--rows", "attempts"]) == 0
+    assert len((destination / "a/attempts.jsonl").read_text().splitlines()) == 2
+    assert not (destination / "a/results.jsonl").exists()
+
+
+def test_admitted_spec_repairs_repeat_for_migrated_success(tmp_path):
+    from pyattacker import Runner
+
+    tpl = pipeline("repeat", echo)
+    specs = list(tpl.map([1], repeats=2))
+    path = str(tmp_path / "old.db")
+    with Runner(store=path, handle_signals=False) as runner:
+        runner.run(specs)
+    store = SqliteStore(path)
+    store._conn.execute("ALTER TABLE pipelines DROP COLUMN repeat")
+    store._conn.commit()
+    store.close()
+    # Migration cannot infer unknown repeats. The next admitted spec can.
+    store = SqliteStore(path)
+    assert all(row.repeat == 0 for row in store.pipelines())
+    store.close()
+    with Runner(store=path, handle_signals=False) as runner:
+        assert runner.run(specs, resume=True).skipped == 2
+    store = SqliteStore(path, read_only=True)
+    assert sorted(row.repeat for row in store.pipelines()) == [0, 1]
+    store.close()
+
+
+def test_outcome_updates_rollback_with_checkpoint_transaction(tmp_path, layout):
+    from pyattacker.store.base import RunRecord
+
+    suite = make_suite(tmp_path, layout)
+    store = SuiteStore.create(suite, write_behind=False)
+    stream = suite.pipelines(store, experiments=["a"])
+    stream.prepare_run(store)
+    store.start_run(RunRecord("atomic-test"))
+    try:
+        spec = next(stream)
+        store.admit(spec, "atomic-test")
+        child = store._child("a")
+        record = store.get_pipeline(spec.pipeline_id)
+        with pytest.raises(RuntimeError, match="rollback"), child._visit_atomic(spec.pipeline_id):
+            child._write_pipeline(dataclasses.replace(record, state="running", attempts_total=1))
+            raise RuntimeError("rollback")
+        assert store.get_pipeline(spec.pipeline_id).state == "pending"
+        outcome = store.pipelines(run_id="atomic-test")[0]
+        assert outcome.state == "pending" and outcome.attempts_total == 0
+        store.upsert_pipeline(dataclasses.replace(record, state="running", attempts_total=1))
+        store.finish_pipeline(spec.pipeline_id, "failed", error=ValueError("durable"))
+        reader = SuiteStore(suite.output_root, read_only=True)
+        outcome = reader.pipelines(run_id="atomic-test")[0]
+        assert outcome.state == "failed" and outcome.error_message == "durable"
+        assert outcome.attempts_total == 1
+        reader.close()
+    finally:
+        stream.close()
+        store.close()

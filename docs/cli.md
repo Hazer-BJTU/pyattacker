@@ -397,6 +397,6 @@ Python examples, `HistoryArtifact` included.
 
 ## Suite commands
 
-Suite configurations reuse `run`, `resume` and `validate`. `run/resume` accept repeatable `--experiment ID` and `--output-root`; `report/watch/export/serve` accept a Suite directory and `--experiment ID`. `export --rows results` writes lightweight final results; `--by-experiment` writes OUTPUT/ID/results.FORMAT. Suite `--store`, `run.store` and sharding flags are rejected. Directory reads default to cumulative results; `--run-id` selects invocation admissions and history.
+Suite configurations reuse `run`, `resume` and `validate`. `run/resume` accept repeatable `--experiment ID` and `--output-root`; `report/watch/export/serve` accept a Suite directory and `--experiment ID`. `export --rows results` writes lightweight final results; `--by-experiment` writes OUTPUT/ID/ROWS.FORMAT. Suite `--store`, `run.store` and sharding flags are rejected. Directory reads default to cumulative results; `--run-id` selects invocation admissions and history.
 
 [Full guide and examples](suites.md).

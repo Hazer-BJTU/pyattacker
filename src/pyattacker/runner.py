@@ -1251,6 +1251,10 @@ class Runner:
                     "the existing result/checkpoint is unchanged. Use a new key or store for "
                     "changed work; --retry-succeeded does not override identity conflicts."
                 )
+        if record is not None and record.repeat != spec.repeat:
+            # A migrated record defaults to zero; the admitted spec is authoritative.
+            record.repeat = spec.repeat
+            self.store.upsert_pipeline(record)
         if record is not None and record.state == "succeeded" and not cfg.retry_succeeded:
             self._counters["skipped"] += 1
             self._counters["pipelines_done"] += 1

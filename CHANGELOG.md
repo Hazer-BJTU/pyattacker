@@ -13,9 +13,13 @@ All notable changes to this project are documented here. The format follows
   Stable Suite/member identities preserve original local keys and isolate checkpoints and metrics.
 * Optional `by_experiment` output directories alongside default `combined` storage, with a
   persistent catalog, source-exhaustion state, selective resume and bounded child connections.
-  Directory-aware report/watch/serve/export provide cumulative and invocation views.
+  Directory-aware report/watch/serve/export provide cumulative and durable invocation views,
+  preserving historical failures, skips and execution timing after resume. Unselected member
+  databases remain untouched. Pool environment placeholders allow credential rotation;
+  reopening validates the persisted artifact backend.
 * `export --rows results`, `--by-experiment`, member-scoped reported metrics, and task context
-  experiment/output-directory fields. Single-store exports atomically replace completed files.
+  experiment/output-directory fields. Split export filenames follow the selected row kind.
+  Single-store exports atomically replace completed files; admitted specs repair migrated repeats.
 * English and Chinese Suite guides and a runnable JSON example. Existing standalone path/ID
   semantics remain unchanged; Suite mode explicitly rejects independent process shards/custom stores.
 

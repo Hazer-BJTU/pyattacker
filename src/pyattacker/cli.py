@@ -485,7 +485,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
                 eid = member["experiment_id"]
                 selected = _open_readonly(paths[0], args.artifact_backend, eid)
                 try:
-                    destination = str(Path(args.output) / eid / f"results.{args.format}")
+                    destination = str(Path(args.output) / eid / f"{args.rows}.{args.format}")
                     export_store(selected, destination, kind=args.rows, fmt=args.format, run_id=args.run_id)
                     print(f"exported {eid} → {destination}")
                 finally:
@@ -828,7 +828,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--rows", choices=list(ROW_KINDS), default="pipelines")
     p_export.add_argument("--format", choices=list(FORMATS), default="jsonl", dest="format")
     p_export.add_argument("--artifact-backend", default=None, metavar="SPEC")
-    p_export.add_argument("--by-experiment", action="store_true", help="write OUTPUT/ID/results.FORMAT for each Suite member")
+    p_export.add_argument("--by-experiment", action="store_true", help="write OUTPUT/ID/ROWS.FORMAT for each Suite member")
     p_export.add_argument("--experiment", help="select one Suite member")
     p_export.set_defaults(func=_cmd_export)
 

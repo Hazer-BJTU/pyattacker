@@ -23,7 +23,7 @@ from ..errors import ConfigError
 from ..reported_metrics import ReportedMetric, report_metric
 from ..suite import namespace, validate_id
 from .base import PipelineRecord
-from .sqlite import SqliteStore
+from .sqlite import SqliteStore, _to_pipeline, _to_task
 from .writebehind import WriteBehindStore
 
 _SCHEMA = """
@@ -76,6 +76,58 @@ class _RelativeFileBackend(FileBackend):
         return str(Path(artifact.digest[:2]) / artifact.digest[2:])
 
 
+def _backend_spec(backend: Any) -> Any:
+    if isinstance(backend, FileBackend):
+        return {"kind": "file", "root": backend.root, "min_bytes": backend.min_bytes}
+    if backend is None or isinstance(backend, (str, dict)):
+        return backend
+    raise ConfigError("Suite artifact backend must be a serializable built-in specification")
+
+
+def _install_outcomes(store: SqliteStore) -> None:
+    """Snapshot run outcomes in the SAME transaction as each checkpoint mutation.
+
+    Triggers cover linear, handoff and visit writes, including terminal repair.
+    The checkpoint keeps cumulative counters; the outcome keeps invocation counters.
+    """
+    conn = store._conn
+    conn.execute("CREATE TABLE IF NOT EXISTS suite_pipeline_runs AS SELECT * FROM pipelines WHERE 0")
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(pipelines)")]
+    if not any(
+        row[1] == "baseline_attempts" for row in conn.execute("PRAGMA table_info(suite_pipeline_runs)")
+    ):
+        conn.execute(
+            "ALTER TABLE suite_pipeline_runs ADD COLUMN baseline_attempts INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS suite_outcome_key ON suite_pipeline_runs(run_id,pipeline_id)"
+    )
+    now = "((julianday('now') - 2440587.5) * 86400.0)"
+    special = {
+        "created_at": "created_at",
+        "started_at": f"CASE WHEN NEW.state='pending' THEN started_at ELSE COALESCE(started_at,NEW.finished_at,{now}) END",
+        "finished_at": "CASE WHEN NEW.state IN ('pending','running') THEN NULL ELSE MAX(COALESCE(started_at,NEW.finished_at),NEW.finished_at) END",
+        "attempts_total": "CASE WHEN NEW.attempts_total<OLD.attempts_total THEN 0 ELSE MAX(0,NEW.attempts_total-baseline_attempts) END",
+    }
+    assignments = ",".join(f'"{c}"={special.get(c, "NEW." + c)}' for c in columns)
+    assignments += ",baseline_attempts=CASE WHEN NEW.attempts_total<OLD.attempts_total THEN NEW.attempts_total ELSE baseline_attempts END"
+    conn.execute(f"""CREATE TRIGGER IF NOT EXISTS suite_outcome_update AFTER UPDATE ON pipelines BEGIN
+        UPDATE suite_pipeline_runs SET {assignments}
+        WHERE run_id=NEW.run_id AND pipeline_id=NEW.pipeline_id AND state IN ('pending','running');
+        END""")
+    conn.execute("CREATE TABLE IF NOT EXISTS suite_task_runs AS SELECT * FROM tasks WHERE 0")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS suite_task_outcome_key ON suite_task_runs(run_id,task_run_id)"
+    )
+    task_columns = [row[1] for row in conn.execute("PRAGMA table_info(tasks)")]
+    names = ",".join(task_columns)
+    values = ",".join("NEW." + c for c in task_columns)
+    for operation in ("INSERT", "UPDATE"):
+        conn.execute(f"""CREATE TRIGGER IF NOT EXISTS suite_task_{operation.lower()} AFTER {operation} ON tasks BEGIN
+            INSERT OR REPLACE INTO suite_task_runs ({names}) VALUES ({values}); END""")
+    conn.commit()
+
+
 class SuiteStore:
     """Both layouts use this Store extension; arbitrary custom stores are not supported.
 
@@ -87,6 +139,7 @@ class SuiteStore:
 
     @classmethod
     def create(cls, suite: Any, **kwargs: Any) -> SuiteStore:
+        backend_spec = _backend_spec(kwargs.get("backend"))
         root = Path(suite.output_root)
         manifest = root / "manifest.json"
         expected = {
@@ -110,22 +163,8 @@ class SuiteStore:
             db._conn.execute("INSERT INTO suite_identity VALUES (?,NULL)", (suite.id,))
             db._conn.commit()
             db.close()
-            backend = kwargs.get("backend")
-            if backend == "file":
-                expected["artifact_backend"] = "file"
-            elif backend is not None:
-                # Built-in external specs are an explicit user override. Do not
-                # serialize arbitrary backend objects or expanded task configs.
-                if isinstance(backend, (str, dict)):
-                    expected["artifact_backend"] = backend
-                elif isinstance(backend, FileBackend):
-                    expected["artifact_backend"] = {
-                        "kind": "file",
-                        "root": backend.root,
-                        "min_bytes": backend.min_bytes,
-                    }
-                else:
-                    raise ConfigError("Suite artifact backend must be a serializable built-in specification")
+            if backend_spec is not None:
+                expected["artifact_backend"] = backend_spec
             atomic_json(manifest, expected)
         store = cls(str(root), **kwargs)
         try:
@@ -166,8 +205,10 @@ class SuiteStore:
             self.manifest = json.loads((self.root / "manifest.json").read_text())
         except (OSError, ValueError) as exc:
             raise ConfigError(f"cannot read Suite manifest at {root}: {exc}") from exc
-        if self._backend is None:
-            self._backend = self.manifest.get("artifact_backend")
+        persisted_backend = self.manifest.get("artifact_backend")
+        if backend is not None and _backend_spec(backend) != persisted_backend:
+            raise ConfigError("artifact backend conflicts with Suite manifest; use a new output root")
+        self._backend = persisted_backend
         self.suite_id = validate_id(self.manifest.get("suite_id"), "manifest.suite_id")
         self.layout = self.manifest.get("layout")
         expected = "state.db" if self.layout == "combined" else "suite.db"
@@ -212,6 +253,8 @@ class SuiteStore:
             ).fetchall()
             if len(identity) != 1 or tuple(identity[0]) != (self.suite_id, None):
                 raise ConfigError("Suite catalog identity does not match manifest")
+            if not read_only:
+                _install_outcomes(self.catalog)
             self._reload()
             if experiment is not None and experiment not in self._members:
                 raise ConfigError(f"unknown experiment: {experiment}")
@@ -224,9 +267,11 @@ class SuiteStore:
             self.close()
             raise
 
-    def _backend_for(self, directory: Path) -> Any:
+    def _backend_for(self, directory: Path, *, read_only: bool | None = None) -> Any:
         if self._backend == "file":
-            return _RelativeFileBackend(directory / "artifacts", read_only=self.read_only)
+            return _RelativeFileBackend(
+                directory / "artifacts", read_only=self.read_only if read_only is None else read_only
+            )
         return self._backend
 
     def _reload(self) -> None:
@@ -256,19 +301,25 @@ class SuiteStore:
         path = self._child_path(eid)
         if not path.is_file():
             raise ConfigError(f"missing experiment database: {path}")
+        read_only = self.read_only or (self._selected is not None and eid not in self._selected)
         child = SqliteStore(
-            str(path), read_only=self.read_only, journal=self.journal, backend=self._backend_for(path.parent)
+            str(path),
+            read_only=read_only,
+            journal=self.journal,
+            backend=self._backend_for(path.parent, read_only=read_only),
         )
+        if not read_only:
+            _install_outcomes(child)
         identity = child._conn.execute("SELECT suite_id,experiment_id FROM suite_identity").fetchall()
         if len(identity) != 1 or tuple(identity[0]) != (self.suite_id, eid):
             child.close()
             raise ConfigError(f"experiment database identity conflict: {eid}")
-        if not self.read_only and self._run is not None:
+        if not read_only and self._run is not None:
             current = self.catalog.get_run(self._run.run_id)
             child.start_run(current or self._run)
         handle = (
             WriteBehindStore(child, batch_size=self.batch_size, flush_interval=self.flush_interval)
-            if self._batch and not self.read_only
+            if self._batch and not read_only
             else child
         )
         self._children[eid] = handle
@@ -318,6 +369,10 @@ class SuiteStore:
     def select_experiments(self, suite_id: str, selected: Sequence[str]) -> None:
         if suite_id != self.suite_id or set(selected) - self._members.keys():
             raise ConfigError("experiment selection does not match this Suite store")
+        # Selection may change when a Runner is reused; reopen with the proper access mode.
+        for child in self._children.values():
+            child.close()
+        self._children.clear()
         self._selected = list(selected)
 
     def prepare(self, suite: Any, selected: Sequence[Any]) -> None:
@@ -358,45 +413,66 @@ class SuiteStore:
         # Identity lives with each child as well, independently of top-level summaries.
         child = self._child(eid)
         inner = getattr(child, "inner", child)
-        if child.get_pipeline(spec.pipeline_id) is None:
-            record = PipelineRecord(
-                spec.pipeline_id,
-                rid,
-                spec.name,
-                spec.key,
-                tags=dict(spec.template.tags),
-                n_tasks_total=spec.n_tasks,
-                seed_digest=spec.seed_digest,
-                spec_digest=spec.spec_digest,
-                suite_id=spec.suite_id,
-                experiment_id=eid,
-                local_key=spec.local_key,
-                repeat=spec.repeat,
-            )
-            encoded = spec.seed_encoded or spec.template.registry.dump(spec.seed)
-            seed = Artifact(
-                Artifact.build_id(spec.pipeline_id, SEED_SEQ),
-                spec.pipeline_id,
-                SEED_TASK,
-                SEED_SEQ,
-                encoded.type_name,
-                encoded.codec,
-                encoded.digest,
-                encoded.size,
-                encoded.data,
-                time.time(),
-            )
-            # Admission is itself durable. A killed process may have queued work
-            # that no worker opened yet; it must not disappear from progress.
-            with inner._visit_atomic(spec.pipeline_id):
+        existing = child.get_pipeline(spec.pipeline_id)
+        with inner._visit_atomic(spec.pipeline_id):
+            if existing is None:
+                record = PipelineRecord(
+                    spec.pipeline_id,
+                    rid,
+                    spec.name,
+                    spec.key,
+                    tags=dict(spec.template.tags),
+                    n_tasks_total=spec.n_tasks,
+                    seed_digest=spec.seed_digest,
+                    spec_digest=spec.spec_digest,
+                    suite_id=spec.suite_id,
+                    experiment_id=eid,
+                    local_key=spec.local_key,
+                    repeat=spec.repeat,
+                )
+                encoded = spec.seed_encoded or spec.template.registry.dump(spec.seed)
+                seed = Artifact(
+                    Artifact.build_id(spec.pipeline_id, SEED_SEQ),
+                    spec.pipeline_id,
+                    SEED_TASK,
+                    SEED_SEQ,
+                    encoded.type_name,
+                    encoded.codec,
+                    encoded.digest,
+                    encoded.size,
+                    encoded.data,
+                    time.time(),
+                )
+                # Admission is itself durable. A killed process may have queued work
+                # that no worker opened yet; it must not disappear from progress.
                 inner._write_pipeline(record)
                 inner._write_artifact(seed)
-        if self.layout == "by_experiment":
-            inner._conn.execute(
-                "INSERT OR IGNORE INTO suite_admissions VALUES (?,?,?,?,?)",
-                (rid, spec.pipeline_id, eid, spec.local_key, spec.repeat),
+            # Initialize before the worker starts. Never copy a previous run's terminal
+            # state, timing or errors into this invocation's pending admission.
+            columns = [row[1] for row in inner._conn.execute("PRAGMA table_info(pipelines)")]
+            values = {c: c for c in columns}
+            values.update(
+                run_id="?",
+                state="'pending'",
+                created_at="?",
+                started_at="NULL",
+                finished_at="NULL",
+                attempts_total="0",
+                error_type="NULL",
+                error_message="NULL",
+                traceback="NULL",
+                failed_task="NULL",
             )
-            inner._conn.commit()
+            inner._conn.execute(
+                f"INSERT OR IGNORE INTO suite_pipeline_runs ({','.join(columns)},baseline_attempts) "
+                f"SELECT {','.join(values[c] for c in columns)},attempts_total FROM pipelines WHERE pipeline_id=?",
+                (rid, time.time(), spec.pipeline_id),
+            )
+            if self.layout == "by_experiment":
+                inner._conn.execute(
+                    "INSERT OR IGNORE INTO suite_admissions VALUES (?,?,?,?,?)",
+                    (rid, spec.pipeline_id, eid, spec.local_key, spec.repeat),
+                )
 
     def _enrich(self, record: PipelineRecord) -> PipelineRecord:
         eid = self._eid(record.pipeline_id)
@@ -504,8 +580,9 @@ class SuiteStore:
 
     def heartbeat(self, run_id: str, ts: float | None = None) -> None:
         self.catalog.heartbeat(run_id, ts)
-        for child in self._children.values():
-            child.heartbeat(run_id, ts)
+        for eid, child in self._children.items():
+            if self._selected is None or eid in self._selected:
+                child.heartbeat(run_id, ts)
 
     def finish_run(self, run_id: str, status: str, ended_at: float | None = None) -> None:
         self.flush()
@@ -522,7 +599,7 @@ class SuiteStore:
         self.catalog._conn.commit()
         # Includes evicted children, whose run rows would otherwise stay running.
         if self.layout == "by_experiment":
-            for eid in self._members:
+            for eid in self._selected if self._selected is not None else self._members:
                 self._child(eid).finish_run(run_id, status, ended_at)
 
     def interrupt_stale(self, *, stale_after_s: float = 30, keep_run_id: str | None = None) -> int:
@@ -547,6 +624,14 @@ class SuiteStore:
 
     def emit_event(self, event: Any) -> None:
         store = self._child(self._eid(event.pipeline_id)) if event.pipeline_id else self.data
+        if event.kind == "pipeline.skipped":
+            inner = getattr(store, "inner", store)
+            inner._conn.execute(
+                "UPDATE suite_pipeline_runs SET state='skipped',finished_at=?,attempts_total=0 "
+                "WHERE run_id=? AND pipeline_id=? AND state='pending'",
+                (event.ts, event.run_id, event.pipeline_id),
+            )
+            inner._conn.commit()
         store.emit_event(event)
 
     def upsert_resource(self, *args: Any, **kwargs: Any) -> None:
@@ -610,8 +695,26 @@ class SuiteStore:
 
     def iter_pipelines(self, *, run_id: str | None = None, state: str | None = None) -> Iterator[Any]:
         for _, store in self._stores():
-            for row in store.iter_pipelines(state=state):
-                if self._selected_pid(row.pipeline_id, run_id):
+            if run_id is None:
+                records = store.iter_pipelines(state=state)
+            else:
+                inner = getattr(store, "inner", store)
+                exists = inner._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='suite_pipeline_runs'"
+                ).fetchone()
+                records = (
+                    (
+                        _to_pipeline(row)
+                        for row in inner._conn.execute(
+                            "SELECT * FROM suite_pipeline_runs WHERE run_id=? ORDER BY created_at,pipeline_id",
+                            (run_id,),
+                        )
+                    )
+                    if exists
+                    else iter(())
+                )
+            for row in records:
+                if (state is None or row.state == state) and self._selected_pid(row.pipeline_id, run_id):
                     yield row
 
     def pipelines(self, *, limit: int | None = None, **kwargs: Any) -> list[Any]:
@@ -630,8 +733,29 @@ class SuiteStore:
                 if self._selected_pid(row.pipeline_id):
                     yield row
 
-    def iter_tasks(self, pipeline_id: str | None = None, **kwargs: Any) -> Iterator[Any]:
-        return self._iter_facts("tasks", pipeline_id=pipeline_id, **kwargs)
+    def iter_tasks(self, pipeline_id: str | None = None, *, run_id: str | None = None) -> Iterator[Any]:
+        if run_id is None:
+            yield from self._iter_facts("tasks", pipeline_id=pipeline_id)
+            return
+        stores = [(None, self._child(self._eid(pipeline_id)))] if pipeline_id else self._stores()
+        for _, store in stores:
+            inner = getattr(store, "inner", store)
+            if not inner._conn.execute("SELECT 1 FROM sqlite_master WHERE name='suite_task_runs'").fetchone():
+                continue
+            for row in inner._conn.execute(
+                "SELECT * FROM suite_task_runs WHERE run_id=? ORDER BY pipeline_id,seq,task_run_id", (run_id,)
+            ):
+                if (pipeline_id is None or row["pipeline_id"] == pipeline_id) and self._selected_pid(
+                    row["pipeline_id"]
+                ):
+                    yield _to_task(row)
+
+    def iter_run_artifacts(self, *, pipeline_id: str, run_id: str) -> Iterator[Artifact]:
+        # Payloads are checkpoints, not versioned history. Never label a later
+        # run's payload as an earlier run's result.
+        current = self.get_pipeline(pipeline_id)
+        if current is not None and current.run_id == run_id:
+            yield from self.iter_artifacts(pipeline_id=pipeline_id)
 
     def iter_attempts(self, **kwargs: Any) -> Iterator[Any]:
         return self._iter_facts("attempts", **kwargs)
@@ -679,6 +803,32 @@ class SuiteStore:
         for _, store in self._stores():
             for row in store.export_rows():
                 if self._selected_pid(row["pipeline_id"], run_id):
+                    if run_id is not None:
+                        inner = getattr(store, "inner", store)
+                        saved = inner._conn.execute(
+                            "SELECT * FROM suite_pipeline_runs WHERE run_id=? AND pipeline_id=?",
+                            (run_id, row["pipeline_id"]),
+                        ).fetchone()
+                        if saved is None:
+                            continue
+                        record = _to_pipeline(saved)
+                        current_run = row["run_id"]
+                        row.update({k: v for k, v in dataclasses.asdict(record).items() if k in row})
+                        row["duration_ms"] = (
+                            (record.finished_at - record.started_at) * 1000
+                            if record.finished_at is not None and record.started_at is not None
+                            else None
+                        )
+                        row["tasks"] = [
+                            dataclasses.asdict(t) for t in self.iter_tasks(record.pipeline_id, run_id=run_id)
+                        ]
+                        row["handoffs"] = [
+                            dataclasses.asdict(h)
+                            for h in self.handoffs(pipeline_id=record.pipeline_id, run_id=run_id)
+                        ]
+                        if current_run != run_id or record.state == "skipped":
+                            row["artifacts"] = []
+                            row.pop("control", None)
                     yield row
 
     def errors(self, *, run_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
@@ -729,8 +879,10 @@ class SuiteStore:
     def stats(self, run_id: str | None = None) -> dict[str, Any]:
         states: Counter = Counter()
         durations = []
+        invocation_attempts = 0
         for row in self.iter_pipelines(run_id=run_id):
             states[row.state] += 1
+            invocation_attempts += row.attempts_total
             if row.finished_at is not None and row.started_at is not None:
                 durations.append((row.finished_at - row.started_at) * 1000)
         durations.sort()
@@ -740,9 +892,18 @@ class SuiteStore:
 
         tasks: Counter = Counter()
         attempts: Counter = Counter()
-        for row in self.iter_tasks(run_id=run_id):
-            tasks[row.name] += 1
-            attempts[row.name] += row.attempts_used
+        if run_id is None:
+            for row in self.iter_tasks():
+                tasks[row.name] += 1
+                attempts[row.name] += row.attempts_used
+        else:
+            seen = set()
+            for row in self.iter_attempts(run_id=run_id):
+                attempts[row.task_name] += 1
+                key = (row.pipeline_id, row.task_run_id)
+                if key not in seen:
+                    tasks[row.task_name] += 1
+                    seen.add(key)
         experiments = self.experiments(run_id)
         return {
             "suite_id": self.suite_id,
@@ -754,7 +915,9 @@ class SuiteStore:
                 "duration_ms": {"p50": pct(0.5), "p95": pct(0.95), "max": pct(1)},
             },
             "tasks": {"by_name": dict(tasks), "attempts_by_name": dict(attempts)},
-            "attempts_total": sum(1 for _ in self.iter_attempts(run_id=run_id)),
+            "attempts_total": invocation_attempts
+            if run_id is not None
+            else sum(1 for _ in self.iter_attempts()),
             "events_total": self.count_events(run_id=run_id),
             "handoffs_total": len(self.handoffs(run_id=run_id)),
             "source_errors": sum(bool(row["source_error"]) for row in experiments),

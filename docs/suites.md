@@ -79,8 +79,11 @@ name. Renaming a display label or template, reordering members, and adding other
 not change existing IDs. Legacy pipelines outside Suite mode retain their old IDs.
 
 Each member has a persisted definition digest covering its task fingerprint, source
-configuration, effective pools/bindings and member limit. Changing that definition under an
-existing ID is rejected: use a new member ID or output root. The digest is not a snapshot of
+configuration, effective pool declarations/bindings and member limit. Pool declarations are
+hashed before environment expansion, so rotating `${API_KEY}` does not change identity.
+Changes to literal pool settings or bindings still change the digest. If an environment change
+alters experiment semantics (rather than credentials), use a new member ID or output root.
+Changing the definition under an existing ID is rejected. The digest is not a snapshot of
 all source file bytes; inputs must remain replayable and stable. Existing spec/seed identity
 checks still protect explicit keys against changed work. SDK users supply their own digest
 and must include configuration/input semantics not already covered by the task fingerprint.
@@ -128,7 +131,9 @@ combined/                       by_experiment/
 "file"` or `--artifact-backend file`). The default remains inline payloads in SQLite. In Suite
 mode the exact shorthand `file` means a file backend rooted in each layout's `artifacts/`;
 explicit paths, file URIs and backend mappings retain their ordinary external-backend meaning.
-Layout-owned file references are relative and travel with the output root. External backends
+Layout-owned file references are relative and travel with the output root. Reopening inherits
+the manifest backend; an explicit specification must match it exactly.
+Changing backends in place is rejected before opening the database. External backends
 keep their own path/locator contract and are not moved or copied automatically.
 
 `manifest.json` contains the layout version, stable Suite identity, catalog locator and an
@@ -136,11 +141,14 @@ optional backend specification. It never copies expanded member configs or task 
 The catalog stores member definition digests and per-run membership. A task's state, artifacts,
 reset and visit transactions all stay in one data database. There is no cross-database atomic
 checkpoint or second authoritative checkpoint in the catalog. At most eight child connections
-are cached by default; eviction flushes pending history. Missing child databases are errors,
+are cached by default; eviction flushes pending history. Selective runs only write to selected
+member databases, including when reopening an evicted connection; reading other members does
+not create run records or migrate their databases. Missing child databases are errors,
 never silently recreated during recovery.
 
 Results are generated on explicit export. `--by-experiment` treats its output argument as a
-directory and writes `OUTPUT/ID/results.FORMAT`; it works for either storage layout. Each
+directory and writes `OUTPUT/ID/ROWS.FORMAT` (for example `results.jsonl` or `attempts.jsonl`);
+it works for either storage layout. Each
 single-store export atomically replaces its destination after successful writing. A split
 export is atomic per output file, not across the whole directory.
 
@@ -153,9 +161,17 @@ is not implemented.
 
 Opening a Suite directory with `report`, `watch`, `serve` or `export` selects the **cumulative
 Suite view** by default, including successful items skipped during recovery. `--experiment ID`
-selects one member. `--run-id` selects that invocation's admissions and source facts; pipeline
-rows describe their current state, while attempts/events are scoped to the invocation that
-actually produced them. This is not an immutable snapshot of historical pipeline payloads.
+selects one member. `--run-id` selects durable outcomes and source facts for that invocation:
+a failure in run A stays failed after run B succeeds. Successful checkpoints skipped during
+resume are counted as `skipped`, with no execution start time or attempts. Execution durations
+start within that invocation, excluding time between runs. Task outcomes also retain their
+run identity; attempts/events are scoped to the invocation that produced them.
+
+Run outcomes update in the same SQLite transaction as checkpoints, including handoff/visit
+transitions. A process crash can still lose buffered attempt/event details, but committed
+outcomes and attempt counters survive. Payloads remain mutable checkpoints: historical exports
+omit artifacts/results once another run owns the checkpoint, rather than returning newer data.
+Use the cumulative view for the latest available successful results.
 
 The dashboard lists members and links to their detail view. JSON endpoints accept
 `?experiment=ID`, combined with `run_id`; `/experiments` returns member/source status and

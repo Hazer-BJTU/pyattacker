@@ -521,7 +521,7 @@ class SqliteStore(VisitStore):
             "finished_at,n_tasks_total,n_tasks_done,attempts_total,failed_task,error_type,error_message,"
             "traceback,seed_digest,spec_digest,resume_of,handoff_floor,suite_id,experiment_id,local_key,repeat) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(pipeline_id) DO UPDATE SET run_id=excluded.run_id, state=excluded.state, "
+            "ON CONFLICT(pipeline_id) DO UPDATE SET run_id=excluded.run_id, state=excluded.state, repeat=excluded.repeat, "
             "started_at=excluded.started_at, finished_at=excluded.finished_at, "
             "n_tasks_total=excluded.n_tasks_total, n_tasks_done=excluded.n_tasks_done, "
             "attempts_total=excluded.attempts_total, failed_task=excluded.failed_task, "

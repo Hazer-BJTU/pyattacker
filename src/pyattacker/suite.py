@@ -215,7 +215,13 @@ class SuiteSpec:
         return Runner(config=config, pools=self.pools, on_pipeline_finished=on_pipeline_finished)
 
 
-def load_suite(path: Path, raw: Mapping[str, Any], *, strict_env: bool = False) -> SuiteSpec:
+def load_suite(
+    path: Path,
+    raw: Mapping[str, Any],
+    *,
+    strict_env: bool = False,
+    identity_raw: Mapping[str, Any] | None = None,
+) -> SuiteSpec:
     from .declarative import (
         _build_pool,
         _load_raw,
@@ -241,6 +247,7 @@ def load_suite(path: Path, raw: Mapping[str, Any], *, strict_env: bool = False) 
         raise ConfigError("Suite uses output.root; run.store is not allowed")
     _validate_pools(raw.get("pools"))
     shared_raw = dict(raw.get("pools") or {})
+    shared_identity = dict((identity_raw if identity_raw is not None else raw).get("pools") or {})
     pools = [_build_pool(name, spec or {}) for name, spec in shared_raw.items()]
     entries = _mapping(raw.get("experiments"), "experiments")
     experiments = []
@@ -255,7 +262,9 @@ def load_suite(path: Path, raw: Mapping[str, Any], *, strict_env: bool = False) 
         member_path = path.parent / filename
         if not member_path.is_file():
             raise ConfigError(f"experiments.{eid}.config: file does not exist: {member_path}")
-        member_raw = expand_env(_load_raw(member_path), strict=strict_env, unresolved=unresolved)
+        member_identity = _load_raw(member_path)
+        member_raw = expand_env(member_identity, strict=strict_env, unresolved=unresolved)
+        pool_identity = dict(member_identity.get("pools") or {})
         if "suite" in member_raw or "experiments" in member_raw:
             raise ConfigError(f"experiments.{eid}: nested suites are not supported")
         aliases = _mapping(entry.get("pool_bindings", {}), f"experiments.{eid}.pool_bindings")
@@ -264,6 +273,7 @@ def load_suite(path: Path, raw: Mapping[str, Any], *, strict_env: bool = False) 
             if not isinstance(local, str) or not isinstance(target, str) or target not in shared_raw:
                 raise ConfigError(f"experiments.{eid}.pool_bindings: unknown shared pool {target!r}")
             local_raw[local] = shared_raw[target]
+            pool_identity[local] = shared_identity[target]
         # Validate/build the member against the effective pool declarations, without
         # changing its source paths or the task's local resource names.
         effective = dict(member_raw, pools=local_raw)
@@ -280,12 +290,12 @@ def load_suite(path: Path, raw: Mapping[str, Any], *, strict_env: bool = False) 
                     raise ConfigError(f"experiments.{eid}: pool namespace collision")
                 mapping[local] = pool.name
                 pools.append(pool)
-        # Hash effective semantics, never persist expanded secrets. Names/tags are
+        # Pool identity retains environment placeholders so credential rotation is safe. Names/tags are
         # descriptive; local source keys deliberately exclude the template name.
         definition = {
             "spec": member.template.spec_digest,
             "source": member.source,
-            "pools": local_raw,
+            "pools": pool_identity,
             "bindings": dict(aliases),
             "limit": entry.get("limit"),
         }

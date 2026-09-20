@@ -743,13 +743,14 @@ def load_spec(path: str | Path, *, strict_env: bool = False, _raw: dict[str, Any
     if not path.exists():
         raise ConfigError(f"config file does not exist: {path}")
     raw = _load_raw(path) if _raw is None else _raw
+    identity_raw = raw
     unresolved: list[str] = []
     if _raw is None:
         raw = expand_env(raw, strict=strict_env, unresolved=unresolved)
 
     if "suite" in raw or "experiments" in raw:
         from .suite import load_suite
-        suite = load_suite(path, raw, strict_env=strict_env)
+        suite = load_suite(path, raw, strict_env=strict_env, identity_raw=identity_raw)
         suite.unresolved_env.extend(unresolved)
         return suite
 

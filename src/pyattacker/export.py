@@ -214,7 +214,7 @@ def iter_rows(
 
 def _result_rows(store: Store, *, run_id: str | None = None) -> Iterator[dict[str, Any]]:
     for pipeline in iter_pipelines(store, run_id=run_id):
-        final = (next((a for a in iter_artifacts(store, pipeline_id=pipeline.pipeline_id) if a.is_final), None)
+        final = (next((a for a in _scoped_artifacts(store, pipeline.pipeline_id, run_id) if a.is_final), None)
                  if pipeline.state == "succeeded" else None)
         yield {"pipeline_id": pipeline.pipeline_id, "key": pipeline.key,
                "local_key": pipeline.local_key, "repeat": pipeline.repeat,
@@ -222,6 +222,13 @@ def _result_rows(store: Store, *, run_id: str | None = None) -> Iterator[dict[st
                "state": pipeline.state, "result": _decode(final) if final is not None else None,
                "artifact_available": final.available if final is not None else False,
                "error_type": pipeline.error_type, "error_message": pipeline.error_message}
+
+
+def _scoped_artifacts(store: Store, pipeline_id: str, run_id: str | None) -> Iterator[Any]:
+    if run_id is not None and getattr(store, "suite_store", False):
+        yield from store.iter_run_artifacts(pipeline_id=pipeline_id, run_id=run_id)
+    else:
+        yield from iter_artifacts(store, pipeline_id=pipeline_id)
 
 
 def _artifact_rows(store: Store, *, run_id: str | None = None) -> Iterator[dict[str, Any]]:
@@ -232,7 +239,7 @@ def _artifact_rows(store: Store, *, run_id: str | None = None) -> Iterator[dict[
     :func:`~pyattacker.store.base.iter_pipelines` orders by ``(created_at, pipeline_id)``.
     """
     for pipeline in iter_pipelines(store, run_id=run_id):
-        for artifact in iter_artifacts(store, pipeline_id=pipeline.pipeline_id):
+        for artifact in _scoped_artifacts(store, pipeline.pipeline_id, run_id):
             yield _artifact_row(artifact)
 
 

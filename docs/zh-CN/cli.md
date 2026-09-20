@@ -291,6 +291,6 @@ pipeline:
 
 ## Suite 命令
 
-Suite 配置复用 `run`、`resume`、`validate`。`run/resume` 支持重复的 `--experiment ID` 和 `--output-root`；`report/watch/export/serve` 支持 Suite 目录与 `--experiment ID`。`export --rows results` 输出简洁最终结果，`--by-experiment` 写入 OUTPUT/ID/results.FORMAT。Suite 拒绝 `--store`、`run.store` 和分片参数。目录读取默认展示累计结果，`--run-id` 选择一次启动的提交记录与历史。
+Suite 配置复用 `run`、`resume`、`validate`。`run/resume` 支持重复的 `--experiment ID` 和 `--output-root`；`report/watch/export/serve` 支持 Suite 目录与 `--experiment ID`。`export --rows results` 输出简洁最终结果，`--by-experiment` 写入 OUTPUT/ID/ROWS.FORMAT。Suite 拒绝 `--store`、`run.store` 和分片参数。目录读取默认展示累计结果，`--run-id` 选择一次启动的提交记录与历史。
 
 [完整指南与示例](suites.md)。
