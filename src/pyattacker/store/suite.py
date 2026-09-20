@@ -620,6 +620,17 @@ class SuiteStore:
                     )
                     if table == "pipelines":
                         total += cursor.rowcount
+        # The writer lock proves that all prior Suite invocations have stopped,
+        # including ones with only pending/completed work or unselected members.
+        # Finalize their catalog records without opening any additional children.
+        # The actual crash time is unknown: record when recovery detected it.
+        detected_at = time.time()
+        with self.catalog._conn:
+            self.catalog._conn.execute(
+                "UPDATE runs SET status='interrupted',ended_at=?,heartbeat_at=? "
+                "WHERE status='running' AND run_id<>?",
+                (detected_at, detected_at, keep_run_id or ""),
+            )
         return total
 
     def emit_event(self, event: Any) -> None:

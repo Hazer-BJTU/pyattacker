@@ -466,12 +466,19 @@ with suite.runner(handle_signals=False, concurrency=1, on_pipeline_finished=lamb
     crashed_run = reader.latest_run_id()
     assert reader.stats(crashed_run)["pipelines"]["by_state"].get("succeeded") == 1
     assert reader.stats(crashed_run)["attempts_total"] == 1
+    assert reader.get_run(crashed_run).status == "running"
     reader.close()
     report = run(suite, resume=True)
     assert report.skipped == 1
     assert report.stats["pipelines"]["by_state"] == {"succeeded": 3, "skipped": 1}
     reader = SuiteStore(suite.output_root, read_only=True)
     assert reader.stats(crashed_run)["pipelines"]["by_state"].get("succeeded") == 1
+    recovered = reader.get_run(crashed_run)
+    assert recovered.status == "interrupted"
+    assert recovered.ended_at == recovered.heartbeat_at
+    assert recovered.ended_at >= recovered.started_at
+    assert all(row["state"] != "running" for row in reader.experiments(crashed_run))
+    assert read_snapshot(reader, crashed_run)["run_status"] == "interrupted"
     reader.close()
 
 
@@ -570,7 +577,17 @@ def finish(seed):
         capture_output=True,
     )
     assert child.returncode == 24, child.stderr.decode()
+    reader = SuiteStore(str(tmp_path / "out"), read_only=True)
+    crashed_run = reader.latest_run_id()
+    assert reader.get_run(crashed_run).status == "running"
+    reader.close()
     assert main(["run", "-c", str(config), "--resume", "--no-signals"]) == 0
+    reader = SuiteStore(str(tmp_path / "out"), read_only=True)
+    recovered = reader.get_run(crashed_run)
+    assert recovered.status == "interrupted"
+    assert recovered.ended_at == recovered.heartbeat_at
+    assert all(row["state"] != "running" for row in reader.experiments(crashed_run))
+    reader.close()
     assert module.with_suffix(".count").read_text().splitlines() == ["prepared", "prepared"]
 
 
@@ -768,3 +785,38 @@ def test_outcome_updates_rollback_with_checkpoint_transaction(tmp_path, layout):
     finally:
         stream.close()
         store.close()
+
+
+def test_stale_run_finalization_is_selective_and_idempotent(tmp_path, layout, monkeypatch):
+    from pyattacker.store.base import RunRecord
+
+    suite = make_suite(tmp_path, layout)
+    completed = run(suite)
+    store = SuiteStore(suite.output_root)
+    completed_before = store.get_run(completed.run_id)
+    store.select_experiments(suite.id, ["a"])
+    store.start_run(RunRecord("abandoned-before-admission", started_at=100))
+    store.start_run(RunRecord("current", started_at=200))
+    current_before = store.get_run("current")
+    unselected = Path(suite.output_root) / "experiments/b/state.db"
+    before_bytes = unselected.read_bytes() if layout == "by_experiment" else None
+    try:
+        monkeypatch.setattr("pyattacker.store.suite.time.time", lambda: 300)
+        # No running pipeline is required: a crash may precede admission or follow
+        # the final checkpoint but precede finish_run().
+        assert store.interrupt_stale(keep_run_id="current") == 0
+        recovered = store.get_run("abandoned-before-admission")
+        assert recovered.status == "interrupted"
+        assert recovered.ended_at == recovered.heartbeat_at == 300
+        snapshot = read_snapshot(store, recovered.run_id)
+        assert snapshot["run_status"] == "interrupted" and snapshot["elapsed_s"] == 200
+        monkeypatch.setattr("pyattacker.store.suite.time.time", lambda: 400)
+        assert store.interrupt_stale(keep_run_id="current") == 0
+        assert store.get_run(recovered.run_id) == recovered
+        assert read_snapshot(store, recovered.run_id)["elapsed_s"] == 200
+        assert store.get_run("current") == current_before
+        assert store.get_run(completed.run_id) == completed_before
+    finally:
+        store.close()
+    if before_bytes is not None:
+        assert unselected.read_bytes() == before_bytes

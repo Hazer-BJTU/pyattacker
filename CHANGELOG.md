@@ -14,7 +14,8 @@ All notable changes to this project are documented here. The format follows
 * Optional `by_experiment` output directories alongside default `combined` storage, with a
   persistent catalog, source-exhaustion state, selective resume and bounded child connections.
   Directory-aware report/watch/serve/export provide cumulative and durable invocation views,
-  preserving historical failures, skips and execution timing after resume. Unselected member
+  preserving historical failures, skips and execution timing after resume. Recovery finalizes
+  abandoned catalog runs as interrupted, freezing their elapsed time. Unselected member
   databases remain untouched. Pool environment placeholders allow credential rotation;
   reopening validates the persisted artifact backend.
 * `export --rows results`, `--by-experiment`, member-scoped reported metrics, and task context

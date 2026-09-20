@@ -169,7 +169,12 @@ run identity; attempts/events are scoped to the invocation that produced them.
 
 Run outcomes update in the same SQLite transaction as checkpoints, including handoff/visit
 transitions. A process crash can still lose buffered attempt/event details, but committed
-outcomes and attempt counters survive. Payloads remain mutable checkpoints: historical exports
+outcomes and attempt counters survive. On resume, the exclusive writer lock also permits
+marking previous catalog runs still labeled `running` as `interrupted`, without modifying
+unselected member databases. Their end and heartbeat timestamps record when recovery detected
+the interruption (the exact crash time is unknown), so historical elapsed time stops growing.
+
+Payloads remain mutable checkpoints: historical exports
 omit artifacts/results once another run owns the checkpoint, rather than returning newer data.
 Use the cumulative view for the latest available successful results.
 
