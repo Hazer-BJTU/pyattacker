@@ -1340,6 +1340,7 @@ with closing(open_store("runs/qa.db")) as store:      # reopen a finished run, a
 | `tasks` | 一个任务：最终状态、已用尝试次数、耗时、错误 | `store.tasks(...)` |
 | `attempts` | 一次尝试：结果（`succeeded`/`failed`/`timeout`/`cancelled`/`handed_off`）、错误类别、**重试决策**、租约、耗时 | `store.attempts(...)` |
 | `artifacts` | 一个工件 | `store.artifacts(pid)`, `store.get_artifact(pid, seq)` |
+| `results` | 流水线最终结果、状态、错误和实验归属 | 同流水线顺序 |
 | `handoffs` | 一次交接：起点/目标位置、入口工件、是否复用、原因 | `store.handoffs(...)`（**可选能力**），嵌套在 `export_rows()` 中 |
 | `events` | 一个结构化事件 | `store.events(...)` |
 | `resources` | 一个资源：规格（spec，密钥已脱敏）和健康统计 | 包含在 `stats()` 中 |
@@ -1779,12 +1780,12 @@ ID，但 Runner 在跳过或恢复**之前**查已存的规格和种子摘要。
 
 ## 导出
 
-五种行形态，三种格式。行以有界批从存储流式读出；合并报告
+六种行形态，三种格式。行以有界批从存储流式读出；合并报告
 （把 N 个存储汇成一个连贯答案）是唯一必须把行留内存的地方。
 
 | 名称 | 值 |
 |---|---|
-| `ROW_KINDS` | `("pipelines", "tasks", "attempts", "events", "artifacts")` |
+| `ROW_KINDS` | `("pipelines", "tasks", "attempts", "events", "artifacts", "results")` |
 | `FORMATS` | `("jsonl", "json", "csv")` |
 
 | 函数 | 用途 |
@@ -2183,3 +2184,9 @@ with StatsServer("runs/qa.db", port=8787) as server:
 | [`docs/cli.md`](cli.md) | 命令、flag、退出码、配置文件格式 |
 | [`docs/design.md`](design.md) | 模型、不变量，以及这些 API 背后的权衡 |
 | [`examples/`](../../examples) | 完整程序，包括对多种流水线形态的实测比较 |
+
+## Suite API
+
+`ExperimentSpec(id, factory, definition_digest, pool_aliases={}, label="", config_path="", ignored_run_fields=[], limit=None)` 描述一个可重复打开的输入工厂。`SuiteSpec(id, experiments, output_root, layout="combined", pools=[], run={}, path="", unresolved_env=[])` 组合成员。使用 `suite.runner(on_pipeline_finished=callback, **run_overrides)` 和 `runner.run(suite.pipelines(runner.store, experiments=None, limit=None))` 执行。`SuiteStore(root, read_only=True, experiment=None, max_open=8)` 可以打开两种布局，两者都需要这套存储能力。`TaskContext` 提供 `suite_id`、`experiment_id`、`local_key`、`output_dir`，`PipelineRecord` 还保留 `repeat`。`Runner.report_metric` 接受 `experiment_id` 写入成员指标。这里列出的空容器默认值在实现中使用 dataclass 工厂，不共享可变参数。
+
+[完整指南与示例](suites.md)。

@@ -61,13 +61,18 @@ def _shard_env_preview(count: int) -> Iterator[None]:
             del os.environ[key]
 
 
-def _open_readonly(path: str, backend: Any = None) -> SqliteStore:
+def _open_readonly(path: str, backend: Any = None, experiment: str | None = None) -> Any:
     """Open an existing store read-only; give a human-readable error when the file is missing.
 
     ``backend`` matters for reads too: payloads spilled out of the database are hydrated through it.
     """
     if not Path(path).exists():
         raise ConfigError(f"store does not exist: {path} (run 'run' or 'demo' first to create one)")
+    if Path(path).is_dir():
+        from .store.suite import SuiteStore
+        return SuiteStore(path, read_only=True, backend=backend, experiment=experiment)
+    if experiment is not None:
+        raise ConfigError("--experiment requires a Suite output directory")
     return SqliteStore(path, read_only=True, backend=backend)
 
 
@@ -86,13 +91,27 @@ def _table(rows: Sequence[Sequence[Any]], header: Sequence[str]) -> str:
 # --------------------------------------------------------------------- run
 def _cmd_run(args: argparse.Namespace, *, resume: bool = False) -> int:
     """One process, one shard (or all of it). ``run --shards N`` orchestrates children of this."""
+    resume = resume or args.resume
+    if args.limit is not None and args.limit < 0:
+        raise ConfigError("--limit must be non-negative")
+    preview = _shard_env_preview(args.shards) if args.shards else contextlib.nullcontext()
+    with preview:
+        spec = load_spec(args.config, strict_env=args.strict_env)
+    from .suite import SuiteSpec
+    if isinstance(spec, SuiteSpec):
+        if args.shard is not None or args.shards is not None:
+            raise ConfigError("Suite mode does not support --shard/--shards: resource limits are process-local")
+        if args.store:
+            raise ConfigError("Suite uses output.root, not --store; use --output-root")
+        spec.select(args.experiment)
+    elif args.experiment or args.output_root:
+        raise ConfigError("--experiment/--output-root require a Suite config")
     shard = parse_shard(getattr(args, "shard", None))
     if getattr(args, "shards", None):
         if shard is not None:
             raise ConfigError("--shard and --shards are mutually exclusive")
         return _run_shards(args, resume=resume)
 
-    spec = load_spec(args.config, strict_env=args.strict_env)
     _warn_unresolved_env(spec)
     # `RUN_FIELDS` is the same schema `load_spec` validated against, so a config field can never be
     # silently dropped here again (artifact_backend and the write-behind knobs used to be).
@@ -136,44 +155,61 @@ def _cmd_run(args: argparse.Namespace, *, resume: bool = False) -> int:
     if args.no_signals:
         config.handle_signals = False
 
+    if isinstance(spec, SuiteSpec):
+        if args.output_root:
+            spec.output_root = str(Path(args.output_root).resolve())
+        from .store.suite import SuiteStore
+        suite_store = SuiteStore.create(spec, journal=config.journal, backend=config.artifact_backend,
+                                        write_behind=config.write_behind, batch_size=config.write_batch,
+                                        flush_interval=config.flush_interval)
+        config.store = suite_store
     runner = Runner(pools=spec.pools, config=config)
     stop_progress = threading.Event()
     progress = None
     if args.progress and str(config.store) != ":memory:":
         progress = threading.Thread(
             target=_progress_loop,
-            args=(str(config.store), lambda: runner.run_id, stop_progress),
+            args=(spec.output_root if isinstance(spec, SuiteSpec) else str(config.store),
+                  lambda: runner.run_id, stop_progress),
             daemon=True,
         )
         progress.start()
-    specs = spec.pipelines(limit=args.limit)
+    specs = (spec.pipelines(runner.store, experiments=args.experiment, limit=args.limit)
+             if isinstance(spec, SuiteSpec) else spec.pipelines(limit=args.limit))
     if shard is not None:
         specs = shard_specs(specs, shard[0], shard[1])
     try:
         report = runner.run(specs, resume=resume)
     except KeyboardInterrupt:  # pragma: no cover - signal handling already took over
+        runner.close()
         print("\ninterrupted (KeyboardInterrupt)", file=sys.stderr)
         return 130
+    except BaseException:
+        runner.close()
+        raise
     finally:
         stop_progress.set()
         if progress is not None:
             progress.join(timeout=2)
     if args.summary_format == "json":
         payload = report.to_dict()
-        payload["store"] = str(config.store)
+        payload["store"] = spec.output_root if isinstance(spec, SuiteSpec) else str(config.store)
         payload["shard"] = f"{shard[0]}/{shard[1]}" if shard else "1/1"
         print(json.dumps(payload, ensure_ascii=False, default=str))
     else:
         print(report.summary())
     failed = report.stats.get("pipelines", {}).get("by_state", {}).get("failed", 0)
     if report.status == "interrupted":
+        runner.close()
         print("Re-run the same command with --resume to continue: unfinished tasks resume from their checkpoint", file=sys.stderr)
         return 130
     # `repair_failures` is run-local on purpose: a pipeline this run could not settle out of a torn
     # terminal state keeps the row (and therefore the run_id) of the run that created it, so it can never
     # appear in the run-scoped by_state above. Without this term the command would exit 0 after a failed
     # repair, which is the silent-success shape this whole path exists to remove.
-    return 1 if failed or report.repair_failures else 0
+    source_errors = report.stats.get("source_errors", 0)
+    runner.close()
+    return 1 if failed or report.repair_failures or source_errors else 0
 
 
 # ------------------------------------------------------------------- shards
@@ -309,7 +345,7 @@ def _last_json_line(text: str) -> dict[str, Any] | None:
 def _progress_loop(store_path: str, run_id_getter: Any, stop: threading.Event) -> None:
     """Read the same SQLite file from another thread (WAL allows one writer, many readers) — shows that a separate process can watch it too."""
     try:
-        store = SqliteStore(store_path, read_only=True)
+        store = _open_readonly(store_path)
     except Exception:
         return
     try:
@@ -335,15 +371,16 @@ def _cmd_report(args: argparse.Namespace) -> int:
     paths = list(args.store)
     if len(paths) > 1:
         return _report_merged(paths, args)
-    store = _open_readonly(paths[0], args.artifact_backend)
+    store = _open_readonly(paths[0], args.artifact_backend, args.experiment)
     try:
-        run_id = args.run_id or _latest_run_id(store)
+        run_id = args.run_id or ("all" if getattr(store, "suite_store", False) else _latest_run_id(store))
         if run_id is None:
             print("(no pipeline records in the store)")
             return 0
-        stats = store.stats(run_id)
+        query_run_id = None if run_id == "all" else run_id
+        stats = store.stats(query_run_id)
         print(render_snapshot(read_snapshot(store, run_id, errors=args.errors), width=24))
-        errors = store.errors(run_id=run_id, limit=args.errors)
+        errors = store.errors(run_id=query_run_id, limit=args.errors)
         if errors:
             print("\nFailure details:")
             print(
@@ -358,7 +395,7 @@ def _cmd_report(args: argparse.Namespace) -> int:
         # Repair failures: associate them with the pipelines in this report, not globally.
         # The repair event's run_id may differ from the pipeline row's run_id (the row stays
         # owned by the original failed run), so we derive the scope from the selected pipelines.
-        report_pipelines = store.pipelines(run_id=run_id)
+        report_pipelines = store.pipelines(run_id=query_run_id)
         repair_failed_pids = set()
         repair_details = []
         for row in report_pipelines:
@@ -385,7 +422,7 @@ def _cmd_report(args: argparse.Namespace) -> int:
 
 def _report_merged(paths: list[str], args: argparse.Namespace) -> int:
     """A report over several shards: rows are de-duplicated first, then statistics recomputed."""
-    stores = [_open_readonly(path, args.artifact_backend) for path in paths]
+    stores = [_open_readonly(path, args.artifact_backend, args.experiment) for path in paths]
     try:
         merged = merge_reports(stores, run_id=args.run_id)
     finally:
@@ -404,9 +441,9 @@ def _latest_run_id(store: Any) -> str | None:
 
 # ------------------------------------------------------------------- watch
 def _cmd_watch(args: argparse.Namespace) -> int:
-    store = _open_readonly(args.store)
+    store = _open_readonly(args.store, experiment=args.experiment)
     try:
-        run_id = args.run_id or _latest_run_id(store)
+        run_id = args.run_id or ("all" if getattr(store, "suite_store", False) else _latest_run_id(store))
         asyncio.run(
             watch(
                 store,
@@ -426,10 +463,12 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 # ------------------------------------------------------------------ export
 def _cmd_export(args: argparse.Namespace) -> int:
     paths = list(args.store)
+    if args.by_experiment and (len(paths) != 1 or not Path(paths[0]).is_dir()):
+        raise ConfigError("--by-experiment requires one Suite directory")
     if len(paths) > 1 and args.rows == "pipelines":
         # Several shards: merging is what makes the file usable (the same pipeline can appear in
         # more than one shard after a shard-count change), so it is not optional here.
-        stores = [_open_readonly(path, args.artifact_backend) for path in paths]
+        stores = [_open_readonly(path, args.artifact_backend, args.experiment) for path in paths]
         try:
             merged = merge_reports(stores, run_id=args.run_id)
             count = merged.export(args.output, fmt=args.format)
@@ -439,7 +478,22 @@ def _cmd_export(args: argparse.Namespace) -> int:
         print(f"exported {count} merged pipelines from {len(paths)} stores → {args.output}")
         return 0
 
-    stores = [_open_readonly(path, args.artifact_backend) for path in paths]
+    if args.by_experiment:
+        catalog = _open_readonly(paths[0], args.artifact_backend, args.experiment)
+        try:
+            for member in catalog.experiments(args.run_id):
+                eid = member["experiment_id"]
+                selected = _open_readonly(paths[0], args.artifact_backend, eid)
+                try:
+                    destination = str(Path(args.output) / eid / f"{args.rows}.{args.format}")
+                    export_store(selected, destination, kind=args.rows, fmt=args.format, run_id=args.run_id)
+                    print(f"exported {eid} → {destination}")
+                finally:
+                    selected.close()
+        finally:
+            catalog.close()
+        return 0
+    stores = [_open_readonly(path, args.artifact_backend, args.experiment) for path in paths]
     try:
         if len(stores) == 1:
             count = export_store(
@@ -461,7 +515,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     """Read-only HTTP view of a store: a dashboard for humans, JSON for everything else."""
     if not Path(args.store).exists():
         raise ConfigError(f"store does not exist: {args.store} (run something first)")
-    server = StatsServer(args.store, host=args.host, port=args.port, run_id=args.run_id).start()
+    server = StatsServer(args.store, host=args.host, port=args.port, run_id=args.run_id, **({"experiment": args.experiment} if args.experiment else {})).start()
     print(f"serving {args.store} at {server.url}  (read-only; Ctrl-C to stop)")
     print(f"  {server.url}/            dashboard")
     print(f"  {server.url}/stats       JSON snapshot")
@@ -569,6 +623,8 @@ def _cmd_demo(args: argparse.Namespace) -> int:
 # -------------------------------------------------------------------- main
 def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-c", "--config", required=True, help="yaml/toml/json config")
+    parser.add_argument("--experiment", action="append", help="Suite member to run (repeatable)")
+    parser.add_argument("--output-root", help="override Suite output directory")
     parser.add_argument("--limit", type=int, default=None, help="run only the first N pipelines")
     parser.add_argument(
         "--store",
@@ -753,6 +809,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--errors", type=int, default=10)
     p_report.add_argument("--json", action="store_true")
     p_report.add_argument("--artifact-backend", default=None, metavar="SPEC")
+    p_report.add_argument("--experiment", help="select one Suite member")
     p_report.set_defaults(func=_cmd_report)
 
     p_watch = sub.add_parser("watch", help="live monitoring (a separate process can watch the same store)")
@@ -761,6 +818,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--interval", type=float, default=1.0)
     p_watch.add_argument("--iterations", type=int, default=None)
     p_watch.add_argument("--no-clear", action="store_true")
+    p_watch.add_argument("--experiment", help="select one Suite member")
     p_watch.set_defaults(func=_cmd_watch)
 
     p_export = sub.add_parser("export", help="export records as jsonl/json/csv")
@@ -770,6 +828,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--rows", choices=list(ROW_KINDS), default="pipelines")
     p_export.add_argument("--format", choices=list(FORMATS), default="jsonl", dest="format")
     p_export.add_argument("--artifact-backend", default=None, metavar="SPEC")
+    p_export.add_argument("--by-experiment", action="store_true", help="write OUTPUT/ID/ROWS.FORMAT for each Suite member")
+    p_export.add_argument("--experiment", help="select one Suite member")
     p_export.set_defaults(func=_cmd_export)
 
     p_serve = sub.add_parser("serve", help="serve a read-only HTTP view of a store")
@@ -777,6 +837,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8787)
     p_serve.add_argument("--run-id", default=None)
+    p_serve.add_argument("--experiment", help="select one Suite member")
     p_serve.set_defaults(func=_cmd_serve)
 
     p_plugins = sub.add_parser("plugins", help="list installed plugins (entry points)")

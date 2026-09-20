@@ -1408,6 +1408,7 @@ Reading a live store while a run writes to it is supported — WAL allows one wr
 | `tasks` | task: final state, attempts used, duration, error | `store.tasks(...)` |
 | `attempts` | attempt: outcome (`succeeded`/`failed`/`timeout`/`cancelled`/`handed_off`), error class, **retry decision**, leases, duration | `store.attempts(...)` |
 | `artifacts` | artifact | `store.artifacts(pid)`, `store.get_artifact(pid, seq)` |
+| `results` | final result, status, error and experiment identity per pipeline | pipeline order |
 | `handoffs` | handoff: from/to position, entry artifact, whether it was reused, reason | `store.handoffs(...)` (**optional capability**), nested in `export_rows()` |
 | `events` | structured event | `store.events(...)` |
 | `resources` | resource: spec (secrets masked) and health stats | included in `stats()` |
@@ -1859,12 +1860,12 @@ external side effects idempotent.
 
 ## Export
 
-Five row shapes, three formats. Rows stream out of the store in bounded batches; the merged report
+Six row shapes, three formats. Rows stream out of the store in bounded batches; the merged report
 (N stores into one coherent answer) is the one place that has to hold rows in memory.
 
 | Name | Value |
 |---|---|
-| `ROW_KINDS` | `("pipelines", "tasks", "attempts", "events", "artifacts")` |
+| `ROW_KINDS` | `("pipelines", "tasks", "attempts", "events", "artifacts", "results")` |
 | `FORMATS` | `("jsonl", "json", "csv")` |
 
 | Function | Purpose |
@@ -2268,3 +2269,9 @@ command line.
 | [`docs/cli.md`](cli.md) | commands, flags, exit codes, config file format |
 | [`docs/design.md`](design.md) | the model, the invariants, and the tradeoffs behind these APIs |
 | [`examples/`](../examples) | complete programs, including a measured comparison of pipeline shapes |
+
+## Suite API
+
+`ExperimentSpec(id, factory, definition_digest, pool_aliases={}, label="", config_path="", ignored_run_fields=[], limit=None)` describes one replayable input factory. `SuiteSpec(id, experiments, output_root, layout="combined", pools=[], run={}, path="", unresolved_env=[])` composes members. Use `suite.runner(on_pipeline_finished=callback, **run_overrides)` and `runner.run(suite.pipelines(runner.store, experiments=None, limit=None))`. `SuiteStore(root, read_only=True, experiment=None, max_open=8)` opens either layout. Both layouts require this store capability. `TaskContext` exposes `suite_id`, `experiment_id`, `local_key`, `output_dir`; `PipelineRecord` also preserves `repeat`. `Runner.report_metric` accepts `experiment_id` for member metrics. Defaults written as empty containers here are dataclass factories, not shared mutable arguments.
+
+[Full guide and examples](suites.md).

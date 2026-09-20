@@ -33,9 +33,14 @@ def render_snapshot(snapshot: Mapping[str, Any], *, width: int = 20) -> str:
     total = pipes.get("total", 0)
     status = snapshot.get("run_status")
     tail = "  [stopping]" if snapshot.get("stopping") else (f"  [status={status}]" if status else "")
+    heading = (f"suite={snapshot['suite_id']}  scope={snapshot.get('scope', 'suite')}"
+               if snapshot.get("suite_id") else
+               f"run={snapshot.get('run_id')}  elapsed={snapshot.get('elapsed_s')}s")
     lines = [
-        f"run={snapshot.get('run_id')}  elapsed={snapshot.get('elapsed_s')}s"
-        f"  in-flight={snapshot.get('in_flight_pipelines', 0)}" + tail,
+        heading
+        # Existing single-run displays retain their elapsed-time header.
+        # The Suite cumulative view has no single elapsed time.
+        + f"  in-flight={snapshot.get('in_flight_pipelines', 0)}" + tail,
         f"pipelines {_bar(total - by_state.get('running', 0) - by_state.get('pending', 0), total, width)} "
         f"{total}  " + " ".join(f"{k}={v}" for k, v in sorted(by_state.items())),
     ]
@@ -77,6 +82,14 @@ def render_snapshot(snapshot: Mapping[str, Any], *, width: int = 20) -> str:
             f"  ! {item.get('name')}/{item.get('failed_task')}: {item.get('error_type')}: "
             f"{str(item.get('error_message'))[:80]}"
         )
+    for experiment in snapshot.get("experiments", []):
+        counts = experiment["pipelines"]
+        lines.append(f"  {experiment['experiment_id']}: {experiment['state']} "
+                     f"{counts['by_state']} source_exhausted={experiment['source_exhausted']}")
+        if experiment.get("source_error"):
+            lines.append(f"    source: {experiment['source_error']}")
+        for metric in experiment.get("reported_metrics", []):
+            lines.append(f"    {metric['name']}={metric['value']}")
     return "\n".join(lines)
 
 
@@ -86,6 +99,8 @@ def resolve_run_id(store: Any, run_id: str | None = None) -> str | None:
         return None
     if run_id is not None:
         return run_id
+    if getattr(store, "suite_store", False):
+        return None
     latest = getattr(store, "latest_run_id", None)
     return latest() if callable(latest) else None
 
@@ -101,7 +116,7 @@ def read_snapshot(store: Any, run_id: str | None = None, *, errors: int = 3) -> 
     snapshot["reported_metrics"] = [
         {"name": row.name, "value": row.value, "label": row.label, "display": row.display}
         for row in read_reported_metrics(store, run_id=run_id)
-    ] if run_id is not None and not aggregate else []
+    ] if (run_id is not None and not aggregate) or getattr(store, "suite_store", False) else []
     run = store.get_run(run_id) if run_id else None
     if run is not None:
         snapshot["elapsed_s"] = round((run.ended_at or time.time()) - run.started_at, 2)

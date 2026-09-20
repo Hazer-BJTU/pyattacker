@@ -1,0 +1,14 @@
+{
+  "run": {"store": "runs/standalone.db", "concurrency": 8},
+  "pools": {
+    "apis": {"resources": [{"id": "standalone-api", "capacity": 2}]}
+  },
+  "pipeline": {
+    "name": "qa",
+    "tasks": [
+      {"use": "echo"},
+      {"use": "simulate_llm", "resource": "apis", "kwargs": {"latency_ms": 2, "fail_rate": 0, "tokens": 16}}
+    ]
+  },
+  "source": {"kind": "range", "n": 6}
+}

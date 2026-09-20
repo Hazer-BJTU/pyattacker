@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -42,6 +43,7 @@ _PAGE = """<!doctype html>
 </style></head><body>
 <h1>pyattacker <span id="run" class="k"></span></h1>
 <div class="row" id="cards"></div>
+<h2>Suite experiments</h2><div id="experiments"></div>
 <h2>Experiment metrics</h2><div class="row" id="metrics"></div>
 <h2>Pipeline reports (first 50)</h2>
 <table><thead><tr><th>pipeline</th><th>reported status</th></tr></thead><tbody id="pipeline-metrics"></tbody></table>
@@ -62,10 +64,29 @@ function showMetrics(rows){
 }
 async function tick(){
   const requested = new URLSearchParams(location.search).get('run_id');
-  const statsPath = requested ? 'stats?run_id=' + encodeURIComponent(requested) : 'stats';
+  const filters = new URLSearchParams(location.search);
+  const statsPath = 'stats?' + filters.toString();
   const s = await (await fetch(statsPath)).json();
-  const scope = 'run_id=' + encodeURIComponent(requested === 'all' ? 'all' : (s.run_id || 'all'));
-  document.getElementById('run').textContent = s.run_id || 'all runs';
+  let scope = 'run_id=' + encodeURIComponent(requested === 'all' ? 'all' : (s.run_id || 'all'));
+  if(filters.has('experiment')) scope += '&experiment=' + encodeURIComponent(filters.get('experiment'));
+  const members = document.getElementById('experiments'); members.replaceChildren();
+  if(s.suite_id){
+    const all = document.createElement('a');
+    const overview = new URLSearchParams(location.search); overview.delete('experiment');
+    all.href = '?' + overview.toString(); all.textContent = 'All experiments'; members.append(all);
+  }
+  for(const exp of (s.experiments || [])){
+    const line = document.createElement('p');
+    const link = document.createElement('a');
+    const selected = new URLSearchParams(location.search); selected.set('experiment', exp.experiment_id);
+    link.href = '?' + selected.toString(); link.textContent = exp.label || exp.experiment_id;
+    line.append(link, document.createTextNode(' ' + exp.state + ' ' + JSON.stringify(exp.pipelines.by_state)));
+    for(const metric of exp.reported_metrics || []){
+      line.append(document.createTextNode(' ' + metric.name + '=' + String(metric.value)));
+    }
+    members.append(line);
+  }
+  document.getElementById('run').textContent = s.run_id || s.suite_id || 'all runs';
   const states = (s.pipelines||{}).by_state||{};
   const cards = [['total',(s.pipelines||{}).total||0],
     ...Object.entries(states).map(([k,v])=>[k,v]),
@@ -116,12 +137,14 @@ class StatsServer:
         port: int = 8787,
         run_id: str | None = None,
         errors: int = 10,
+        experiment: str | None = None,
     ) -> None:
         self.store_spec = store
         self.host = host
         self.port = port
         self.run_id = run_id
         self.errors = errors
+        self.experiment = experiment
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self.requests = 0
@@ -169,7 +192,7 @@ class StatsServer:
         self.stop()
 
     # ------------------------------------------------------------------ data
-    def _read(self, fn: Any) -> Any:
+    def _read(self, fn: Any, experiment: str | None = None) -> Any:
         """Run one read against the store.
 
         A file store gets a fresh *read-only* connection per request: never the writer's
@@ -181,7 +204,11 @@ class StatsServer:
         if isinstance(store, str) and store not in (":memory:", "memory"):
             from .store.sqlite import SqliteStore
 
-            handle: Store = SqliteStore(store, read_only=True)
+            if Path(store).is_dir():
+                from .store.suite import SuiteStore
+                handle = SuiteStore(store, read_only=True, experiment=experiment or self.experiment)
+            else:
+                handle = SqliteStore(store, read_only=True)
         else:
             handle = open_store(store)
         try:
@@ -195,6 +222,10 @@ class StatsServer:
         limit = _int(query.get("limit"), 50)
         run_id = (query.get("run_id") or [self.run_id])[0]
 
+        experiment = (query.get("experiment") or [self.experiment])[0]
+        def read(fn: Any) -> Any:
+            return self._read(fn, experiment=experiment)
+
         if path in ("/healthz", "/health"):
             return 200, {"ok": True}
 
@@ -202,28 +233,31 @@ class StatsServer:
             return 200, {"_html": _PAGE}
 
         if path == "/stats":
-            snapshot = self._read(lambda store: read_snapshot(store, run_id, errors=self.errors))
+            snapshot = read(lambda store: read_snapshot(store, run_id, errors=self.errors))
             snapshot.pop("buffered", None)
             return 200, snapshot
+
+        if path == "/experiments":
+            return 200, {"rows": read(lambda store: store.experiments(run_id) if getattr(store, "suite_store", False) else [])}
 
         if path == "/metrics":
             pipeline_id = (query.get("pipeline_id") or [None])[0]
 
             def _metrics(store: Any) -> Any:
                 selected = resolve_run_id(store, run_id)
-                rows = read_reported_metrics(store, run_id=selected, pipeline_id=pipeline_id) if selected else []
+                rows = read_reported_metrics(store, run_id=selected, pipeline_id=pipeline_id) if selected or getattr(store, "suite_store", False) else []
                 return selected, [
-                    {"run_id": row.run_id, "pipeline_id": row.pipeline_id,
+                    {"run_id": row.run_id, "pipeline_id": row.pipeline_id, "experiment_id": row.experiment_id,
                      "name": row.name, "value": row.value, "label": row.label,
                      "display": row.display, "updated_at": row.updated_at}
                     for row in rows
                 ]
 
-            selected, rows = self._read(_metrics)
+            selected, rows = read(_metrics)
             return 200, {"run_id": selected, "rows": rows}
 
         if path == "/events":
-            rows = self._read(
+            rows = read(
                 lambda store: [
                     {
                         "event_id": event.event_id,
@@ -257,6 +291,8 @@ class StatsServer:
                     rows.append(
                         {
                             "pipeline_id": record.pipeline_id,
+                            "suite_id": record.suite_id, "experiment_id": record.experiment_id,
+                            "local_key": record.local_key, "repeat": record.repeat,
                             "name": record.name,
                             "state": record.state,
                             "run_id": record.run_id,
@@ -283,7 +319,7 @@ class StatsServer:
                     )
                 return rows
 
-            rows = self._read(_pipelines)
+            rows = read(_pipelines)
             return 200, {"rows": rows, "limit": limit}
 
         if path == "/resources":
@@ -303,7 +339,7 @@ class StatsServer:
             return 200, {"rows": rows}
 
         if path == "/errors":
-            return 200, {"rows": self._read(lambda store: store.errors(
+            return 200, {"rows": read(lambda store: store.errors(
                 run_id=resolve_run_id(store, run_id), limit=limit
             ))}
 

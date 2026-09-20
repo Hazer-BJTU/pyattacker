@@ -619,7 +619,10 @@ class TaskContext:
         "clock",
         "default_algorithm",
         "default_pool",
+        "experiment_id",
+        "local_key",
         "meta",
+        "output_dir",
         "pipeline_id",
         "pipeline_key",
         "pipeline_name",
@@ -629,6 +632,7 @@ class TaskContext:
         "run_id",
         "seed",
         "seq",
+        "suite_id",
         "task_name",
         "visit",
     )
@@ -656,6 +660,10 @@ class TaskContext:
         report_metric: Callable[..., Any] | None = None,
         meta: Mapping[str, Any] | None = None,
     ) -> None:
+        self.suite_id = (meta or {}).get("suite_id")
+        self.experiment_id = (meta or {}).get("experiment_id")
+        self.local_key = (meta or {}).get("local_key")
+        self.output_dir = (meta or {}).get("output_dir")
         self.run_id = run_id
         self.pipeline_id = pipeline_id
         self.pipeline_key = pipeline_key

@@ -421,3 +421,7 @@ uv build                     # sdist + wheel
 ## 许可证
 
 MIT——见 [LICENSE](https://github.com/Hazer-BJTU/pyattacker/blob/main/LICENSE)。
+
+## 实验集合
+
+把已有配置文件组合到同一个 Runner，共享资源池和总并发。可选的按子实验分目录布局分别保存检查点、结果和文件产物；Suite 报告包含恢复前已完成的结果。参见 [Suite 指南](docs/zh-CN/suites.md) 和 [可运行配置](examples/suites/suite.json)。
