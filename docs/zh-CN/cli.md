@@ -120,7 +120,7 @@ pyattacker report STORE [STORE ...] [--run-id ID] [--errors N] [--json] [--artif
 
 如果存储里有过终端修复失败的尝试，report 会单独列出（`Terminal repair failures: N pipeline(s)`），每条注明流水线和失败阶段。这是事后可观测性指标：实时运行的 `RunReport.repair_failures` 是运行本地的计数器，事后视图从事件日志里查询这些流水线的修复失败历史——范围和报告里的流水线一致，不是全局统计。
 
-开了交接的运行会在摘要行里注明（`... attempts: total=12 handoffs=2`），`export` 的 `--rows pipelines` 会带上账本本身（见[进阶：交接](reference.md#进阶交接可选启用)）。
+开了交接的运行会在摘要行里注明（`... attempts: total=12 handoffs=2`），`export` 的 `--rows pipelines` 会带上账本本身（见[交接](reference.md#交接可选启用)）。
 
 ## `watch` —— 实时监控
 
@@ -252,9 +252,11 @@ source: { kind: jsonl, path: data.jsonl, limit: 100, key_field: id, repeats: 1 }
 
 `${VAR}` 从环境变量展开（见 `--strict-env`）。`source.kind` 是 `jsonl` 或 `range`；`repeats: k` 就是 pass@k——每个种子 k 条独立流水线。CLI 参数覆盖 `run:` 块。
 
-### `pipeline.control` —— 进阶可选的交接
+<a id="pipelinecontrol--进阶可选的交接"></a>
 
-配置还能声明哪个任务允许通过返回 [`Handoff`](reference.md#进阶交接可选启用) 来**交接**（向前跳过），这样同一条流水线就能用声明式表达：
+### `pipeline.control` —— 显式声明的交接
+
+配置还能声明哪个任务允许通过返回 [`Handoff`](reference.md#交接可选启用) 来**交接**（向前跳过），这样同一条流水线就能用声明式表达：
 
 ```yaml
 pipeline:
@@ -270,17 +272,19 @@ pipeline:
     - { use: my_pkg.tasks:report, name: report }
 ```
 
-目标可以是任务名、任务的数字 seq，或 `end`，必须严格晚于来源（`edges` 只向前）。链里出现两次的同名任务必须用 seq 指定。*最后一个*任务声明 `end` 会被拒，因为没意义。每个问题都带字段路径报出来——`pipeline.control.edges['judge'][0]: destination 'fetch' (seq 0) is not later than the source 'judge' (seq 2); v1 handoffs are forward-only`——`validate`（退出码 2）和 `run` 都走同一个校验入口，表现一致。`edges` 块里没有别的 key，本版本也没有 `mode`；反向遍历用自己的 `rewind` / `retry_all` / `max_handoffs` key（见[进阶反向控制声明](cli.md#进阶反向控制声明)）。
+目标可以是任务名、任务的数字 seq，或 `end`，必须严格晚于来源（`edges` 只向前）。链里出现两次的同名任务必须用 seq 指定。*最后一个*任务声明 `end` 会被拒，因为没意义。每个问题都带字段路径报出来——`pipeline.control.edges['judge'][0]: destination 'fetch' (seq 0) is not later than the source 'judge' (seq 2); v1 handoffs are forward-only`——`validate`（退出码 2）和 `run` 都走同一个校验入口，表现一致。`edges` 块里没有别的 key，本版本也没有 `mode`；反向遍历用自己的 `rewind` / `retry_all` / `max_handoffs` key（见[反向控制声明](cli.md#反向控制声明)）。
 
 数字源 key 在 YAML、JSON、TOML 里都能用：JSON/TOML 把 seq 0 写成 key `"0"`（比如 `"edges": {"0": [2]}`）。精确任务名优先于数字字符串。数字目标还是整数。同一个来源既用名称又用 seq 声明是错的，不会悄悄替换其中一个。生效后的配置对重名的或 `end` 这种保留名用数字 seq 表示，不会发明 `name#N` 语法。
 
-这个功能属于**进阶**：它改执行模型，所以是可选的、1.0 之前标记实验性，还需要支持原子提交交接的存储（两个内置后端都支持）。不带这个配置块的流水线完全不受影响。API 见[参考 → 进阶：交接](reference.md#进阶交接可选启用)，模型见[设计 §4.8](design.md#48-进阶交接--声明式正向跳转可选启用实验性)。
+交接是**正式的控制流特性**：需要显式声明 `control`，并使用支持原子提交交接的存储（两个内置后端都支持）。不带这个配置块的流水线完全不受影响。API 见[参考 → 交接](reference.md#交接可选启用)，模型见[设计 §4.8](design.md#48-交接--声明式正向跳转可选启用)。
 
 声明式层只管**组装和资源**；逻辑还在 Python 里，在 `use:` 后面。它表达不了的东西，都该用 SDK 而不是往 YAML 里加东西——这条界线画在哪，看 [`docs/tutorial.md`](tutorial.md)（第 11 步）。
 
-### 进阶反向控制声明
+<a id="进阶反向控制声明"></a>
 
-`pipeline.control` 还接 `rewind: {source: [earlier_targets]}`、`retry_all: [sources]`，以及反向遍历必须的正整数 `max_handoffs`。纯反向的方案里 `edges` 是可选的；已有的纯向前声明不变。`run.max_handoffs` 设运行时上限（默认 1000）。校验复用 Python 的名称/seq 解析，报配置字段路径。回退载荷由任务代码选，不是配置选。语法、访问模型、预算生命周期和载荷缺失恢复见 [reference → 进阶：反向遍历](reference.md#进阶反向遍历rewindretry-allvisits)；可运行的 Python 示例（含 `HistoryArtifact`）见 [tutorial 第 16–17 步](tutorial.md#第-16-步--高级用回退和全部重试重新生成)。
+### 反向控制声明
+
+`pipeline.control` 还接 `rewind: {source: [earlier_targets]}`、`retry_all: [sources]`，以及反向遍历必须的正整数 `max_handoffs`。纯反向的方案里 `edges` 是可选的；已有的纯向前声明不变。`run.max_handoffs` 设运行时上限（默认 1000）。校验复用 Python 的名称/seq 解析，报配置字段路径。回退载荷由任务代码选，不是配置选。语法、访问模型、预算生命周期和载荷缺失恢复见 [reference → 反向遍历](reference.md#反向遍历rewindretry-allvisits)；可运行的 Python 示例（含 `HistoryArtifact`）见 [tutorial 第 16–17 步](tutorial.md#第-16-步--用回退和全部重试重新生成)。
 
 ## 另见
 

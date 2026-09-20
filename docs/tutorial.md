@@ -42,9 +42,9 @@ Read the steps in order the first time. Afterwards, use this table.
 | branch inside a step | [Step 13](#step-13--capstone-a-small-model-evaluation) | [`fanout`](reference.md#fanout) |
 | store custom types or large payloads, ship a plugin | [Step 14](#step-14--your-own-types-blobs-plugins) | [Codecs](reference.md#codecregistry), [Backends](reference.md#artifact-backends), [Plugins](reference.md#plugins) |
 | monitor a run in progress | [Step 14](#step-14--your-own-types-blobs-plugins) | [Monitoring](reference.md#monitoring) |
-| skip the rest of a chain from inside a task (advanced) | [Step 15](#step-15--advanced-skipping-stations-handoffs) | [Handoffs](reference.md#advanced-handoffs-opt-in) |
-| send work back to an earlier station (advanced) | [Step 16](#step-16--advanced-regenerating-with-rewind-and-retry-all) | [Backward traversal](reference.md#advanced-backward-traversal-rewind-retry-all-visits) |
-| snapshot and restore state inside a payload (advanced) | [Step 17](#step-17--advanced-payloads-that-carry-their-own-history) | [`HistoryArtifact`](reference.md#historyartifact) |
+| skip the rest of a chain from inside a task | [Step 15](#step-15--skipping-stations-handoffs) | [Handoffs](reference.md#handoffs-opt-in) |
+| send work back to an earlier station | [Step 16](#step-16--regenerating-with-rewind-and-retry-all) | [Backward traversal](reference.md#backward-traversal-rewind-retry-all-visits) |
+| snapshot and restore state inside a payload | [Step 17](#step-17--payloads-that-carry-their-own-history) | [`HistoryArtifact`](reference.md#historyartifact) |
 
 ---
 
@@ -1616,10 +1616,11 @@ accuracy through `runner.report_metric()`; the dashboard displays the value as i
 
 ---
 
-## Step 15 — advanced: skipping stations (handoffs)
+<a id="step-15--advanced-skipping-stations-handoffs"></a>
 
-**This step is the one advanced feature in the framework: it is opt-in, it changes the execution model, and
-it is marked experimental until 1.0.** Everything before this step works without it, and a pipeline that does
+## Step 15 — skipping stations (handoffs)
+
+**Handoffs are a supported control-flow feature, enabled explicitly through `control`.** Everything before this step works without it, and a pipeline that does
 not declare it behaves exactly as it did before the feature existed. Read this step when you have a step that
 decides *the rest of the chain no longer needs to run*.
 
@@ -1631,7 +1632,7 @@ finished right here.
 
 ```python
 # tutorial/step_15_handoff.py
-"""Step 15 (advanced) - a task hands off: skip stations, or finish the pipeline, and nothing lies about it."""
+"""Step 15 - a task hands off: skip stations, or finish the pipeline, and nothing lies about it."""
 
 import json
 from contextlib import closing
@@ -1740,10 +1741,10 @@ What is worth knowing before you use it:
   should continue over there". Conditions still belong in task code, branching inside a step is still
   `fanout`, and iterating a dataset is still `map`. A pipeline that is mostly handoffs is a sign the problem
   wants a graph engine, which this is not.
-* **Advanced tier.** It is opt-in, it changes the execution model, and it is experimental until 1.0: the
-  guarantees above are stable, the spelling may still change. Separately declared backward operations
-  use visits and finite budgets; see [Step 16](#step-16--advanced-regenerating-with-rewind-and-retry-all)
-  and [reference → advanced: backward traversal](reference.md#advanced-backward-traversal-rewind-retry-all-visits).
+* **Supported control flow.** The `Handoff` API and `control` declarations are part of the public API
+  and follow the project's versioning policy. Separately declared backward operations
+  use visits and finite budgets; see [Step 16](#step-16--regenerating-with-rewind-and-retry-all)
+  and [reference → backward traversal](reference.md#backward-traversal-rewind-retry-all-visits).
   Both built-in stores can commit a handoff; a custom store that cannot is refused up front with a
   `ConfigError` rather than writing a jump that would not survive a crash.
 
@@ -1757,9 +1758,11 @@ artifact. See the [store recovery contract](reference.md#tables-and-readers) whe
 
 ---
 
-## Step 16 — advanced: regenerating with rewind and retry-all
+<a id="step-16--advanced-regenerating-with-rewind-and-retry-all"></a>
 
-**Like Step 15, this is an advanced, opt-in feature, experimental until 1.0.** It changes the traversal of
+## Step 16 — regenerating with rewind and retry-all
+
+**Like forward jumps, rewind and retry-all are supported features enabled through `control`.** It changes the traversal of
 the chain: a validator can send the work *back* to an earlier station instead of failing the row or looping
 inside one task. Read it when a step decides that an earlier step should run again with different state.
 
@@ -1771,7 +1774,7 @@ artifact rows.
 
 ```python
 # tutorial/step_16_backward.py
-"""Step 16 (advanced) - a validator rewinds to the generator; state is what the author chose."""
+"""Step 16 - a validator rewinds to the generator; state is what the author chose."""
 
 from pyattacker import Handoff, Runner, pipeline, task
 
@@ -1877,14 +1880,16 @@ What is worth knowing before you use it:
   snapshot/restore bookkeeping; nothing in the runner reads it to decide where to go next.
 
 The full interface — the visit/occurrence model, the budget lifecycle, the store capability and the
-`HistoryArtifact` codec — is in [reference → advanced: backward traversal](reference.md#advanced-backward-traversal-rewind-retry-all-visits),
+`HistoryArtifact` codec — is in [reference → backward traversal](reference.md#backward-traversal-rewind-retry-all-visits),
 and the optional payload history gets its own step next.
 
 ---
 
-## Step 17 — advanced: payloads that carry their own history
+<a id="step-17--advanced-payloads-that-carry-their-own-history"></a>
 
-**Also advanced, also opt-in, and it changes nothing about scheduling.** Steps 15 and 16 decide *where* the
+## Step 17 — payloads that carry their own history
+
+**Payload history is an optional companion to control flow and changes nothing about scheduling.** Steps 15 and 16 decide *where* the
 pipeline goes; this one is the optional companion to a rewind, for when the state you send back should carry
 named checkpoints of its own.
 
@@ -1897,7 +1902,7 @@ detached snapshots of application state plus a versioned codec for them.
 
 ```python
 # tutorial/step_17_history.py
-"""Step 17 (advanced) - optional payload history: named checkpoints carried inside the payload."""
+"""Step 17 - optional payload history: named checkpoints carried inside the payload."""
 
 from pyattacker import CodecRegistry, Handoff, HistoryArtifact, Runner, pipeline, task
 
@@ -2040,9 +2045,9 @@ What is worth knowing before you use it:
 | use four processes | `--shards 4 --jobs 4`, then `report`/`export` over the shard files |
 | branch inside a step | `fanout(task_a, task_b)` |
 | skip ahead / finish early, on the record | `return Handoff.to("report", v)` / `Handoff.end(v)` on a pipeline declared with `control={"edges": {...}}` |
-| send a station back to an earlier one (advanced) | `return Handoff.rewind("generate", chosen_state)` on a pipeline declared with `control={"rewind": {...}, "max_handoffs": N}` |
-| restart the whole pipeline from its seed (advanced) | `return Handoff.retry_all()` on a pipeline declared with `control={"retry_all": [...], "max_handoffs": N}` |
-| keep named state checkpoints inside a payload (advanced) | `class S(HistoryArtifact)`, then `s.checkpoint("label")` / `.restore(...)` / `.prune(...)`, registered in both registries |
+| send a station back to an earlier one | `return Handoff.rewind("generate", chosen_state)` on a pipeline declared with `control={"rewind": {...}, "max_handoffs": N}` |
+| restart the whole pipeline from its seed | `return Handoff.retry_all()` on a pipeline declared with `control={"retry_all": [...], "max_handoffs": N}` |
+| keep named state checkpoints inside a payload | `class S(HistoryArtifact)`, then `s.checkpoint("label")` / `.restore(...)` / `.prune(...)`, registered in both registries |
 | make my code usable from YAML | no plugin: `use: my_pkg.tasks:my_task`; with an entry point in `pyattacker.tasks`: `use: my_task` |
 
 Every class and function, with signatures and parameter tables: [`docs/reference.md`](reference.md).

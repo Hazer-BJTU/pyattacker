@@ -28,8 +28,8 @@ shaped this way.
 |---|---|
 | [Tasks](#tasks) | `task`, `build_task_spec`, `TaskSpec`, `Retrying`, `TaskContext`, `with_retry` |
 | [Pipelines](#pipelines) | `pipeline`, `PipelineTemplate`, `PipelineSpec`, `Chain`, `compute_spec_digest` |
-| [Advanced: handoffs](#advanced-handoffs-opt-in) | `Handoff`, the `control=` declaration, `HandoffRecord` |
-| [Advanced: backward traversal](#advanced-backward-traversal-rewind-retry-all-visits) | `Handoff.rewind`, `Handoff.retry_all`, the backward `control` keys, visits, budgets, recovery |
+| [Handoffs](#handoffs-opt-in) | `Handoff`, the `control=` declaration, `HandoffRecord` |
+| [Backward traversal](#backward-traversal-rewind-retry-all-visits) | `Handoff.rewind`, `Handoff.retry_all`, the backward `control` keys, visits, budgets, recovery |
 | [Running](#running) | `Runner`, `RunConfig`, `RunReport`, worker liveness |
 | [Resources](#resources) | `Resource`, `Pool`, `Lease`, `PoolStats`, `Bus`, `ResourceState`, `ResourceEvent` |
 | [Acquire algorithms](#acquire-algorithms) | `Wait`, `Backoff`, `LeastBusy`, `Failover`, `Sticky`, `QuotaAware`, `Immediate`, `resolve_algorithm` |
@@ -282,7 +282,7 @@ pipeline(name, *tasks_or_chain, tags=None, include_code=True, registry=None, con
 | `tags` | free-form dict stored with each pipeline, for filtering later |
 | `include_code` | when `True` (default), each task's source digest is part of the pipeline's identity |
 | `registry` | a custom `CodecRegistry` for non-JSON artifact types |
-| `control` | **advanced** (see [handoffs](#advanced-handoffs-opt-in)): which task may hand off where; `None` (the default) keeps the pipeline an ordinary linear chain |
+| `control` | which task may hand off where (see [handoffs](#handoffs-opt-in)); `None` (the default) keeps the pipeline an ordinary linear chain |
 
 ```python
 from pyattacker import pipeline
@@ -309,7 +309,7 @@ existing checkpoints. The default is the safe direction: edited code means a new
 | `n_tasks` | how many tasks in the chain |
 | `task_names` | their names in order |
 | `describe()` | a JSON-ready summary (what `validate` prints), including the resolved `control` block when there is one |
-| `control` | the resolved edge plan (**advanced**), or `None` |
+| `control` | the resolved edge plan, or `None` |
 | `bind(seed, *, key=None, repeat=0)` | one `PipelineSpec` from one seed |
 | `map(seeds, *, repeats=1, key_of=None)` | a lazy iterator of `PipelineSpec` |
 
@@ -351,7 +351,7 @@ content-addressed identity that makes resume and sharding work.
 | `seed` | the dataset row |
 | `repeat` | which sample of pass@k this is |
 | `name`, `tasks`, `n_tasks`, `tags` | inherited from the template |
-| `control` | the resolved edge plan (**advanced**), or `None` |
+| `control` | the resolved edge plan, or `None` |
 
 ### `Chain`
 
@@ -394,15 +394,18 @@ destinations, sorted — so spelling a target as a name or as a seq is the same 
 
 ---
 
-## Advanced: Handoffs (Opt-In)
+<a id="advanced-handoffs-opt-in"></a>
 
-**Advanced tier: opt-in, changes the execution model, not needed for ordinary pipelines, experimental until
-1.0.** A task may *skip ahead* by returning a framework-owned directive instead of a value; the pipeline
+## Handoffs (Opt-In)
+
+**Handoffs, forward jumps and rewinds are supported control-flow features, enabled explicitly through `control`.**
+
+A task may *skip ahead* by returning a framework-owned directive instead of a value; the pipeline
 continues at a declared later position (or finishes on the spot) and the framework records the jump durably.
 A pipeline that declares nothing here is completely unaffected — see the design document
-[§4.8](design.md#48-advanced-handoffs--declared-forward-jumps-opt-in-experimental) for the full reasoning.
+[§4.8](design.md#48-handoffs--declared-forward-jumps-opt-in) for the full reasoning.
 Backward traversal — `Handoff.rewind`, `Handoff.retry_all` and optional payload history — is a *separately
-declared* tier of the same feature: see [advanced: backward traversal](#advanced-backward-traversal-rewind-retry-all-visits).
+declared* part of the same feature: see [backward traversal](#backward-traversal-rewind-retry-all-visits).
 
 ### `Handoff`
 
@@ -453,9 +456,9 @@ Rules that are worth knowing before you use it:
 * **The cursor becomes a position.** On a control-enabled pipeline `n_tasks_done` is where execution is, not
   how many tasks ran, and skipped slots have no task rows. Do not render it as a completion percentage; the
   handoff count is exposed next to it instead.
-* **Stability.** The guarantees above are the stable part; the spelling (`Handoff`, `control`) may still
-  change before 1.0. Backward traversal is a *separately declared* opt-in tier rather than part of this
-  forward model — see [advanced: backward traversal](#advanced-backward-traversal-rewind-retry-all-visits).
+* **Public API.** `Handoff`, `control` and the guarantees above follow the project's versioning policy.
+  Backward traversal is *separately declared* rather than part of this
+  forward model — see [backward traversal](#backward-traversal-rewind-retry-all-visits).
 
 ### What a hop records
 
@@ -473,16 +476,18 @@ Rules that are worth knowing before you use it:
 
 ---
 
-## Advanced: backward traversal (rewind, retry-all, visits)
+<a id="advanced-backward-traversal-rewind-retry-all-visits"></a>
 
-**Advanced tier: opt-in, changes the traversal of a pipeline, experimental until 1.0.** Backward operations
+## Backward traversal (rewind, retry-all, visits)
+
+**Rewind and retry-all are supported control-flow features, enabled explicitly through `control`.** Backward operations
 are declared separately from the forward model above, so a pipeline that declares none keeps its identity,
 its visit-0 artifact addresses, its random stream and its `spec_digest`. Read this section when a station
 decides that an **earlier** station must run again with state the author chooses — regenerate after a failed
 validation, retry a step with different parameters — and both runs have to stay on the record instead of
-collapsing into one task. The [tutorial](tutorial.md#step-16--advanced-regenerating-with-rewind-and-retry-all)
+collapsing into one task. The [tutorial](tutorial.md#step-16--regenerating-with-rewind-and-retry-all)
 builds up to it in two steps, the second one covering
-[payload history](tutorial.md#step-17--advanced-payloads-that-carry-their-own-history).
+[payload history](tutorial.md#step-17--payloads-that-carry-their-own-history).
 
 ### `Handoff.rewind` and `Handoff.retry_all`
 
@@ -523,7 +528,7 @@ What differs:
 
 ```python
 # reference/backward_rewind.py
-"""The backward tier in one program: a validator sends the work back to the generator."""
+"""Backward traversal in one program: a validator sends the work back to the generator."""
 
 from pyattacker import Handoff, Runner, pipeline, task
 
@@ -577,7 +582,7 @@ operations`). `RunConfig.max_handoffs` (default 1000, spelled `run.max_handoffs`
 lower a pipeline's budget and can never raise it. A fresh start resets it. Names and seqs resolve exactly
 as they do for `edges` (an exact task name wins over a numeric string, a repeated name must be given as a
 seq), and every problem is reported as a configuration field path — see
-[CLI → advanced backward control declarations](cli.md#advanced-backward-control-declarations).
+[CLI → backward control declarations](cli.md#backward-control-declarations).
 
 ```python
 # reference/backward_retry_all.py
@@ -782,7 +787,7 @@ Everything that shapes one run. Pass a `RunConfig`, or pass its fields as keywor
 | `write_batch` | `128` | batch size when write-behind is active |
 | `flush_interval` | `1.0` | seconds between flushes |
 | `artifact_backend` | `None` | where payloads live: `None`/`"inline"`, `"file:///path"`, `"null"`, or a spec dict |
-| `max_handoffs` | `1000` | runtime ceiling on nonterminal control transfers in backward-enabled pipelines; the effective limit is `min(control.max_handoffs, this)` (see [backward traversal](#advanced-backward-traversal-rewind-retry-all-visits)) |
+| `max_handoffs` | `1000` | runtime ceiling on nonterminal control transfers in backward-enabled pipelines; the effective limit is `min(control.max_handoffs, this)` (see [backward traversal](#backward-traversal-rewind-retry-all-visits)) |
 | `notes`, `meta` | `""`, `{}` | free-form, recorded on the run |
 
 ```python
@@ -1237,7 +1242,7 @@ checkpoint granularity a task rather than a pipeline.
 
 | Field | Meaning |
 |---|---|
-| `pipeline_id`, `seq` | its identity; `seq=-1` is the pipeline's seed. On a control-enabled pipeline a handoff payload lives at `seq >= n_tasks` (see [handoffs](#advanced-handoffs-opt-in)), so `seq` is a task position only for the chain. In a [backward-enabled](#advanced-backward-traversal-rewind-retry-all-visits) pipeline the first occurrence keeps `pipeline_id:seq` and a revisit qualifies the id as `pipeline_id:seq#visit` |
+| `pipeline_id`, `seq` | its identity; `seq=-1` is the pipeline's seed. On a control-enabled pipeline a handoff payload lives at `seq >= n_tasks` (see [handoffs](#handoffs-opt-in)), so `seq` is a task position only for the chain. In a [backward-enabled](#backward-traversal-rewind-retry-all-visits) pipeline the first occurrence keeps `pipeline_id:seq` and a revisit qualifies the id as `pipeline_id:seq#visit` |
 | `task_name` | which task produced it |
 | `type_name`, `codec` | how to restore it |
 | `digest`, `size` | `blake2b` of the payload, and its length |
@@ -1299,10 +1304,10 @@ under the `pyattacker.codecs` entry-point group and it installs itself.
 
 An optional base class for a payload that carries its own named snapshots of **application** state. It is a
 decoded payload, not a subclass of the persisted `Artifact` record, and nothing in the runner reads it to
-decide where execution goes next: it exists so a [rewind](#advanced-backward-traversal-rewind-retry-all-visits)
+decide where execution goes next: it exists so a [rewind](#backward-traversal-rewind-retry-all-visits)
 can send back a state the author chose with the states it passed through still inspectable. Ordinary
 dictionaries stay ordinary dictionaries — there is no automatic snapshot on task entry or completion. The
-tutorial builds one in [Step 17](tutorial.md#step-17--advanced-payloads-that-carry-their-own-history).
+tutorial builds one in [Step 17](tutorial.md#step-17--payloads-that-carry-their-own-history).
 
 ```python
 HistoryArtifact(state, *, history=None, selected=None, next_snapshot=0)
@@ -1465,7 +1470,7 @@ and its failure phase. The count is de-duplicated by `pipeline_id`, so the same 
 multiple stores does not double-count. The live `run` exit code remains the authoritative signal for the
 attempt it just made; the post-hoc report is a historical view.
 A control-enabled pipeline adds one branch, consulted **before** those rules
-([handoffs](#advanced-handoffs-opt-in)): if the newest active ledger row's target is at or ahead of the cursor, the
+([handoffs](#handoffs-opt-in)): if the newest active ledger row's target is at or ahead of the cursor, the
 run resumes *at that target* with the recorded entry artifact and never re-runs the source task, and a
 durable `END` row is settled from its own entry artifact. A row whose target is behind the cursor has been
 consumed by later forward progress, so the ordinary `artifact(cursor - 1)` rule applies instead. If the
@@ -1576,7 +1581,7 @@ plugin layer is public API, and existing plugins were written against the list m
 ### Optional store capabilities
 
 **`commit_handoff(record, *, task, attempt, payload=None, cursor, final=False)`**,
-**`handoffs(*, pipeline_id=None, run_id=None, limit=None)`** and **`reset_pipeline(record)`** are the optional capability behind the advanced
+**`handoffs(*, pipeline_id=None, run_id=None, limit=None)`** and **`reset_pipeline(record)`** are the optional capability behind the
 handoff feature, in the same "not part of the protocol" spirit as `resources()`. The commit is **one atomic
 write**: finalize the source task as `handed_off`, insert the handed-off attempt, persist the payload
 allocating its address above the chain, append the ledger row and move the cursor — and for `END` also mark
@@ -1614,7 +1619,7 @@ works: the Runner falls back to `finish_pipeline` (state and cursor, atomically)
 **`commit_visit_success(pipeline, task, attempt, artifact, *, final)`**,
 **`commit_control_transition(record, *, pipeline, task, attempt, payload, entry_id, target_task, limit)`**,
 **`repair_visit_terminal(record)`** and **`get_artifact_by_id(artifact_id)`** are the optional capability
-behind [backward traversal](#advanced-backward-traversal-rewind-retry-all-visits), again outside the protocol.
+behind [backward traversal](#backward-traversal-rewind-retry-all-visits), again outside the protocol.
 `store/visits.py`'s `VisitStore` holds
 the shared transition semantics and both built-in backends derive from it, so a backend supplies one atomic
 write boundary plus its low-level row writes. Each operation is one commit: entry allocation advances the
@@ -1917,7 +1922,7 @@ historical records excluded from recovery. `store.handoffs(pipeline_id=...)` inc
 `stats(run_id)["handoffs_total"]` counts only commits by that run, so a resume can use an active handoff
 from a previous run while reporting zero new handoffs. The
 `handoffs` list is `[]` for an ordinary pipeline and has one object per recorded jump otherwise (see
-[handoffs](#advanced-handoffs-opt-in)); it is nested rather than a row kind of its own, so `ROW_KINDS` is
+[handoffs](#handoffs-opt-in)); it is nested rather than a row kind of its own, so `ROW_KINDS` is
 unchanged. CSV takes its
 header from the first rows and folds later keys into an `extra` column, so memory stays flat and no field is
 dropped silently.

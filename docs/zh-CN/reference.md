@@ -22,8 +22,8 @@
 |---|---|
 | [任务](reference.md#任务) | `task`, `build_task_spec`, `TaskSpec`, `Retrying`, `TaskContext`, `with_retry` |
 | [流水线](reference.md#流水线) | `pipeline`, `PipelineTemplate`, `PipelineSpec`, `Chain`, `compute_spec_digest` |
-| [进阶：交接](reference.md#进阶交接可选启用) | `Handoff`、`control=` 声明、`HandoffRecord` |
-| [进阶：反向遍历](reference.md#进阶反向遍历rewindretry-allvisits) | `Handoff.rewind`、`Handoff.retry_all`、反向的 `control` 键、访问、预算、恢复 |
+| [交接](reference.md#交接可选启用) | `Handoff`、`control=` 声明、`HandoffRecord` |
+| [反向遍历](reference.md#反向遍历rewindretry-allvisits) | `Handoff.rewind`、`Handoff.retry_all`、反向的 `control` 键、访问、预算、恢复 |
 | [运行](reference.md#运行) | `Runner`, `RunConfig`, `RunReport`, worker 存活检测 |
 | [资源](reference.md#资源) | `Resource`, `Pool`, `Lease`, `PoolStats`, `Bus`, `ResourceState`, `ResourceEvent` |
 | [获取算法](reference.md#获取算法) | `Wait`, `Backoff`, `LeastBusy`, `Failover`, `Sticky`, `QuotaAware`, `Immediate`, `resolve_algorithm` |
@@ -264,7 +264,7 @@ pipeline(name, *tasks_or_chain, tags=None, include_code=True, registry=None, con
 | `tags` | 自由形式字典，随每条流水线存着，供后续过滤 |
 | `include_code` | 为 `True`（默认）时，每个任务的源码摘要都是流水线身份的一部分 |
 | `registry` | 非 JSON 工件类型用的自定义 `CodecRegistry` |
-| `control` | **进阶**（见[交接](reference.md#进阶交接可选启用)）：哪个任务能向哪里交接；`None`（默认）让流水线保持普通线性链 |
+| `control` | （见[交接](reference.md#交接可选启用)）：哪个任务能向哪里交接；`None`（默认）让流水线保持普通线性链 |
 
 ```python
 from pyattacker import pipeline
@@ -287,7 +287,7 @@ template = pipeline("qa", ask)                          # a single task is a val
 | `n_tasks` | 链里有多少个任务 |
 | `task_names` | 按顺序的任务名 |
 | `describe()` | 可转 JSON 的概要（就是 `validate` 打印的），有解析后的 `control` 块也会包含 |
-| `control` | 解析后的边计划（**进阶**），或 `None` |
+| `control` | 解析后的边计划，或 `None` |
 | `bind(seed, *, key=None, repeat=0)` | 从一个种子得到一个 `PipelineSpec` |
 | `map(seeds, *, repeats=1, key_of=None)` | `PipelineSpec` 的惰性迭代器 |
 
@@ -329,7 +329,7 @@ runner.run(template.map(stream()))
 | `seed` | 数据集里的一行 |
 | `repeat` | 这是 pass@k 里的第几个样本 |
 | `name`、`tasks`、`n_tasks`、`tags` | 继承自模板 |
-| `control` | 解析后的边计划（**进阶**），或 `None` |
+| `control` | 解析后的边计划，或 `None` |
 
 ### `Chain`
 
@@ -365,13 +365,15 @@ if compute_spec_digest(new_chain.tasks) != stored_digest:
 
 ---
 
-## 进阶：交接（可选启用）
+<a id="进阶交接可选启用"></a>
 
-**进阶层级：可选启用、改执行模型、普通流水线不需要、1.0 前实验性。** 任务可以通过返回一条框架自带的指令而不是值来*向前跳*；流水线在声明里更靠后的位置继续（或就地结束），框架持久记录这次跳转。这里什么都不声明的流水线完全不受影响——
+## 交接（可选启用）
+
+**交接、正向跳转和回退都是正式的控制流特性，通过 `control` 显式声明后启用。** 任务可以通过返回一条框架自带的指令而不是值来*向前跳*；流水线在声明里更靠后的位置继续（或就地结束），框架持久记录这次跳转。这里什么都不声明的流水线完全不受影响——
 完整论证见设计文档
-[§4.8](design.md#48-进阶交接--声明式正向跳转可选启用实验性)。反向遍历——`Handoff.rewind`、
-`Handoff.retry_all` 和可选的载荷历史——是同一特性里*单独声明*的层级：见
-[进阶：反向遍历](#进阶反向遍历rewindretry-allvisits)。
+[§4.8](design.md#48-交接--声明式正向跳转可选启用)。反向遍历——`Handoff.rewind`、
+`Handoff.retry_all` 和可选的载荷历史——是同一特性里*单独声明*的控制流方式：见
+[反向遍历](#反向遍历rewindretry-allvisits)。
 
 ### `Handoff`
 
@@ -419,8 +421,7 @@ template = pipeline("qa", retrieve | ask | judge | report,
 * **游标变成位置。** 开了控制流的流水线上，`n_tasks_done` 表示执行到哪，
   不是跑了多少任务，跳过的槽位也没任务行。别把它渲染成完成百分比；
   交接计数就在旁边露出来。
-* **稳定性。** 上面这些保证是稳定部分；写法形式（`Handoff`、`control`）
-  1.0 前还可能变。反向遍历是一个*单独声明*的可选层级，不是这个正向模型的一部分——见 [进阶：反向遍历](#进阶反向遍历rewindretry-allvisits)。
+* **公共 API。** `Handoff`、`control` 和上述保证都遵循项目的版本管理策略。反向遍历是一个*单独声明*的控制流方式，不是这个正向模型的一部分——见 [反向遍历](#反向遍历rewindretry-allvisits)。
 
 ### 一次跳转记录的内容
 
@@ -438,12 +439,14 @@ template = pipeline("qa", retrieve | ask | judge | report,
 
 ---
 
-## 进阶：反向遍历（rewind、retry-all、visits）
+<a id="进阶反向遍历rewindretry-allvisits"></a>
 
-**进阶层级：可选启用、改流水线遍历方式、1.0 前实验性。** 反向操作和上面的正向模型分开
+## 反向遍历（rewind、retry-all、visits）
+
+**回退和全量重试是正式的控制流特性，通过 `control` 显式声明后启用。** 反向操作和上面的正向模型分开
 声明，所以什么都不声明的流水线保留身份、访问 0 的工件地址、随机流和 `spec_digest`。当一个站点判定**更早**的某个站点必须带着作者选定的状态重跑——校验失败后重新生成、用不同参数重试某个步骤——而且两次运行都得留在记录里，不能折成一个任务，再读这节。
-[tutorial](tutorial.md#第-16-步--高级用回退和全部重试重新生成) 用两步把它搭起来，第二步讲
-[载荷历史](tutorial.md#第-17-步--高级让载荷自带历史)。
+[tutorial](tutorial.md#第-16-步--用回退和全部重试重新生成) 用两步把它搭起来，第二步讲
+[载荷历史](tutorial.md#第-17-步--让载荷自带历史)。
 
 ### `Handoff.rewind` 与 `Handoff.retry_all`
 
@@ -478,7 +481,7 @@ Handoff.retry_all(*, reason="") -> Handoff               # restart at seq 0 from
 
 ```python
 # reference/backward_rewind.py
-"""The backward tier in one program: a validator sends the work back to the generator."""
+"""Backward traversal in one program: a validator sends the work back to the generator."""
 
 from pyattacker import Handoff, Runner, pipeline, task
 
@@ -531,7 +534,7 @@ with Runner(store=":memory:", max_handoffs=10) as runner:   # the runtime ceilin
 `min(control.max_handoffs, run.max_handoffs)`，所以一次运行可以调低某条流水线的预算，但永远不能调高。
 全新开始会重置它。名字和 seq 的解析和 `edges` 完全相同（精确任务名优先于数字字符串，重复出现的
 名字必须用 seq 指定），每个问题都以配置字段路径报告——见
-[CLI → 进阶反向控制声明](cli.md#进阶反向控制声明)。
+[CLI → 反向控制声明](cli.md#反向控制声明)。
 
 ```python
 # reference/backward_retry_all.py
@@ -720,7 +723,7 @@ print(live["in_flight_pipelines"], live["delayed_pipelines"])      # in flight v
 | `write_batch` | `128` | write-behind 生效时的批大小 |
 | `flush_interval` | `1.0` | 两次刷写之间的秒数 |
 | `artifact_backend` | `None` | 载荷放哪：`None`/`"inline"`、`"file:///path"`、`"null"`，或规格字典 |
-| `max_handoffs` | `1000` | 开反向的流水线中非终止控制转移的运行时上限；实际限制为 `min(control.max_handoffs, this)`（见 [反向遍历](#进阶反向遍历rewindretry-allvisits)） |
+| `max_handoffs` | `1000` | 开反向的流水线中非终止控制转移的运行时上限；实际限制为 `min(control.max_handoffs, this)`（见 [反向遍历](#反向遍历rewindretry-allvisits)） |
 | `notes`、`meta` | `""`、`{}` | 自由形式，记在这次运行上 |
 
 ```python
@@ -1174,7 +1177,7 @@ for attempt in store.attempts(pipeline_id=pid):
 
 | 字段 | 含义 |
 |---|---|
-| `pipeline_id`, `seq` | 它的身份；`seq=-1` 是流水线的种子。开控制的流水线上，交接载荷位于 `seq >= n_tasks`（见[交接](reference.md#进阶交接可选启用)），所以 `seq` 只有对链才是任务位置。在[开反向](#进阶反向遍历rewindretry-allvisits)的流水线上，第一个发生实例保留 `pipeline_id:seq`，重访把 id 限定为 `pipeline_id:seq#visit` |
+| `pipeline_id`, `seq` | 它的身份；`seq=-1` 是流水线的种子。开控制的流水线上，交接载荷位于 `seq >= n_tasks`（见[交接](reference.md#交接可选启用)），所以 `seq` 只有对链才是任务位置。在[开反向](#反向遍历rewindretry-allvisits)的流水线上，第一个发生实例保留 `pipeline_id:seq`，重访把 id 限定为 `pipeline_id:seq#visit` |
 | `task_name` | 哪个任务产的 |
 | `type_name`, `codec` | 怎么恢复它 |
 | `digest`, `size` | 载荷的 `blake2b` 和长度 |
@@ -1236,9 +1239,9 @@ with Runner(store="runs/embed.db", registry=registry) as runner:   # the same re
 
 一个可选的载荷基类：让载荷自带应用状态的**具名**快照。它是解码后的载荷，不是持久化 `Artifact` 记录
 的子类，runner 里也没有任何代码读它来决定下一步去哪：它存在是为了让一次
-[回退](#进阶反向遍历rewindretry-allvisits)能送回作者选定的状态，同时它途经的那些状态仍然可检视。
+[回退](#反向遍历rewindretry-allvisits)能送回作者选定的状态，同时它途经的那些状态仍然可检视。
 普通字典还是普通字典——任务进入或完成时不自动生成快照。教程第 17 步
-[把它搭了出来](tutorial.md#第-17-步--高级让载荷自带历史)。
+[把它搭了出来](tutorial.md#第-17-步--让载荷自带历史)。
 
 ```python
 HistoryArtifact(state, *, history=None, selected=None, next_snapshot=0)
@@ -1395,7 +1398,7 @@ print([event.kind for event in store.events(pipeline_id=pid)])
 计数按 `pipeline_id` 去重，所以同一条流水线出现在多个存储里不会重复计数。
 实时 `run` 的退出码仍然是它刚完成的那次尝试的权威信号；事后报告是历史视图。
 开控制的流水线加一个分支，在那些规则**之前**查
-（[交接](reference.md#进阶交接可选启用)）：如果最新活动账本行的目标等于游标或在它前方，
+（[交接](reference.md#交接可选启用)）：如果最新活动账本行的目标等于游标或在它前方，
 运行用记录的入口工件*从那个目标*恢复，绝不重跑源任务；持久的
 `END` 行根据它自己的入口工件写最终状态。目标在游标后方的行已被
 后续正向进展消费，所以走普通的 `artifact(cursor - 1)` 规则。如果
@@ -1506,7 +1509,7 @@ ORDER BY <key> LIMIT 1000`），所以没有查询返回超过一批，也没有
 ### 可选的存储能力
 
 **`commit_handoff(record, *, task, attempt, payload=None, cursor, final=False)`**,
-**`handoffs(*, pipeline_id=None, run_id=None, limit=None)`** 和 **`reset_pipeline(record)`** 是进阶
+**`handoffs(*, pipeline_id=None, run_id=None, limit=None)`** 和 **`reset_pipeline(record)`** 是
 交接功能背后的可选能力，和 `resources()` 一样"不属于协议"。这次提交是**一次原子
 写入**：把源任务终结为 `handed_off`，插入被交接的尝试，持久化载荷
 并在它链上的地址分配，追加账本行并移动游标——对 `END`，还把
@@ -1544,7 +1547,7 @@ attempts/events，通过这个提交写被交接的尝试，不走自己的缓�
 **`commit_visit_success(pipeline, task, attempt, artifact, *, final)`**,
 **`commit_control_transition(record, *, pipeline, task, attempt, payload, entry_id, target_task, limit)`**,
 **`repair_visit_terminal(record)`** 和 **`get_artifact_by_id(artifact_id)`** 是可选能力，
-在[反向遍历](#进阶反向遍历rewindretry-allvisits)背后，同样在协议外。`store/visits.py` 的 `VisitStore` 持
+在[反向遍历](#反向遍历rewindretry-allvisits)背后，同样在协议外。`store/visits.py` 的 `VisitStore` 持
 共享的状态转换语义，两个内置后端都从它派生，所以后端只需提供一个原子
 写入边界，加自己的底层行写入。每个操作是一次提交：入口分配推进
 按 seq 的访问计数器并记待定输入，普通成功一并写输出的发生实例和
@@ -1837,7 +1840,7 @@ export_store(store, "attempts.csv", kind="attempts", fmt="csv")
 `stats(run_id)["handoffs_total"]` 只统计这次运行提交的交接，所以恢复能用上次运行留的活动交接，
 同时报告零个新交接。普通流水线，
 `handoffs` 列表是 `[]`；否则每记一次跳转就一个对象（见
-[handoffs](reference.md#进阶交接可选启用)）；它是嵌套结构，不是独立的行 kind，所以 `ROW_KINDS`
+[handoffs](reference.md#交接可选启用)）；它是嵌套结构，不是独立的行 kind，所以 `ROW_KINDS`
 不变。CSV 从最初几行取表头，
 之后出现的键折进 `extra` 列，所以内存平稳，没字段
 被静默丢。

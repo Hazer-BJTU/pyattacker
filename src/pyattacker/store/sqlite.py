@@ -192,7 +192,7 @@ CREATE TABLE IF NOT EXISTS reported_metrics (
 );
 CREATE INDEX IF NOT EXISTS idx_reported_metrics_run ON reported_metrics(run_id, pipeline_id);
 
--- Advanced control flow (docs/design.md §4.8): one append-only row per task-initiated handoff, the
+-- Control flow (docs/design.md §4.8): one append-only row per task-initiated handoff, the
 -- pipeline's control-flow history and the durable state recovery resumes at. `to_seq`/`to_task` are
 -- NULL for END; `entry_seq` is the entry artifact's position (the lookup key), `entry_artifact_id` the
 -- recorded reference, never null. A new *table* needs no `_migrate` step: CREATE TABLE IF NOT EXISTS

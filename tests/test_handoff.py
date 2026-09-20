@@ -1,4 +1,4 @@
-"""Forward handoffs (``docs/design.md`` §4.8) —— the advanced, opt-in control-flow feature.
+"""Forward handoffs (``docs/design.md`` §4.8) —— the explicitly declared control-flow feature.
 
 What this file proves, in the order the design promises it:
 

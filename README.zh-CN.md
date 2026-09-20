@@ -51,7 +51,7 @@ uv run pyattacker demo       # zero-config smoke test: 50 simulated pipelines, r
 | 概念 | 含义 | 一句话 |
 |---|---|---|
 | **artifact（产物）** | 任务持久化后的状态 | 内容寻址，**一产生就落盘** → 检查点粒度 = 任务 |
-| **task（任务）** | 调度的最小单位 | 一个一元函数 `(artifact) -> artifact`，同步异步都行——也可以 `-> artifact \| Handoff` 来跳过后续步骤（[进阶](README.zh-CN.md#进阶交接可选启用)） |
+| **task（任务）** | 调度的最小单位 | 一个一元函数 `(artifact) -> artifact`，同步异步都行——也可以 `-> artifact \| Handoff` 来跳过后续步骤（[交接](README.zh-CN.md#交接可选启用)） |
 | **pipeline（流水线）** | 完成和恢复的单位 | `fetch \| ask \| judge \| metrics` 线性串起来，各步语义独立 |
 | **resource（资源）** | 可租用的外部能力 | 一个端点 / 一把 key；放进资源池后可以并发安全地发布和订阅 |
 | **algorithm（算法）** | 获取资源的策略 | `wait`、`backoff`、`least_busy`、`failover`、`sticky`、`quota_aware`、`immediate`——和"失败了怎么重试"是两回事 |
@@ -147,14 +147,16 @@ runner.run(template.map(rows), resume=True)   # or pyattacker resume -c config.y
 * 任务和输入都没变、已经成功的流水线 → 直接跳过。
 * 失败的流水线 → 从**第一个没产出 artifact 的任务**接着跑：任务 C 挂了，只要 B 的检查点已经落盘，就只重跑 C。
 * 种子数据也持久化了 → 续跑**不需要原始数据集文件**。
-* 走过交接的流水线（[进阶](README.zh-CN.md#进阶交接可选启用)）会在跳转目标处恢复，用账本里记好的入口状态——发起跳转的那个任务不重跑。
+* 走过交接的流水线（[交接](README.zh-CN.md#交接可选启用)）会在跳转目标处恢复，用账本里记好的入口状态——发起跳转的那个任务不重跑。
 * 改了任务源码（`spec_digest` 包含源码摘要）→ 视为全新流水线，不会拿旧结果瞎复用。工厂参数、fanout 子任务、重试/算法策略、显式的 `config`/`version` 都算在内。手动指定 key 的话，定义或输入变了会直接拒绝。
 
 **升级已有存储：** fingerprint v2 改了默认 ID 和分片分配方式。旧任务可能会重跑，旧的手动 key 会冲突。建议用旧版本把手上的跑完，再换新存储。迁移指引、动态函数和外部配置详见 [恢复同一性与幂等性参考](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/reference.md#恢复同一性)。
 
-## 进阶：交接（可选启用）
+<a id="进阶交接可选启用"></a>
 
-**这是进阶功能：需要手动开启，会改变执行模型，普通流水线用不上，1.0 之前算实验性。**
+## 交接（可选启用）
+
+**交接、正向跳转和回退都是正式的控制流特性，通过 `control` 显式声明后启用。**
 
 任务可以判断"后面的步骤不用跑了"，然后*明确说出来*，而不是硬编一个失败或者把分支藏在某一步里面。它**返回**一条指令——`Handoff.to(target, value)` 表示跳到指定的后续步骤继续跑，`Handoff.end(value)` 表示直接收尾：
 
@@ -217,11 +219,11 @@ with Runner(store=":memory:", concurrency=4) as runner:
 * **交接是一种处置结果，不是失败。** 它是个返回值，所以重试策略根本看不到它，任务里写的 `except Exception:` 也吞不掉它。租约的归还和成功时完全一样，被取消或超时的尝试压根走不到返回这一步。
 * **它是持久化的检查点。** 跳转是原子提交的（源任务、尝试、入口产物、账本记录、游标一起提交），进程被杀了会在目标步骤恢复，带着记录好的入口状态，不会重跑源任务。开了控制流的流水线里，`n_tasks_done` 是个*位置*，不是进度计数——被跳过的步骤没有任务记录。`watch` 默认统计选定运行的提交数（`--run-id all` 查看全部历史）；`/pipelines.handoffs` 统计活跃执行记录，`handoffs_historical` 统计全部账本记录。续跑时可以用之前某次运行的活跃交接，同时不记录新的交接。导出的流水线数据里会带上账本身份和水位标记，用来区分这些范围。
 * **不开就完全没影响。** 没有 `control` 块的流水线，一行数据、一个计数器、`spec_digest` 的一个字节都不会变。
-* **往回跳需要单独声明。** `Handoff.rewind(target, value)` 把作者指定的状态送回更早的步骤；`Handoff.retry_all()` 从最初的种子重新开始。需要声明 `control.rewind` / `control.retry_all`，还要设一个有限的 `control.max_handoffs`。可选的 `HistoryArtifact` 载荷可以做显式快照和恢复；普通字典的控制权完全在作者手里。访问记录（visits）和精确的产物出现记录会保留历史，保证恢复安全。API、预算和恢复边界见 [reference → 进阶：反向遍历](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/reference.md#进阶反向遍历rewindretry-allvisits)，可运行的示例见 [tutorial 第 16–17 步](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/tutorial.md#第-16-步--高级用回退和全部重试重新生成)。
+* **往回跳需要单独声明。** `Handoff.rewind(target, value)` 把作者指定的状态送回更早的步骤；`Handoff.retry_all()` 从最初的种子重新开始。需要声明 `control.rewind` / `control.retry_all`，还要设一个有限的 `control.max_handoffs`。可选的 `HistoryArtifact` 载荷可以做显式快照和恢复；普通字典的控制权完全在作者手里。访问记录（visits）和精确的产物出现记录会保留历史，保证恢复安全。API、预算和恢复边界见 [reference → 反向遍历](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/reference.md#反向遍历rewindretry-allvisits)，可运行的示例见 [tutorial 第 16–17 步](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/tutorial.md#第-16-步--用回退和全部重试重新生成)。
 
-API 就是一个类（[`Handoff`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/reference.md#进阶交接可选启用)）、一条声明——正向跳转用 `control={"edges": {...}}`，反向遍历用 `control.rewind` / `control.retry_all` / `control.max_handoffs`——再加一项可选的存储能力。无法原子提交交接的自定义存储会直接被拒绝，不会让你写一个崩了就丢的跳转。
+API 就是一个类（[`Handoff`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/reference.md#交接可选启用)）、一条声明——正向跳转用 `control={"edges": {...}}`，反向遍历用 `control.rewind` / `control.retry_all` / `control.max_handoffs`——再加一项可选的存储能力。无法原子提交交接的自定义存储会直接被拒绝，不会让你写一个崩了就丢的跳转。
 
-上手示例：[教程第 15 步](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/tutorial.md#第-15-步--高级跳过站点交接)。模型和规则：[设计 §4.8](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/design.md#48-进阶交接--声明式正向跳转可选启用实验性)。
+上手示例：[教程第 15 步](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/tutorial.md#第-15-步--跳过站点交接)。模型和规则：[设计 §4.8](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/design.md#48-交接--声明式正向跳转可选启用)。
 
 流水线从种子重新开始时，之前的任务记录和链上产物会和游标/水位一起原子重置。之前的交接还留在历史里，但不再当检查点用。之后的续跑只看当前这轮执行的交接，完成时选一个最终产物。支持交接的自定义存储必须把持久化的 `handoff_floor` 水位和游标一起存，还要实现原子的 `reset_pipeline(record)`。详见 [恢复契约](docs/zh-CN/reference.md#表与读取器)。
 
@@ -351,8 +353,8 @@ uv run pyattacker bench --algorithms wait,backoff --seeds 5 --json runs/bench.js
 
 | 文档 | 内容 |
 |---|---|
-| [`docs/tutorial.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/tutorial.md) | 17 个可运行步骤，从"一个任务"到分片评测和高级交接/反向遍历——回退、全量重试、载荷历史都有；每个步骤都有测试执行 |
-| [`docs/reference.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/reference.md) | 所有公开类和函数：签名、参数、示例——包括高级反向遍历和 `HistoryArtifact` |
+| [`docs/tutorial.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/tutorial.md) | 17 个可运行步骤，从"一个任务"到分片评测、交接和反向遍历——回退、全量重试、载荷历史都有；每个步骤都有测试执行 |
+| [`docs/reference.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/reference.md) | 所有公开类和函数：签名、参数、示例——包括反向遍历和 `HistoryArtifact` |
 | [`docs/cli.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/cli.md) | 每个子命令、每个参数、退出码、配置参考 |
 | [`docs/design.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/design.md) | 概念模型、六条不变量、租约契约、数据模型、设计权衡 |
 | [`docs/benchmark.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/benchmark.md) | 算法基准测试：场景假设了什么、指标怎么看、表格怎么读 |
@@ -383,7 +385,7 @@ uv run pyattacker run -c examples/qa_eval.yaml --limit 40
 
 * **网络请求**——openai/anthropic 的调用你自己写。内核从不碰 socket。
 * **指标计算**——准确率、pass@k、F1，以及任何跨流水线的汇总计算。把产物导出来在外面算，或者用原语自己拼一条汇总流水线。
-* **DAG 编排**——流水线就是一条直线链，要分支就在任务内部用 `fanout`。唯一例外是可选的[交接](README.zh-CN.md#进阶交接可选启用)：它只是沿着声明的边改变链的遍历方式，拓扑不变（没有汇合节点、没有第二个入口、没有跨流水线跳转）。
+* **DAG 编排**——流水线就是一条直线链，要分支就在任务内部用 `fanout`。唯一例外是可选的[交接](README.zh-CN.md#交接可选启用)：它只是沿着声明的边改变链的遍历方式，拓扑不变（没有汇合节点、没有第二个入口、没有跨流水线跳转）。
 * **服务网关**——唯一的 HTTP 接口就是上面那个只读调试面板。
 * **分布式调度**——横向扩展用 `--shard`，多进程就是上限。
 
@@ -395,7 +397,7 @@ uv run pyattacker run -c examples/qa_eval.yaml --limit 40
 把准确率等数值汇报到只读监控面板。完成回调提供已提交的流水线结果，指标计算仍由应用负责。
 面板和 `watch` 默认统一跟随同一个运行。参见 [`examples/live_metrics.py`](examples/live_metrics.py)。
 
-**0.3.0——高级控制流（可选），以及中文文档。** 任务现在可以做[交接](README.zh-CN.md#进阶交接可选启用)：返回一个 `Handoff` 跳过声明的后续步骤或提前收尾，记录在持久化账本里，续跑时从账本接着走。需要手动开启，不开完全没影响——没有 `control` 块的流水线不写新数据，`spec_digest` 逐字节不变。1.0 之前标记为实验性。反向遍历现在支持声明式回退和全量重试，带 visits 和可选的载荷历史。整套文档也提供了简体中文版（[`README.zh-CN.md`](README.zh-CN.md)、[`docs/zh-CN/`](https://github.com/Hazer-BJTU/pyattacker/tree/main/docs/zh-CN)），由 CI 保持同步。升级时有一个改名要知道：`MergedReport.events_total` 现在叫 `source_events_total`，因为它是合并报告里**唯一**不去重、按源库原始累加的计数（旧名字仍可作为废弃别名使用）。
+**0.3.0——控制流（可选），以及中文文档。** 任务现在可以做[交接](README.zh-CN.md#交接可选启用)：返回一个 `Handoff` 跳过声明的后续步骤或提前收尾，记录在持久化账本里，续跑时从账本接着走。需要手动开启，不开完全没影响——没有 `control` 块的流水线不写新数据，`spec_digest` 逐字节不变。交接与反向遍历在 0.3.0 发布时属于实验性特性；当前开发版本将其提升为正式特性（见 [Unreleased](CHANGELOG.md#unreleased)）。反向遍历现在支持声明式回退和全量重试，带 visits 和可选的载荷历史。整套文档也提供了简体中文版（[`README.zh-CN.md`](README.zh-CN.md)、[`docs/zh-CN/`](https://github.com/Hazer-BJTU/pyattacker/tree/main/docs/zh-CN)），由 CI 保持同步。升级时有一个改名要知道：`MergedReport.events_total` 现在叫 `source_events_total`，因为它是合并报告里**唯一**不去重、按源库原始累加的计数（旧名字仍可作为废弃别名使用）。
 
 **0.2.0——基准测试、更严格的身份校验、三处正确性修复。** 新增 `pyattacker bench`：一个模拟接口方的世界，用一组指标对比各获取算法，而不是一个加权分数（[`docs/benchmark.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/benchmark.md)）。新增 `Retrying.decide`：把重试决策暴露为策略上的方法。新增分页的整类读取（`pyattacker.store.iter_*`，由可选的 `PagedStore` 扩展提供），导出大存储不再需要全量加载。0.1.x 已经实现了 M0–M4 计划的全部内容：内核、持久化和任务级恢复、重试和错误分类、带 7 种获取算法的资源池、延迟延续和 write-behind 批处理、分片和合并报告、三种格式五种导出形状、入口点插件、外部产物后端、fan-out 辅助函数、HTTP 监控端点。
 

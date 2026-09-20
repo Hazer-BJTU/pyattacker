@@ -8,7 +8,7 @@ from first, with the same kind of marker as the first line of the block:
   with the current interpreter and ``cwd`` set to that directory, so an undefined name, a relative
   store path that assumes the checkout, or a network call fails CI.
 * ``# reference/<name>.py`` — the same contract for the complete programs in ``docs/reference.md``:
-  the reference is where the advanced backward-traversal and ``HistoryArtifact`` interfaces are
+  the reference is where the backward-traversal and ``HistoryArtifact`` interfaces are
   specified, and a snippet there that no longer runs is worse than no snippet.
 * ``# example/<name>.yaml`` — a complete config. It is written out and passed to
   ``pyattacker validate`` through the CLI entry point, which is exactly what the document tells the

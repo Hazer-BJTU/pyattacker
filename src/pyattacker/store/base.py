@@ -252,10 +252,10 @@ class EventRecord:
 
 @dataclass
 class HandoffRecord:
-    """One recorded handoff —— the durable control-flow edge that made a pipeline skip positions.
+    """One recorded handoff —— the durable control-flow edge that moved or ended a pipeline.
 
-    **Advanced feature** (``docs/design.md`` §4.8): append-only, one row per task-initiated jump, and
-    the authoritative history of "why does this pipeline's task list skip stations". Rows are read by
+    **Control-flow feature** (``docs/design.md`` §4.8): append-only, one row per task-initiated jump, and
+    the authoritative history of forward jumps, early completion, rewinds and restarts. Rows are read by
     recovery (the pipeline resumes at the target with the recorded entry state), by export (nested in
     the pipeline row) and by ``report``/``watch`` counters.
 
@@ -403,7 +403,7 @@ class Store(Protocol):
     #
     # ``commit_handoff(record, *, task, attempt, payload=None, cursor, final=False)`` and
     # ``handoffs(*, pipeline_id=None, run_id=None, limit=None)`` are the optional capability behind the
-    # **advanced** handoff feature (``docs/design.md`` §4.8), again in the ``resources()`` spirit:
+    # handoff feature (``docs/design.md`` §4.8), again in the ``resources()`` spirit:
     #
     # * ``commit_handoff`` is **one atomic commit**: finalize the source task row
     #   (``state="handed_off"``), insert the handed-off attempt (``outcome="handed_off"``), persist the

@@ -152,7 +152,7 @@ over the stores you passed, duplicates included, because an event is not part of
 `--errors N` prints the first N failures with their error class. `--json` gives you the same numbers as an
 object. A run that recorded handoffs says so in its summary line (`... attempts: total=12 handoffs=2`), and
 `--rows pipelines` on `export` carries the ledger itself (see
-[advanced: handoffs](reference.md#advanced-handoffs-opt-in)).
+[handoffs](reference.md#handoffs-opt-in)).
 
 If the store contains failed terminal repair attempts, the report lists them separately
 (`Terminal repair failures: N pipeline(s)`), each with the pipeline id and failure phase. This is a
@@ -332,10 +332,12 @@ the entry does not mention keeps whatever the target declares (its own `resource
 `${VAR}` is expanded from the environment (see `--strict-env`). `source.kind` is `jsonl` or `range`;
 `repeats: k` is pass@k — k independent pipelines per seed. CLI flags override the `run:` block.
 
-### `pipeline.control` — advanced, opt-in handoffs
+<a id="pipelinecontrol--advanced-opt-in-handoffs"></a>
+
+### `pipeline.control` — explicitly declared handoffs
 
 A config may also declare which task is allowed to **hand off** (skip ahead) by returning a
-[`Handoff`](reference.md#advanced-handoffs-opt-in), so the same pipeline can be expressed declaratively:
+[`Handoff`](reference.md#handoffs-opt-in), so the same pipeline can be expressed declaratively:
 
 ```yaml
 pipeline:
@@ -358,7 +360,7 @@ path — `pipeline.control.edges['judge'][0]: destination 'fetch' (seq 0) is not
 'judge' (seq 2); v1 handoffs are forward-only` — under `validate` (exit 2) as well as `run`, because both go
 through the same validation entry. Within an `edges` block there is no other key and no `mode` in this
 version; backward traversal declares its own `rewind` / `retry_all` / `max_handoffs` keys instead (see
-[Advanced backward control declarations](#advanced-backward-control-declarations)).
+[Backward control declarations](#backward-control-declarations)).
 
 Numeric source keys work across YAML, JSON and TOML: JSON/TOML spell seq 0 as the key `"0"`
 (e.g. `"edges": {"0": [2]}`). An exact task name takes precedence over a numeric string. Numeric
@@ -366,26 +368,28 @@ destinations remain integers. Declaring the same source twice through a name and
 rather than silently replacing one list. Effective configuration uses numeric seqs for repeated or
 reserved (`end`) names instead of inventing a `name#N` syntax.
 
-The feature is **advanced**: it changes the execution model, so it is opt-in, marked experimental until 1.0,
-and needs a store that can commit a handoff atomically (both built-in backends can). Pipelines without the
+Handoffs are a **supported control-flow feature**. They require an explicit `control` declaration
+and a store that can commit a handoff atomically (both built-in backends can). Pipelines without the
 block are unaffected in every respect. See
-[reference → advanced: handoffs](reference.md#advanced-handoffs-opt-in) for the API and
-[design §4.8](design.md#48-advanced-handoffs--declared-forward-jumps-opt-in-experimental) for the model.
+[reference → handoffs](reference.md#handoffs-opt-in) for the API and
+[design §4.8](design.md#48-handoffs--declared-forward-jumps-opt-in) for the model.
 
 The declarative layer describes **composition and resources only**; the logic stays in Python behind `use:`.
 Anything it cannot express is a reason to use the SDK, not a reason to add YAML — see
 [`docs/tutorial.md`](tutorial.md) step 11 for where the line falls.
 
-### Advanced backward control declarations
+<a id="advanced-backward-control-declarations"></a>
+
+### Backward control declarations
 
 `pipeline.control` also accepts `rewind: {source: [earlier_targets]}`, `retry_all: [sources]` and
 required positive `max_handoffs` for backward traversal. `edges` is optional for backward-only plans;
 existing forward-only declarations stay unchanged. `run.max_handoffs` sets the runtime ceiling (default
 1000). Validation shares Python's name/seq resolution and reports configuration field paths. Rewind payloads
 are chosen by task code, not config. See
-[reference → advanced: backward traversal](reference.md#advanced-backward-traversal-rewind-retry-all-visits)
+[reference → backward traversal](reference.md#backward-traversal-rewind-retry-all-visits)
 for the syntax, the visit model, the budget lifecycle and missing-payload recovery, and
-[tutorial steps 16–17](tutorial.md#step-16--advanced-regenerating-with-rewind-and-retry-all) for working
+[tutorial steps 16–17](tutorial.md#step-16--regenerating-with-rewind-and-retry-all) for working
 Python examples, `HistoryArtifact` included.
 
 ## See also
