@@ -561,3 +561,7 @@ extracted and executed by `tests/test_tutorial.py`, so documentation that rots f
 ## License
 
 MIT — see [LICENSE](https://github.com/Hazer-BJTU/pyattacker/blob/main/LICENSE).
+
+## Experiment suites
+
+Combine existing configuration files under one Runner with shared resource pools and total concurrency. Optional per-experiment directories separate checkpoints, results and file artifacts. Suite reports include prior successes across resumes. See the [Suite guide](docs/suites.md) and [runnable configuration](examples/suites/suite.json).

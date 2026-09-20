@@ -732,7 +732,7 @@ class DeclarativeSpec:
         }
 
 
-def load_spec(path: str | Path, *, strict_env: bool = False) -> DeclarativeSpec:
+def load_spec(path: str | Path, *, strict_env: bool = False, _raw: dict[str, Any] | None = None) -> Any:
     """Read a declarative config, validate it, and build pools + the pipeline template + run parameters.
 
     Validation is the shared entry point for ``validate`` and ``run``: unknown fields, field types,
@@ -742,9 +742,16 @@ def load_spec(path: str | Path, *, strict_env: bool = False) -> DeclarativeSpec:
     path = Path(path)
     if not path.exists():
         raise ConfigError(f"config file does not exist: {path}")
-    raw = _load_raw(path)
+    raw = _load_raw(path) if _raw is None else _raw
     unresolved: list[str] = []
-    raw = expand_env(raw, strict=strict_env, unresolved=unresolved)
+    if _raw is None:
+        raw = expand_env(raw, strict=strict_env, unresolved=unresolved)
+
+    if "suite" in raw or "experiments" in raw:
+        from .suite import load_suite
+        suite = load_suite(path, raw, strict_env=strict_env)
+        suite.unresolved_env.extend(unresolved)
+        return suite
 
     _validate_run(raw.get("run"))
     _validate_pools(raw.get("pools"))

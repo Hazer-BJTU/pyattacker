@@ -277,6 +277,11 @@ class RunReport:
                     f"    - {item.get('name')}/{item.get('failed_task')}: "
                     f"{item.get('error_type')}: {str(item.get('error_message'))[:120]}"
                 )
+        for experiment in self.stats.get("experiments", []):
+            lines.append(f"  experiment {experiment['experiment_id']}: {experiment['state']} "
+                         f"{experiment['pipelines']['by_state']}")
+            if experiment.get("source_error"):
+                lines.append(f"    source: {experiment['source_error']}")
         return "\n".join(lines)
 
     def export_jsonl(self, path: str, *, scope: str = "store", run_id: str | None = None) -> int:
@@ -409,6 +414,7 @@ class Runner:
         elif store != ":memory:":
             config = dataclasses.replace(config, store=store)
         self.config = config
+        self._run_resume = config.resume
         self.clock = clock or _RealClock()
         self.bus = bus or Bus(clock=self.clock)
         self.registry = registry or DEFAULT_REGISTRY
@@ -544,9 +550,13 @@ class Runner:
         resume: bool | None = None,
         run_id: str | None = None,
     ) -> RunReport:
+        from .suite import _SuiteStream
+        if isinstance(pipelines, _SuiteStream):
+            pipelines.prepare_run(self.store)
         cfg = self.config
         if resume is None:
             resume = cfg.resume
+        self._run_resume = resume
         self._stopping.clear()
         self._stop_reason = None
         self._counters.clear()
@@ -637,6 +647,11 @@ class Runner:
                 ):
                     self.stop("stop_after_failures")
                     break
+                if spec.suite_id is not None:
+                    admit = getattr(self.store, "admit", None)
+                    if admit is None:
+                        raise ConfigError("Suite pipelines require SuiteStore in both output layouts")
+                    admit(spec, rid)
                 self._counters["pipelines_admitted"] += 1
                 if not await self._hand_over(queue, spec):
                     # A worker died before this pipeline could be handed over. It was never queued,
@@ -671,6 +686,10 @@ class Runner:
                 if restore_signals is not None:
                     restore_signals()
                 self._finalize_pools()
+                if getattr(self.store, "suite_store", False):
+                    close_source = getattr(pipelines, "close", None)
+                    if close_source is not None:
+                        close_source()
 
         if self._fatal_error is not None:
             # The store itself failed while recovering from an earlier framework surprise -- its
@@ -1126,6 +1145,7 @@ class Runner:
                     run_id=run_id,
                     name=spec.name,
                     key=spec.key,
+                    repeat=spec.repeat,
                     tags=dict(spec.template.tags),
                     n_tasks_total=spec.n_tasks,
                     seed_digest=spec.seed_digest,
@@ -1195,6 +1215,7 @@ class Runner:
                 run_id=run_id,
                 name=item.name,
                 key=item.key,
+                repeat=item.repeat,
                 tags=dict(item.template.tags),
                 n_tasks_total=item.n_tasks,
                 seed_digest=item.seed_digest,
@@ -1238,7 +1259,7 @@ class Runner:
             return None
 
         if spec.control is not None and spec.control.backward_enabled:
-            if self._owned_by_another_run(record, resume=cfg.resume):
+            if self._owned_by_another_run(record, resume=self._run_resume):
                 # Explicit ownership rule for backward traversal (`docs/reference.md`, "Advanced:
         # backward traversal"): a durable
                 # pending visit can be continued after a crash, so taking over a row that another
@@ -1365,6 +1386,7 @@ class Runner:
             run_id=run_id,
             name=spec.name,
             key=spec.key,
+            repeat=spec.repeat,
             tags=dict(spec.template.tags),
             n_tasks_total=spec.n_tasks,
             seed_digest=spec.seed_digest,
@@ -1504,7 +1526,7 @@ class Runner:
             or restart
         )
         record = record or PipelineRecord(pipeline_id=spec.pipeline_id, run_id=run_id, name=spec.name,
-                                         key=spec.key, tags=dict(spec.template.tags), n_tasks_total=spec.n_tasks,
+                                         key=spec.key, repeat=spec.repeat, tags=dict(spec.template.tags), n_tasks_total=spec.n_tasks,
                                          seed_digest=spec.seed_digest, spec_digest=spec.spec_digest)
         if not fresh and traversal is None:
             raise PyAttackerError("corrupt visit checkpoint: missing traversal state")
@@ -2090,10 +2112,15 @@ class Runner:
         self._begin_task(state)
         return False
 
+    def _spec_pools(self, spec: PipelineSpec) -> dict[str, Pool]:
+        if spec.pool_aliases is None:
+            return self.pools
+        return {local: self.pools[actual] for local, actual in spec.pool_aliases.items()}
+
     def _pool_problem(self, spec: PipelineSpec) -> ConfigError | None:
         """Problems that should be blocked at construction time: a task declares an unknown resource pool."""
         for task_spec in spec.tasks:
-            if task_spec.resource and task_spec.resource not in self.pools:
+            if task_spec.resource and task_spec.resource not in self._spec_pools(spec):
                 return ConfigError(
                     f"task {task_spec.name!r} declares unknown resource pool {task_spec.resource!r}"
                     f" (registered: {sorted(self.pools)})"
@@ -2140,7 +2167,7 @@ class Runner:
             attempt=attempts_used,
             visit=record.visit,
             clock=self.clock,
-            pools=self.pools,
+            pools=self._spec_pools(spec),
             bus=self.bus,
             rng=rng,
             registry=self.registry,
@@ -2153,7 +2180,9 @@ class Runner:
             report_metric=lambda name, value, _pid=spec.pipeline_id, **kwargs: self.report_metric(
                 name, value, pipeline_id=_pid, **kwargs
             ),
-            meta={"tags": spec.template.tags},
+            meta={"tags": spec.template.tags, "suite_id": spec.suite_id,
+                  "experiment_id": spec.experiment_id, "local_key": spec.local_key,
+                  "output_dir": spec.output_dir},
         )
         attempt_started = self.clock.now()
         error: BaseException | None = None
@@ -2508,9 +2537,16 @@ class Runner:
 
     def report_metric(
         self, name: str, value: str | int | float | bool, *, label: str = "",
-        display: str = "number", pipeline_id: str | None = None
+        display: str = "number", pipeline_id: str | None = None, experiment_id: str | None = None
     ) -> ReportedMetric:
         """Persist an application-defined latest value for the active run."""
+        if experiment_id is not None:
+            if pipeline_id is not None:
+                raise ConfigError("choose either experiment_id or pipeline_id for a metric")
+            reporter = getattr(self.store, "report_experiment_metric", None)
+            if reporter is None:
+                raise ConfigError("experiment metrics require SuiteStore")
+            return reporter(self._run_id or "", experiment_id, name, value, label=label, display=display)
         return report_metric(
             self.store, self._run_id or "", name, value, label=label,
             display=display, pipeline_id=pipeline_id,

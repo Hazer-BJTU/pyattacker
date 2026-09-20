@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+* **Experiment suites** (#68): reference existing configurations and schedule their inputs
+  round-robin through one Runner with shared global concurrency and explicit local pool bindings.
+  Stable Suite/member identities preserve original local keys and isolate checkpoints and metrics.
+* Optional `by_experiment` output directories alongside default `combined` storage, with a
+  persistent catalog, source-exhaustion state, selective resume and bounded child connections.
+  Directory-aware report/watch/serve/export provide cumulative and invocation views.
+* `export --rows results`, `--by-experiment`, member-scoped reported metrics, and task context
+  experiment/output-directory fields. Single-store exports atomically replace completed files.
+* English and Chinese Suite guides and a runnable JSON example. Existing standalone path/ID
+  semantics remain unchanged; Suite mode explicitly rejects independent process shards/custom stores.
+
 ## [0.3.1] — 2026-09-19
 
 ### Added

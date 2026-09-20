@@ -213,6 +213,12 @@ class PipelineSpec:
     spec_digest: str = ""
     seed_encoded: Encoded | None = field(default=None, compare=False, repr=False)
 
+    suite_id: str | None = None
+    experiment_id: str | None = None
+    local_key: str | None = None
+    pool_aliases: dict[str, str] | None = field(default=None, compare=False, repr=False)
+    output_dir: str | None = None
+
     @property
     def name(self) -> str:
         return self.template.name

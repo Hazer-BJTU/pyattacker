@@ -39,7 +39,7 @@ from .store.base import (
 
 __all__ = ["ROW_KINDS", "FORMATS", "iter_rows", "flatten", "write_rows", "export_store"]
 
-ROW_KINDS = ("pipelines", "tasks", "attempts", "events", "artifacts")
+ROW_KINDS = ("pipelines", "tasks", "attempts", "events", "artifacts", "results")
 FORMATS = ("jsonl", "json", "csv")
 
 
@@ -191,7 +191,9 @@ def iter_rows(
         raise ConfigError(f"limit must be >= 0, got {limit}")
 
     rows: Iterator[dict[str, Any]]
-    if kind == "pipelines":
+    if kind == "results":
+        rows = _result_rows(store, run_id=run_id)
+    elif kind == "pipelines":
         rows = store.export_rows(run_id=run_id)
     elif kind == "tasks":
         rows = (_task_row(record) for record in iter_tasks(store, run_id=run_id))
@@ -201,7 +203,25 @@ def iter_rows(
         rows = (_event_row(record) for record in iter_events(store, run_id=run_id))
     else:
         rows = _artifact_rows(store, run_id=run_id)
-    yield from rows if limit is None else islice(rows, limit)
+    for row in rows if limit is None else islice(rows, limit):
+        if "suite_id" not in row and str(row.get("pipeline_id", "")).startswith("suite-"):
+            pipeline = store.get_pipeline(row["pipeline_id"])
+            if pipeline is not None and pipeline.suite_id is not None:
+                row.update(suite_id=pipeline.suite_id, experiment_id=pipeline.experiment_id,
+                           local_key=pipeline.local_key)
+        yield row
+
+
+def _result_rows(store: Store, *, run_id: str | None = None) -> Iterator[dict[str, Any]]:
+    for pipeline in iter_pipelines(store, run_id=run_id):
+        final = (next((a for a in iter_artifacts(store, pipeline_id=pipeline.pipeline_id) if a.is_final), None)
+                 if pipeline.state == "succeeded" else None)
+        yield {"pipeline_id": pipeline.pipeline_id, "key": pipeline.key,
+               "local_key": pipeline.local_key, "repeat": pipeline.repeat,
+               "suite_id": pipeline.suite_id, "experiment_id": pipeline.experiment_id,
+               "state": pipeline.state, "result": _decode(final) if final is not None else None,
+               "artifact_available": final.available if final is not None else False,
+               "error_type": pipeline.error_type, "error_message": pipeline.error_message}
 
 
 def _artifact_rows(store: Store, *, run_id: str | None = None) -> Iterator[dict[str, Any]]:
@@ -320,7 +340,21 @@ def export_store(
     limit: int | None = None,
 ) -> int:
     rows = iter_rows(store, kind=kind, run_id=run_id, limit=limit)
-    return write_rows(rows, path, fmt=fmt)
+    if path is None:
+        return write_rows(rows, path, fmt=fmt)
+    # A failed export never replaces a previous complete output file.
+    import tempfile
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=directory, prefix=".export-")
+    os.close(fd)
+    try:
+        count = write_rows(rows, temporary, fmt=fmt)
+        os.replace(temporary, path)
+        return count
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def export_stores(

@@ -25,6 +25,7 @@ class ReportedMetric:
     display: str = "number"
     pipeline_id: str | None = None
     updated_at: float = field(default_factory=time.time)
+    experiment_id: str | None = None
 
 
 def report_metric(

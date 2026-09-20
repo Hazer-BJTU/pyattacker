@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # reader who lands on the English tree never has to guess which files are translations.
 PAIRS: dict[str, str] = {
     "README.md": "README.zh-CN.md",
+    "docs/suites.md": "docs/zh-CN/suites.md",
     "docs/tutorial.md": "docs/zh-CN/tutorial.md",
     "docs/reference.md": "docs/zh-CN/reference.md",
     "docs/design.md": "docs/zh-CN/design.md",

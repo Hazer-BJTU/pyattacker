@@ -188,6 +188,7 @@ pyattacker export STORE [STORE ...] OUTPUT [--rows SHAPE] [--format FMT] [--run-
 | `attempts` | attempt, including each retry `decision` |
 | `events` | structured event |
 | `artifacts` | artifact, intermediate ones included |
+| `results` | pipeline final result, status, error and experiment identity |
 
 `--format` is `jsonl` (default), `json` or `csv`. CSV takes its header from the first rows and folds later
 keys into an `extra` column, so memory stays flat and no field is silently dropped.
@@ -393,3 +394,9 @@ Python examples, `HistoryArtifact` included.
 * [`docs/reference.md`](reference.md) — every class and function the SDK exposes
 * [`docs/design.md`](design.md) — why the CLI has these commands and no others
 * [`README.md`](../README.md) — the compact tour
+
+## Suite commands
+
+Suite configurations reuse `run`, `resume` and `validate`. `run/resume` accept repeatable `--experiment ID` and `--output-root`; `report/watch/export/serve` accept a Suite directory and `--experiment ID`. `export --rows results` writes lightweight final results; `--by-experiment` writes OUTPUT/ID/results.FORMAT. Suite `--store`, `run.store` and sharding flags are rejected. Directory reads default to cumulative results; `--run-id` selects invocation admissions and history.
+
+[Full guide and examples](suites.md).

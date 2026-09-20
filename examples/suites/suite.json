@@ -1,0 +1,12 @@
+{
+  "suite": {"id": "qa-comparison"},
+  "run": {"concurrency": 4},
+  "output": {"root": "../../runs/suite-demo", "layout": "by_experiment"},
+  "pools": {
+    "shared": {"resources": [{"id": "shared-api", "capacity": 2}]}
+  },
+  "experiments": {
+    "baseline": {"config": "experiment.json", "pool_bindings": {"apis": "shared"}},
+    "candidate": {"config": "experiment.json", "pool_bindings": {"apis": "shared"}}
+  }
+}

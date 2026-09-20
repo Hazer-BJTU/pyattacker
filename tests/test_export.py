@@ -68,7 +68,7 @@ from pyattacker.store.writebehind import WriteBehindStore
 from pyattacker.tasks import flaky
 
 # 2 pipelines x 2 tasks, all succeeding: the counts below are exact for that fixture.
-EXPECTED_COUNTS = {"pipelines": 2, "tasks": 4, "attempts": 4, "events": 7, "artifacts": 6}
+EXPECTED_COUNTS = {"pipelines": 2, "tasks": 4, "attempts": 4, "events": 7, "artifacts": 6, "results": 2}
 
 
 @task("export.inc")
@@ -120,7 +120,7 @@ def two_step(tmp_path):
 
 # --------------------------------------------------------------------- row kinds
 def test_row_kinds_and_formats_are_the_documented_sets():
-    assert ROW_KINDS == ("pipelines", "tasks", "attempts", "events", "artifacts")
+    assert ROW_KINDS == ("pipelines", "tasks", "attempts", "events", "artifacts", "results")
     assert FORMATS == ("jsonl", "json", "csv")
 
 

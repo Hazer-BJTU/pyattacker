@@ -353,7 +353,9 @@ class SqliteStore(VisitStore):
         """
         self._conn.execute("CREATE TABLE IF NOT EXISTS visit_state (pipeline_id TEXT PRIMARY KEY, state_json TEXT NOT NULL)")
         self._conn.execute(f"CREATE TABLE IF NOT EXISTS {META_TABLE} (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        for table, additions in {"artifacts": {"visit": "INTEGER NOT NULL DEFAULT 0"},
+        for table, additions in {"pipelines": {"suite_id": "TEXT", "experiment_id": "TEXT",
+                                              "local_key": "TEXT", "repeat": "INTEGER NOT NULL DEFAULT 0"},
+                                 "artifacts": {"visit": "INTEGER NOT NULL DEFAULT 0"},
                                  "tasks": {"visit": "INTEGER NOT NULL DEFAULT 0"},
                                  "attempts": {"visit": "INTEGER NOT NULL DEFAULT 0"},
                                  "handoffs": {"operation": "TEXT NOT NULL DEFAULT 'forward'",
@@ -517,8 +519,8 @@ class SqliteStore(VisitStore):
         self._conn.execute(
             "INSERT INTO pipelines (pipeline_id,run_id,name,key,state,tags_json,created_at,started_at,"
             "finished_at,n_tasks_total,n_tasks_done,attempts_total,failed_task,error_type,error_message,"
-            "traceback,seed_digest,spec_digest,resume_of,handoff_floor) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "traceback,seed_digest,spec_digest,resume_of,handoff_floor,suite_id,experiment_id,local_key,repeat) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(pipeline_id) DO UPDATE SET run_id=excluded.run_id, state=excluded.state, "
             "started_at=excluded.started_at, finished_at=excluded.finished_at, "
             "n_tasks_total=excluded.n_tasks_total, n_tasks_done=excluded.n_tasks_done, "
@@ -531,6 +533,7 @@ class SqliteStore(VisitStore):
                 record.n_tasks_total, record.n_tasks_done, record.attempts_total, record.failed_task,
                 record.error_type, record.error_message, record.traceback, record.seed_digest,
                 record.spec_digest, record.resume_of, record.handoff_floor,
+                record.suite_id, record.experiment_id, record.local_key, record.repeat,
             ),
         )
 
@@ -1284,6 +1287,9 @@ class SqliteStore(VisitStore):
                 "handoffs": [handoff_row(h) for h in self.handoffs(pipeline_id=record.pipeline_id)],
             }
 
+            if record.suite_id is not None:
+                row.update(suite_id=record.suite_id, experiment_id=record.experiment_id,
+                           local_key=record.local_key, repeat=record.repeat)
             traversal = self.visit_state(record.pipeline_id)
             if traversal is not None:
                 row["control"] = traversal
@@ -1343,6 +1349,10 @@ def _to_pipeline(row: sqlite3.Row) -> PipelineRecord:
         attempts_total=row["attempts_total"], failed_task=row["failed_task"],
         error_type=row["error_type"], error_message=row["error_message"], traceback=row["traceback"],
         seed_digest=row["seed_digest"], spec_digest=row["spec_digest"], resume_of=row["resume_of"],
+        suite_id=row["suite_id"] if "suite_id" in row.keys() else None,  # noqa: SIM118
+        experiment_id=row["experiment_id"] if "experiment_id" in row.keys() else None,  # noqa: SIM118
+        local_key=row["local_key"] if "local_key" in row.keys() else None,  # noqa: SIM118
+        repeat=row["repeat"] if "repeat" in row.keys() else 0,  # noqa: SIM118
         handoff_floor=row["handoff_floor"] if "handoff_floor" in row.keys() else 0,  # noqa: SIM118 (sqlite Row membership checks values)
     )
 

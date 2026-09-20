@@ -146,6 +146,7 @@ pyattacker export STORE [STORE ...] OUTPUT [--rows SHAPE] [--format FMT] [--run-
 | `attempts` | 一次尝试，含每次重试的 `decision` |
 | `events` | 一个结构化事件 |
 | `artifacts` | 一个产物，包括中间产物 |
+| `results` | 一条流水线的最终结果、状态、错误和实验归属 |
 
 `--format` 可以是 `jsonl`（默认）、`json` 或 `csv`。CSV 从第一批行取表头，后面出现的新 key 折进 `extra` 列，内存占用平稳，也不会悄悄丢字段。
 
@@ -287,3 +288,9 @@ pipeline:
 * [`docs/reference.md`](reference.md) —— SDK 暴露的每个类和函数
 * [`docs/design.md`](design.md) —— 为什么 CLI 是这些命令、没有别的
 * [`README.md`](../../README.zh-CN.md) —— 简明导览
+
+## Suite 命令
+
+Suite 配置复用 `run`、`resume`、`validate`。`run/resume` 支持重复的 `--experiment ID` 和 `--output-root`；`report/watch/export/serve` 支持 Suite 目录与 `--experiment ID`。`export --rows results` 输出简洁最终结果，`--by-experiment` 写入 OUTPUT/ID/results.FORMAT。Suite 拒绝 `--store`、`run.store` 和分片参数。目录读取默认展示累计结果，`--run-id` 选择一次启动的提交记录与历史。
+
+[完整指南与示例](suites.md)。

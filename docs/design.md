@@ -1137,3 +1137,9 @@ is provably untouched: no new rows and a byte-identical `spec_digest`.
 * No service-ification / gateway / proxy
 * No dataset store (it only accepts an iterable stream of seeds + one `jsonl_source` utility)
 * No distributed scheduling (`--shard` is the multi-process ceiling)
+
+## Suite storage and scope
+
+A Suite adds stable experiment identity above pipeline execution, without adding dependencies between pipelines. Each experiment owns a local pool-name map, with explicit aliases pointing at shared Pool instances. The catalog persists definition digests, admission membership and source exhaustion; each data database owns its atomic task/visit checkpoints. Split storage does not create independent schedulers or cross-database checkpoint transactions. Historical run queries retain admission membership but pipeline payloads remain current state, not immutable historical snapshots.
+
+[Full guide and examples](suites.md).

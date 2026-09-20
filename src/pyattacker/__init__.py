@@ -220,3 +220,8 @@ __all__ = [
     "WorkerCrashed",
     "error_class_of",
 ]
+
+from .store.suite import SuiteStore
+from .suite import ExperimentSpec, SuiteSpec
+
+__all__ += ["ExperimentSpec", "SuiteSpec", "SuiteStore"]

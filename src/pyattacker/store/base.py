@@ -141,6 +141,10 @@ class PipelineRecord:
     attempts_total: int = 0
     # Ledger rows at/below this durable watermark belong to an abandoned execution.
     handoff_floor: int = 0
+    suite_id: str | None = None
+    experiment_id: str | None = None
+    local_key: str | None = None
+    repeat: int = 0
 
 
 @dataclass
