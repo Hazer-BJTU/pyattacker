@@ -2,7 +2,7 @@
 
 **English** | [简体中文](zh-CN/design.md)
 
-> Version: 0.3.1 — M0–M5 complete, including the supported control flow of §4.8 (forward handoffs and
+> Version: 0.3.2 — M0–M5 complete, including the supported control flow of §4.8 (forward handoffs and
 > backward traversal), enabled through explicit declarations. See "Implemented / Left for later" in Section 9.
 > In one sentence: **an async task orchestration framework centered on the artifact, using the pipeline as the unit of completion, and the resource pool as the only shared surface.**
 > It does not touch the network, does not do reduction, and does not do DAG scheduling — it is only responsible for "running tens of thousands of mutually independent pipelines to completion, reliably, recoverably, and observably".

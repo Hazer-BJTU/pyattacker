@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-09-21
+
 ### Changed
 
 * **Handoffs and forward/backward jumps are supported public features.** `Handoff.to`,

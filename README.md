@@ -499,6 +499,13 @@ every known tradeoff with its reason.
 
 ## Status
 
+**0.3.2 — experiment suites and supported control flow.** Independent experiments can share resource
+pools and global concurrency, with unified run/resume/report commands and optional per-experiment output
+directories. Durable run histories preserve earlier outcomes after resume. Handoffs, forward jumps,
+rewinds and retry-all are supported public features, enabled through explicit `control` declarations.
+See the [Suite guide](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/suites.md) and
+[release notes](https://github.com/Hazer-BJTU/pyattacker/blob/main/CHANGELOG.md#032--2026-09-21).
+
 **0.3.1 — application-reported live metrics.** Applications can publish values such as accuracy to the
 read-only monitoring dashboard through `Runner.report_metric()` or `TaskContext.report_metric()`. A completion
 callback receives committed pipeline results; the application owns the calculation. The dashboard and
@@ -508,8 +515,8 @@ callback receives committed pipeline results; the application owns the calculati
 [hand off](#handoffs-opt-in): return a `Handoff` to skip declared stations or finish the pipeline
 early, recorded in a durable ledger that recovery resumes from. It is opt-in and inert — a pipeline without a
 `control` block writes no new rows and keeps a byte-identical `spec_digest`. Handoffs and backward traversal
-were experimental in 0.3.0; the current development version promotes them to supported features
-(see [Unreleased](CHANGELOG.md#unreleased)). Backward traversal adds declared rewind and retry-all with visits
+were experimental in 0.3.0 and became supported features in 0.3.2
+(see [0.3.2 release notes](https://github.com/Hazer-BJTU/pyattacker/blob/main/CHANGELOG.md#032--2026-09-21)). Backward traversal adds declared rewind and retry-all with visits
 and optional payload history. The
 whole documentation set also ships in Simplified Chinese ([`README.zh-CN.md`](README.zh-CN.md),
 [`docs/zh-CN/`](https://github.com/Hazer-BJTU/pyattacker/tree/main/docs/zh-CN)), kept in sync by CI. One
