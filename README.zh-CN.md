@@ -397,7 +397,7 @@ uv run pyattacker run -c examples/qa_eval.yaml --limit 40
 把准确率等数值汇报到只读监控面板。完成回调提供已提交的流水线结果，指标计算仍由应用负责。
 面板和 `watch` 默认统一跟随同一个运行。参见 [`examples/live_metrics.py`](examples/live_metrics.py)。
 
-**0.3.0——控制流（可选），以及中文文档。** 任务现在可以做[交接](README.zh-CN.md#交接可选启用)：返回一个 `Handoff` 跳过声明的后续步骤或提前收尾，记录在持久化账本里，续跑时从账本接着走。需要手动开启，不开完全没影响——没有 `control` 块的流水线不写新数据，`spec_digest` 逐字节不变。交接与反向遍历现已作为正式特性维护。反向遍历现在支持声明式回退和全量重试，带 visits 和可选的载荷历史。整套文档也提供了简体中文版（[`README.zh-CN.md`](README.zh-CN.md)、[`docs/zh-CN/`](https://github.com/Hazer-BJTU/pyattacker/tree/main/docs/zh-CN)），由 CI 保持同步。升级时有一个改名要知道：`MergedReport.events_total` 现在叫 `source_events_total`，因为它是合并报告里**唯一**不去重、按源库原始累加的计数（旧名字仍可作为废弃别名使用）。
+**0.3.0——控制流（可选），以及中文文档。** 任务现在可以做[交接](README.zh-CN.md#交接可选启用)：返回一个 `Handoff` 跳过声明的后续步骤或提前收尾，记录在持久化账本里，续跑时从账本接着走。需要手动开启，不开完全没影响——没有 `control` 块的流水线不写新数据，`spec_digest` 逐字节不变。交接与反向遍历在 0.3.0 发布时属于实验性特性；当前开发版本将其提升为正式特性（见 [Unreleased](CHANGELOG.md#unreleased)）。反向遍历现在支持声明式回退和全量重试，带 visits 和可选的载荷历史。整套文档也提供了简体中文版（[`README.zh-CN.md`](README.zh-CN.md)、[`docs/zh-CN/`](https://github.com/Hazer-BJTU/pyattacker/tree/main/docs/zh-CN)），由 CI 保持同步。升级时有一个改名要知道：`MergedReport.events_total` 现在叫 `source_events_total`，因为它是合并报告里**唯一**不去重、按源库原始累加的计数（旧名字仍可作为废弃别名使用）。
 
 **0.2.0——基准测试、更严格的身份校验、三处正确性修复。** 新增 `pyattacker bench`：一个模拟接口方的世界，用一组指标对比各获取算法，而不是一个加权分数（[`docs/benchmark.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/zh-CN/benchmark.md)）。新增 `Retrying.decide`：把重试决策暴露为策略上的方法。新增分页的整类读取（`pyattacker.store.iter_*`，由可选的 `PagedStore` 扩展提供），导出大存储不再需要全量加载。0.1.x 已经实现了 M0–M4 计划的全部内容：内核、持久化和任务级恢复、重试和错误分类、带 7 种获取算法的资源池、延迟延续和 write-behind 批处理、分片和合并报告、三种格式五种导出形状、入口点插件、外部产物后端、fan-out 辅助函数、HTTP 监控端点。
 

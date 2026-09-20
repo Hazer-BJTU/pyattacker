@@ -524,9 +524,10 @@ case.
 no surface may render `n_tasks_done / n_tasks_total` as a completion percentage for such a pipeline
 (`report`/`watch`/`/pipelines` expose the handoff count next to it for exactly that reason).
 
-Termination is still structural, not budgetary: a handoff may only target a strictly later position, so the
-cursor strictly increases and the chain is walked at most once. That is what keeps this version free of loop
-budgets — and why the v2 backward case cannot be added without one (§4.8.7).
+For forward-only traversal, termination is structural, not budgetary: a handoff may only target a strictly
+later position, so the cursor strictly increases and the chain is walked at most once. That is what keeps
+the forward-only path free of loop budgets; backward traversal instead requires a finite `max_handoffs`
+budget (§4.8.8).
 
 #### 4.8.6 Declaring edges, and what validation does (and does not) check
 

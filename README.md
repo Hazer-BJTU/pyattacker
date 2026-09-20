@@ -508,7 +508,8 @@ callback receives committed pipeline results; the application owns the calculati
 [hand off](#handoffs-opt-in): return a `Handoff` to skip declared stations or finish the pipeline
 early, recorded in a durable ledger that recovery resumes from. It is opt-in and inert — a pipeline without a
 `control` block writes no new rows and keeps a byte-identical `spec_digest`. Handoffs and backward traversal
-are now maintained as supported features. Backward traversal adds declared rewind and retry-all with visits
+were experimental in 0.3.0; the current development version promotes them to supported features
+(see [Unreleased](CHANGELOG.md#unreleased)). Backward traversal adds declared rewind and retry-all with visits
 and optional payload history. The
 whole documentation set also ships in Simplified Chinese ([`README.zh-CN.md`](README.zh-CN.md),
 [`docs/zh-CN/`](https://github.com/Hazer-BJTU/pyattacker/tree/main/docs/zh-CN)), kept in sync by CI. One
