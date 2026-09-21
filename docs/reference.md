@@ -1404,6 +1404,37 @@ with closing(open_store("runs/qa.db")) as store:      # reopen a finished run, a
 `spec` can be `":memory:"`, a path, a plugin URI (`"s3://bucket/runs.db"`), or an already-open store.
 Reading a live store while a run writes to it is supported — WAL allows one writer and many readers.
 
+### Fact batches and failure recovery
+
+`pyattacker.store.FactBatchStore` is an optional capability, separate from the required `Store`
+protocol: `write_facts(attempts, events)` atomically commits both sequences and assigns their IDs
+only after success. On exception no batch rows may be committed and input IDs must be unchanged.
+The capability owns its transaction; SQLite rejects a call inside an existing transaction without
+committing or rolling back the caller's work. An empty batch performs no transaction.
+
+`WriteBehindStore` uses this capability when available. SQLite implements it, including the SQLite
+stores wrapped by either Suite layout. A failed atomic batch stays buffered and can be flushed again.
+In a split Suite, a successful child batch stays committed if a later child's batch fails; retry only
+writes the remaining batches. Eviction flushes before removing a child from the connection cache,
+so a failed flush leaves that child and its pending batch available for retry. Checkpoint, artifact,
+and task-state writes still bypass the buffer; handoff/visit transactions keep their existing boundaries.
+
+A legacy store without `write_facts` is supported through individual `record_attempt`/`emit_event`
+calls. Each normally returned call removes that confirmed record from the buffer. If a call raises,
+the original exception propagates and the failing record plus its unattempted suffix stay buffered.
+Because the failing call might have committed before raising, this wrapper then refuses further
+fact writes and flush-dependent reads/flushes with `StoreUnavailable`, chaining the original error.
+`buffer_stats()["flush_blocked"]` reports this condition; `pending` includes the uncertain record.
+Reconcile persisted records with the original submitted facts before constructing another wrapper;
+do not blindly replay the pending suffix. There is no automatic exactly-once guarantee for an
+ambiguous legacy write. Custom stores that can guarantee atomic rollback should implement the optional
+capability instead. SQLite subclasses that customize fact writes must also customize `write_facts`
+or disable it with `write_facts = None` to keep using their individual write overrides.
+
+Closing always releases the underlying store even when flush raises; the error remains visible.
+Suite close attempts every child, the catalog and the ownership lock, and propagates the first error.
+After a failed close, reopen/reconcile as needed; do not retry a flush on the closed connection.
+
 ### Tables and readers
 
 | Table | One row per | Read with |

@@ -296,8 +296,14 @@ class SuiteStore:
             self._children.move_to_end(eid)
             return self._children[eid]
         if len(self._children) >= self.max_open:
-            _, old = self._children.popitem(last=False)
-            old.close()  # flush before eviction
+            oldest = next(iter(self._children))
+            old = self._children[oldest]
+            # Keep a failed batch reachable (and its connection open) for retry.
+            # close() releases the handle even on failure, so flush before eviction.
+            if hasattr(old, "flush"):
+                old.flush()
+            old.close()
+            del self._children[oldest]
         path = self._child_path(eid)
         if not path.is_file():
             raise ConfigError(f"missing experiment database: {path}")
@@ -942,14 +948,18 @@ class SuiteStore:
         return total
 
     def close(self) -> None:
-        try:
-            for child in self._children.values():
-                child.close()
-        finally:
-            self._children.clear()
+        error = None
+        # A failed child flush must neither hide its error nor prevent the other
+        # children/catalog/ownership lock from being closed.
+        for handle in [*self._children.values(), self.data, self._writer_guard]:
+            if handle is None:
+                continue
             try:
-                self.data.close()
-            finally:
-                if self._writer_guard is not None:
-                    self._writer_guard.close()
-                    self._writer_guard = None
+                handle.close()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+        self._children.clear()
+        self._writer_guard = None
+        if error is not None:
+            raise error

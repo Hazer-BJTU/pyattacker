@@ -6,6 +6,7 @@ from .base import (
     TASK_STATES,
     AttemptRecord,
     EventRecord,
+    FactBatchStore,
     HandoffRecord,
     PagedStore,
     PipelineRecord,
@@ -34,6 +35,7 @@ from .writebehind import WriteBehindStore, wrap_write_behind
 
 __all__ = [
     "Store",
+    "FactBatchStore",
     "PagedStore",
     "MemoryStore",
     "WriteBehindStore",

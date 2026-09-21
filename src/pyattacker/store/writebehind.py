@@ -15,6 +15,11 @@ Flush triggers (no background thread, no timer task — fully deterministic):
 Failure model: a hard crash (SIGKILL) can lose at most the last unsent batch, while
 every checkpoint stays intact — a resumed run re-executes only the tasks that were
 genuinely unfinished.
+
+SQLite implements ``write_facts``: a failed flush rolls back the whole batch and
+leaves it retryable. Legacy stores acknowledge each successful row individually;
+after an exception their commit outcome is unknown, so automatic replay is blocked.
+``close()`` always closes the underlying store, including when flush fails.
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 from ..artifact import Artifact, Encoded
-from ..errors import ConfigError, StoreFeatureUnsupported
+from ..errors import ConfigError, StoreFeatureUnsupported, StoreUnavailable
 from .base import (
     AttemptRecord,
     EventRecord,
@@ -65,6 +70,7 @@ class WriteBehindStore:
         self.flushes = 0
         self.buffered_attempts = 0
         self.buffered_events = 0
+        self._write_error: BaseException | None = None
 
     # ------------------------------------------------------------------ buffering
     @property
@@ -73,22 +79,48 @@ class WriteBehindStore:
 
     def flush(self) -> int:
         """Write every buffered fact to the inner store. Returns how many rows were written."""
+        self._check_write_error()
         if not self._attempts and not self._events:
             self._last_flush = self._clock.now()
             return 0
-        written = 0
-        # attempts first: they are the more valuable record if the process dies mid-flush
-        for attempt in self._attempts:
-            self.inner.record_attempt(attempt)
-            written += 1
-        self._attempts.clear()
-        for event in self._events:
-            self.inner.emit_event(event)
-            written += 1
-        self._events.clear()
+        written = self.pending
+        batch = getattr(self.inner, "write_facts", None)
+        if callable(batch):
+            # Only opt-in atomic stores may take this path. Failed calls retain the
+            # entire batch; IDs are published by the store only after commit.
+            batch(tuple(self._attempts), tuple(self._events))
+            self._attempts.clear()
+            self._events.clear()
+        else:
+            # Legacy methods acknowledge one record at a time. Remove the known
+            # committed prefix even on failure, but never guess whether the failing
+            # call committed: a later read/close must not silently replay it.
+            for records, write in (
+                (self._attempts, self.inner.record_attempt),
+                (self._events, self.inner.emit_event),
+            ):
+                confirmed = 0
+                try:
+                    for record in records:
+                        write(record)
+                        confirmed += 1
+                except BaseException as exc:
+                    self._write_error = exc
+                    raise
+                finally:
+                    del records[:confirmed]
         self.flushes += 1
         self._last_flush = self._clock.now()
         return written
+
+    def _check_write_error(self) -> None:
+        if self._write_error is not None:
+            raise StoreUnavailable(
+                "a non-atomic fact write failed with an unknown commit outcome; "
+                "automatic replay is disabled for this WriteBehindStore. Reconcile the "
+                "underlying store and pending facts before creating a new wrapper, or "
+                "implement the atomic write_facts capability"
+            ) from self._write_error
 
     def _maybe_flush(self) -> None:
         if self.pending >= self.batch_size:
@@ -105,11 +137,13 @@ class WriteBehindStore:
             "buffered_events": self.buffered_events,
             "batch_size": self.batch_size,
             "flush_interval": self.flush_interval,
+            "flush_blocked": self._write_error is not None,
         }
 
     # ------------------------------------------------------- append-only writes
     def record_attempt(self, record: AttemptRecord) -> AttemptRecord:
         """Buffered. ``attempt_id`` is assigned by the inner store when the batch is flushed."""
+        self._check_write_error()
         self._attempts.append(record)
         self.buffered_attempts += 1
         self._maybe_flush()
@@ -117,6 +151,7 @@ class WriteBehindStore:
 
     def emit_event(self, event: EventRecord) -> None:
         """Buffered. ``event_id`` is assigned by the inner store when the batch is flushed."""
+        self._check_write_error()
         self._events.append(event)
         self.buffered_events += 1
         self._maybe_flush()
@@ -353,8 +388,10 @@ class WriteBehindStore:
         return self.inner.export_rows(run_id=run_id)
 
     def close(self) -> None:
-        self.flush()
-        self.inner.close()
+        try:
+            self.flush()
+        finally:
+            self.inner.close()
 
     def reset_pipeline(self, record: PipelineRecord) -> None:
         self.flush()
