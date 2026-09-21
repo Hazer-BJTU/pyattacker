@@ -185,6 +185,7 @@ RUN_FIELDS = frozenset({
     "store",
     "journal",
     "concurrency",
+    "max_admitted",
     "label",
     "heartbeat_s",
     "grace_s",
@@ -390,6 +391,9 @@ def _validate_run(raw: Any) -> None:
             _text(value, path)
             if value not in ("full", "summary"):
                 _fail(path, f"must be 'full' or 'summary', got {value!r}")
+        elif key == "max_admitted":
+            if value is not None:
+                _integer(value, path, minimum=1)
         elif key == "concurrency":
             _integer(value, path, minimum=1)
         elif key in ("heartbeat_s", "stale_after_s", "stop_after_s", "flush_interval"):

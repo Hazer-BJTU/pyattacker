@@ -46,6 +46,7 @@ pyattacker run -c config.yaml [options]
 | `--limit N` | run only the first N pipelines (a smoke test over a real dataset) |
 | `--store PATH` | override `run.store`. Used verbatim with `--shard`; otherwise a shard suffix is appended |
 | `--concurrency N` | override `run.concurrency` — attempts in flight, not pipelines alive |
+| `--max-admitted N` | override `run.max_admitted`: queued + running + delayed pipelines per Runner (positive integer; default `4 * concurrency`) |
 | `--journal {full,summary}` | `full` (default) stores artifact payloads, which is what makes resume work at task granularity; `summary` keeps digests only |
 | `--label TEXT` | a label recorded on the run, for telling runs apart later |
 | `--resume` | skip finished pipelines, restart failed ones at their checkpoint |
@@ -303,7 +304,7 @@ source: { kind: jsonl, path: data.jsonl, limit: 100, key_field: id, repeats: 1 }
 ```
 
 The `run:` block accepts exactly the fields the CLI maps onto `RunConfig`: `store`, `journal`,
-`concurrency`, `label`, `heartbeat_s`, `grace_s`, `stale_after_s`, `strict_leases`,
+`concurrency`, `max_admitted`, `label`, `heartbeat_s`, `grace_s`, `stale_after_s`, `strict_leases`,
 `stop_after_failures`, `stop_after_s`, `max_handoffs`, `retry_succeeded`, `fresh_restart`, `seed`, `notes`,
 `write_behind`,
 `write_batch`, `flush_interval`, `artifact_backend` and `meta`. Anything else is a config error, not a

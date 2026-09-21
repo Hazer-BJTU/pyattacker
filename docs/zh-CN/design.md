@@ -487,7 +487,7 @@ pool = Pool("apis", [Resource.create("llm", capacity=4,
 template = pipeline("qa_eval", fetch | ask | judge | metrics, tags={"bench": "mmlu"})
 
 with Runner(store="runs/qa.db", pools=[pool], concurrency=64) as runner:
-    report = runner.run(template.map(dataset_rows, repeats=3))   # a generator, streaming, memory O(concurrency)
+    report = runner.run(template.map(dataset_rows, repeats=3))   # streams seeds under the max_admitted budget
     print(report.summary())
     report.export_jsonl("runs/qa.jsonl")
 ```
