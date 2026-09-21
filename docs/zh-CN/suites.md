@@ -126,3 +126,32 @@ with suite.runner(concurrency=4, handle_signals=False) as runner:
 `ExperimentSpec.factory` 必须在每次调用时创建一个新的普通 PipelineSpec 迭代流。`pool_aliases` 把本地资源名映射到 `SuiteSpec.pools` 里的实际池名。`SuiteSpec.runner()` 拥有自己的 SuiteStore，应使用 Runner 上下文管理器关闭它。`SuiteSpec.pipelines(store, experiments=[...], limit=N)` 选择成员并输出带命名空间的流水线。`SuiteStore(root, read_only=True, experiment=ID)` 提供与 CLI 目录读取相同的接口，用完后需要关闭。
 
 `ctx.output_dir` 在集中模式下指向 Suite 根目录，在拆分模式下指向成员目录。业务文件可以显式使用它。原有 `write_jsonl(path=...)` 和任意 Python 文件写入不会被拦截或重定向。应用仍然负责文件命名、并发追加，以及重试时的幂等性。框架检查点和最终结果导出不依赖这些业务文件。
+
+## 查询 limit 与开销
+
+`SuiteStore.tasks(limit=N)` 先按 pipeline、run 和成员筛选，再按
+`(pipeline_id, seq, visit, task_run_id)` 在所选数据库间排序取前 N 条。
+与 `MemoryStore.tasks`、`SqliteStore.tasks` 一致：`None` 返回全部，`0` 返回空列表；
+负数或非整数 limit 抛出 `ValueError`。
+
+`SuiteStore.events(limit=N)` 按 `(ts, event_id)` 取最新的匹配事件，结果升序返回。
+全局或成员级 `handoffs(limit=N)` 按 `(ts, handoff_id)` 取最新记录，筛选在 limit 前执行。
+ID 只在各自数据库内唯一；排序键完全相同时，保留稳定的成员遍历顺序（events 优先较早
+成员，handoffs 优先较晚成员）。指定单个 `pipeline_id` 的 handoff 查询保留插入 ID 顺序，
+以便恢复逻辑在时钟回退时仍能找到最后提交的转换。这些 Suite 列表接口同样支持
+`None` 返回全部、`0` 返回空列表。
+
+有限查询从每个数据库最多取 N 条原始候选记录，只解码最终选中的记录。合并候选所需内存
+为 O(N)，依次访问各库，因此也支持 `max_open=1`。Suite 写入者会为全局、run、成员、
+成员/run 时间查询以及单 pipeline 事件查询建立索引。这些索引占用磁盘并增加写入开销；
+旧库第一次由新版本写入者打开时需要建索引。只读查询不修改数据库：无新索引的旧库仍可读，
+但可能需要扫描和排序。稀疏 `kind` 等附加筛选条件仍可能扫描大量索引项。
+
+事件计数及统计改用 SQL 计数和分组，无需解码事件、attempt、task 或 pipeline 的 payload。
+历史 run 仍使用 admission 快照和本次 invocation 的 attempt 计数，包括 resume 后跳过的
+pipeline。这不意味着全部统计为常数开销：分组聚合可能扫描匹配行；精确耗时分位数仍需读取
+并排序全部有效 pipeline 耗时，数值内存 O(P)、排序 O(P log P)。完整导出仍使用分页历史读取。
+
+在仓库运行 `PYTHONPATH=src python benchmarks/suite_queries.py`，可复现 1 万、10 万、
+100 万事件规模与旧 Python top-N/计数路径的对比。脚本报告 combined 布局热连接查询的耗时
+和 SQLite VM 指令数，合成数据插入耗时包含新索引维护成本。

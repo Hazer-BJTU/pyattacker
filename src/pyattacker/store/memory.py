@@ -24,6 +24,7 @@ from .base import (
     PipelineRecord,
     RunRecord,
     TaskRecord,
+    _validate_limit,
     handoff_row,
 )
 from .visits import FEATURE_BASE, FEATURE_VISITS, VisitStore
@@ -305,13 +306,14 @@ class MemoryStore(VisitStore):
     def tasks(
         self, pipeline_id: str | None = None, *, run_id: str | None = None, limit: int | None = None
     ) -> list[TaskRecord]:
+        _validate_limit(limit)
         items = [
             t
             for t in self._tasks.values()
             if (pipeline_id is None or t.pipeline_id == pipeline_id) and (run_id is None or t.run_id == run_id)
         ]
         items.sort(key=lambda t: (t.pipeline_id, t.seq, t.visit, t.task_run_id))
-        return items[:limit] if limit else items
+        return items[:limit] if limit is not None else items
 
     def record_attempt(self, record: AttemptRecord) -> AttemptRecord:
         record.attempt_id = len(self._attempts) + 1

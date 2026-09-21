@@ -300,6 +300,11 @@ class HandoffRecord:
     transition_version: int | None = None
 
 
+def _validate_limit(limit: int | None) -> None:
+    if limit is not None and (type(limit) is not int or limit < 0):
+        raise ValueError("limit must be a non-negative integer or None")
+
+
 @runtime_checkable
 class FactBatchStore(Protocol):
     """Optional atomic append capability; not required by :class:`Store`.

@@ -238,3 +238,39 @@ Use it explicitly for application-owned files. Existing `write_jsonl(path=...)` 
 Python file writes are not intercepted or redirected. Applications remain responsible for
 file naming, concurrent appends and idempotency across retries. Framework checkpoints and
 exported final results do not depend on those application files.
+
+## Query limits and cost
+
+`SuiteStore.tasks(limit=N)` applies pipeline/run/member filters before the limit,
+then orders by `(pipeline_id, seq, visit, task_run_id)` across all selected databases.
+As with `MemoryStore.tasks` and `SqliteStore.tasks`, `None` returns all tasks and
+`0` returns an empty list; negative or non-integer limits raise `ValueError`.
+
+`SuiteStore.events(limit=N)` returns the latest matching events by `(ts, event_id)`,
+in ascending order. Global/member `handoffs(limit=N)` uses `(ts, handoff_id)` with
+filters applied before limiting. IDs belong to their individual databases; exact
+ties retain stable member traversal order (events select earlier members, handoffs
+select later members). A handoff query for one `pipeline_id` retains insertion-ID
+order because recovery needs the last committed transition even if the clock moves
+backwards. For these Suite list APIs, `None` is unlimited and `0` is empty.
+
+Each database contributes at most `N` raw candidates for a limited query; only the
+final selected records are decoded. The merge uses O(N) candidate memory and visits
+selected databases sequentially, so it also works with `max_open=1`. Suite writers
+install timestamp indexes for global, run, member and member/run views, plus a
+pipeline event index. These indexes consume disk space and add write work; the
+first writer opening an older database builds them. Read-only readers never install
+indexes: old databases remain readable but may need scans/sorts. Additional filters
+such as a sparse `kind` can still require scanning many index entries.
+
+Event counts and statistics use SQL counts/grouping without decoding event, attempt,
+task or pipeline payloads. Historical run statistics retain admission snapshots and
+invocation attempt counters, including skipped pipelines after resume. This does
+not make all statistics constant-time: grouped aggregates may scan matching rows,
+and exact duration percentiles still read and sort all valid pipeline durations
+(O(P) numeric memory, O(P log P) sorting). Full exports remain paged history reads.
+
+Run `PYTHONPATH=src python benchmarks/suite_queries.py` from the checkout for a
+reproducible 10k/100k/1M event comparison against the previous Python top-N/count
+path. It reports elapsed time and SQLite VM instructions for warm combined-store
+queries; synthetic insert time includes the new index maintenance cost.
