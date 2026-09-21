@@ -91,8 +91,13 @@ async function tick(){
   const cards = [['total',(s.pipelines||{}).total||0],
     ...Object.entries(states).map(([k,v])=>[k,v]),
     ['attempts', s.attempts_total||0], ['events', s.events_total||0]];
-  document.getElementById('cards').innerHTML = cards.map(([k,v])=>
-    `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+  const cardRoot = document.getElementById('cards'); cardRoot.replaceChildren();
+  for(const [k,v] of cards){
+    const card = document.createElement('div'); card.className = 'card';
+    const label = document.createElement('div'); label.className = 'k'; label.textContent = k;
+    const value = document.createElement('div'); value.className = 'v'; value.textContent = String(v);
+    card.append(label, value); cardRoot.append(card);
+  }
   const metrics = await (await fetch('metrics?' + scope)).json();
   showMetrics(metrics.rows);
   const pipelines = await (await fetch('pipelines?limit=50&' + scope)).json();
@@ -109,10 +114,16 @@ async function tick(){
     tr.append(id, details); reports.append(tr);
   }
   const ev = await (await fetch('events?limit=40&' + scope)).json();
-  document.getElementById('events').innerHTML = ev.rows.map(r=>{
-    const cls = r.kind.includes('failed')?'f':(r.kind.includes('succeeded')?'s':'');
-    return `<tr><td class="${cls}">${r.kind}</td><td>${(r.pipeline_id||'').slice(0,12)}</td>`+
-           `<td>${JSON.stringify(r.data).slice(0,160)}</td></tr>`;}).join('');
+  const events = document.getElementById('events'); events.replaceChildren();
+  for(const r of ev.rows){
+    const tr = document.createElement('tr');
+    const kind = document.createElement('td');
+    kind.className = r.kind.includes('failed')?'f':(r.kind.includes('succeeded')?'s':'');
+    kind.textContent = r.kind;
+    const id = document.createElement('td'); id.textContent = (r.pipeline_id||'').slice(0,12);
+    const data = document.createElement('td'); data.textContent = JSON.stringify(r.data).slice(0,160);
+    tr.append(kind, id, data); events.append(tr);
+  }
 }
 tick(); setInterval(tick, 1500);
 </script></body></html>
