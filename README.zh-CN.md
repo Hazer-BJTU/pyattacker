@@ -400,6 +400,10 @@ uv run pyattacker run -c examples/qa_eval.yaml --limit 40
 
 ## 当前状态
 
+**0.3.3——可靠性、准入上限与在线文档。** 提供原子 write-behind 批次、正确且更快的 Suite 查询、
+仪表盘 HTML 注入修复，以及可配置的 `max_admitted` 上限（默认 `4 * concurrency`）。
+双语文档站现已上线。详见[发布说明](https://github.com/Hazer-BJTU/pyattacker/blob/main/CHANGELOG.md#033--2026-09-21)。
+
 **0.3.2——组合实验与正式控制流特性。** 独立子实验可共享资源池和总并发，统一运行、恢复和查看结果，
 并可按实验分目录存储。持久化的运行历史在恢复后仍保留此前的结果。交接、正向跳转、回退和全量重试
 作为正式公共特性维护，通过 `control` 显式声明后启用。

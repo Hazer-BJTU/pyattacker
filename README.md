@@ -506,6 +506,11 @@ every known tradeoff with its reason.
 
 ## Status
 
+**0.3.3 — reliability, bounded admission and online documentation.** Atomic write-behind batches,
+correct and faster Suite queries, dashboard HTML injection fixes, and a configurable
+`max_admitted` limit (default: `4 * concurrency`). The bilingual documentation site is now available.
+See the [release notes](https://github.com/Hazer-BJTU/pyattacker/blob/main/CHANGELOG.md#033--2026-09-21).
+
 **0.3.2 — experiment suites and supported control flow.** Independent experiments can share resource
 pools and global concurrency, with unified run/resume/report commands and optional per-experiment output
 directories. Durable run histories preserve earlier outcomes after resume. Handoffs, forward jumps,

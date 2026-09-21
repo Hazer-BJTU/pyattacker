@@ -47,7 +47,8 @@ cannot be borrowed by a branch push.
 release notes. No section means the release still publishes, with a placeholder and a warning.
 
 **2. Bump the version in two places** — they must agree, and the workflow refuses the release if the tag
-disagrees with either:
+disagrees with either. Also update the version headers in `docs/design.md` and
+`docs/zh-CN/design.md`, and the current-status summaries in both READMEs:
 
 ```bash
 # pyproject.toml:  version = "X.Y.Z"
