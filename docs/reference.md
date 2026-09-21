@@ -330,7 +330,7 @@ runner.run(template.map(rows))                              # one pipeline per r
 runner.run(template.map(rows, repeats=5))                   # pass@5
 runner.run(template.map(rows, key_of=lambda r: r["qid"]))   # ids from your dataset's primary key
 
-def stream():                                                # memory stays O(concurrency)
+def stream():                                                # streams seeds; max_admitted bounds unfinished pipelines
     with open("dataset.jsonl") as fh:
         for line in fh:
             yield json.loads(line)
@@ -760,7 +760,27 @@ live = runner.stats()                                             # while runnin
 print(live["in_flight_pipelines"], live["delayed_pipelines"])      # in flight vs parked in backoff
 ```
 
-`run()` accepts any iterator of `PipelineSpec`, so a generator keeps memory flat regardless of dataset size.
+`run()` reads a `PipelineSpec` iterator only while admission capacity is available.
+`max_admitted=None` (default) resolves to `4 * concurrency`; a positive integer sets
+an explicit limit on queued, executing and delayed pipelines **together**. Retries
+retain their admission and can return to workers while new input is paused. Lower
+limits reduce memory held by unfinished work, but can leave workers idle during
+backoff; a limit below concurrency also limits useful parallelism. Suite members
+share one budget per Runner; shard processes each have their own budget.
+
+This bounds the number of unfinished scheduler states, not total bytes or process
+RSS. Memory also includes each retained seed/current value, source-side buffering,
+worker references, write-behind buffers, caches and reporting queries. The default
+`MemoryStore` retains accumulated records and artifact payloads as the run grows;
+use a file-backed store and a streaming source for large datasets. A pre-built input
+list or unbounded task payload remains outside the admission guarantee.
+
+`runner.stats()` exposes `admitted_pipelines` (admitted minus terminal) and the
+effective `max_admitted`; the run's persisted config records that effective limit.
+Stop, cancellation and run budgets also interrupt admission waits. As before,
+synchronous input iteration and blocking task code must return control before the
+async scheduler can respond.
+
 
 ### `RunConfig`
 
@@ -771,6 +791,7 @@ Everything that shapes one run. Pass a `RunConfig`, or pass its fields as keywor
 | `store` | `":memory:"` | `":memory:"`, a SQLite path, a plugin URI, or an open store instance |
 | `journal` | `"full"` | `"full"` keeps artifact payloads (**required for task-level resume**); `"summary"` keeps only metadata |
 | `concurrency` | `16` | max attempts in flight; a pipeline parked in a retry backoff does not hold a slot |
+| `max_admitted` | `None` | queued + executing + delayed pipeline limit; auto = `4 * concurrency`, otherwise a positive integer |
 | `label` | `""` | a label recorded on the run |
 | `run_id` | `None` | explicit run id; default is timestamp + digest |
 | `resume` | `False` | mark pipelines abandoned by dead runs as resumable before scheduling |

@@ -308,7 +308,7 @@ runner.run(template.map(rows))                              # one pipeline per r
 runner.run(template.map(rows, repeats=5))                   # pass@5
 runner.run(template.map(rows, key_of=lambda r: r["qid"]))   # ids from your dataset's primary key
 
-def stream():                                                # memory stays O(concurrency)
+def stream():                                                # streams seeds; max_admitted bounds unfinished pipelines
     with open("dataset.jsonl") as fh:
         for line in fh:
             yield json.loads(line)
@@ -696,7 +696,21 @@ live = runner.stats()                                             # while runnin
 print(live["in_flight_pipelines"], live["delayed_pipelines"])      # in flight vs parked in backoff
 ```
 
-`run()` 接受任何 `PipelineSpec` 迭代器，所以无论数据集多大，用生成器都能让内存平稳。
+`run()` 仅在准入容量可用时读取下一个 `PipelineSpec`。
+`max_admitted=None`（默认）解析为 `4 * concurrency`；也可设为正整数，限制排队、执行和
+等待重试的流水线**总数**。重试保留原有准入资格，暂停新输入时仍能回到 worker。
+较小的上限减少未完成工作持有的内存，但退避时可能让 worker 空闲；低于 concurrency 时
+也会限制实际并行度。Suite 成员共享一个 Runner 的预算；各分片进程分别计算预算。
+
+这限制的是未完成调度状态的数量，不是总字节数或进程 RSS。内存还包括保留的 seed/当前值、
+源自身的缓冲、worker 引用、write-behind 缓冲、缓存及报表查询。默认 `MemoryStore` 会随
+运行持续保留记录和工件载荷；大数据集应使用文件存储和流式源。预先构造的输入列表以及
+没有大小限制的任务载荷都不在准入保证范围内。
+
+`runner.stats()` 暴露 `admitted_pipelines`（已接纳减已终结）及实际 `max_admitted`；
+运行记录的 config 也保存实际生效的上限。停止、取消和运行预算都会解除准入等待。
+同步读取输入和阻塞任务仍须先交还控制权，异步调度器才能响应。
+
 
 ### `RunConfig`
 
@@ -707,6 +721,7 @@ print(live["in_flight_pipelines"], live["delayed_pipelines"])      # in flight v
 | `store` | `":memory:"` | `":memory:"`、SQLite 路径、插件 URI，或已打开的存储实例 |
 | `journal` | `"full"` | `"full"` 留工件载荷（**任务级恢复必需**）；`"summary"` 只留元数据 |
 | `concurrency` | `16` | 最多同时在途的尝试数；挂在重试退避里的流水线不占槽位 |
+| `max_admitted` | `None` | 排队 + 执行 + 延迟流水线总上限；默认 `4 * concurrency`，可设正整数 |
 | `label` | `""` | 记在这次运行上的标签 |
 | `run_id` | `None` | 显式运行 id；默认时间戳 + 摘要 |
 | `resume` | `False` | 调度前把被已死运行遗弃的流水线标成可恢复 |

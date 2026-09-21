@@ -38,6 +38,7 @@ pyattacker run -c config.yaml [options]
 | `--limit N` | 只跑前 N 条流水线（在真实数据集上做冒烟测试用） |
 | `--store PATH` | 覆盖 `run.store`。和 `--shard` 一起用就直接用这个路径，否则自动加分片后缀 |
 | `--concurrency N` | 覆盖 `run.concurrency`——指的是*同时在跑的尝试数*，不是存活的流水线数 |
+| `--max-admitted N` | 覆盖 `run.max_admitted`：每个 Runner 排队、执行、延迟流水线总上限（正整数；默认 `4 * concurrency`） |
 | `--journal {full,summary}` | `full`（默认）存完整产物，这是任务级恢复的基础；`summary` 只存摘要 |
 | `--label TEXT` | 给这次运行打个标签，方便以后区分 |
 | `--resume` | 跳过已完成的流水线，失败的从检查点接着跑 |
@@ -239,7 +240,7 @@ source: { kind: jsonl, path: data.jsonl, limit: 100, key_field: id, repeats: 1 }
 ```
 
 `run:` 块接的字段和 CLI 映射到 `RunConfig` 的字段完全一致：`store`、`journal`、
-`concurrency`、`label`、`heartbeat_s`、`grace_s`、`stale_after_s`、`strict_leases`、
+`concurrency`、`max_admitted`、`label`、`heartbeat_s`、`grace_s`、`stale_after_s`、`strict_leases`、
 `stop_after_failures`、`stop_after_s`、`max_handoffs`、`retry_succeeded`、`fresh_restart`、`seed`、`notes`、
 `write_behind`、
 `write_batch`、`flush_interval`、`artifact_backend` 和 `meta`。其他字段都是配置错误，不会被静默忽略。优先级很明确：命令行参数 > `run:` 块 > 内置默认值。

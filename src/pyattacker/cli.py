@@ -128,6 +128,8 @@ def _cmd_run(args: argparse.Namespace, *, resume: bool = False) -> int:
         run_cfg["store"] = shard_store_path(base, shard[0], shard[1])
     if args.concurrency:
         run_cfg["concurrency"] = args.concurrency
+    if args.max_admitted is not None:
+        run_cfg["max_admitted"] = args.max_admitted
     if args.journal:
         run_cfg["journal"] = args.journal
     if args.label:
@@ -216,6 +218,7 @@ def _cmd_run(args: argparse.Namespace, *, resume: bool = False) -> int:
 _CHILD_PASSTHROUGH = (
     ("limit", "--limit"),
     ("concurrency", "--concurrency"),
+    ("max_admitted", "--max-admitted"),
     ("journal", "--journal"),
     ("label", "--label"),
     ("stop_after_failures", "--stop-after-failures"),
@@ -632,6 +635,8 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
         help="override run.store (used verbatim with --shard; otherwise run.store gets a shard suffix)",
     )
     parser.add_argument("--concurrency", type=int, default=None)
+    parser.add_argument("--max-admitted", type=int, default=None,
+                        help="max queued, executing and delayed pipelines (default: 4 * concurrency)")
     parser.add_argument("--journal", choices=["full", "summary"], default=None)
     parser.add_argument("--label", default=None)
     parser.add_argument("--resume", action="store_true", help="skip completed work and resume from the checkpoint")

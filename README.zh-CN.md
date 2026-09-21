@@ -76,7 +76,7 @@ async def fetch(row: dict, ctx) -> dict:
 
 
 def dataset_rows():
-    """Your dataset. A generator works too: `map` streams it, so memory stays O(concurrency)."""
+    """Your dataset. `map` streams generators; max_admitted bounds unfinished pipelines."""
     return [{"q": f"question-{i}"} for i in range(4)]
 
 
@@ -91,6 +91,11 @@ with Runner(store="runs/qa.db", pools=[pool], concurrency=8) as runner:
     print(report.summary())
     report.export_jsonl("runs/qa.jsonl")
 ```
+
+流式输入通过 `max_admitted`（默认 `4 * concurrency`）限制排队、执行和等待重试的
+流水线总数。这是数量上限，不是字节上限；任务载荷、源缓冲和 Store 保留数据也占用内存。
+默认 `MemoryStore` 会随数据量增长保留结果。详见 [RunConfig](docs/zh-CN/reference.md#runconfig)。
+
 
 `ctx.acquire()` 不指定参数时，自动用任务声明的 `resource`。`lease.report(ok=...)` 把健康和配额信息喂回资源池。
 

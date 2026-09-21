@@ -94,7 +94,7 @@ async def fetch(row: dict, ctx) -> dict:
 
 
 def dataset_rows():
-    """Your dataset. A generator works too: `map` streams it, so memory stays O(concurrency)."""
+    """Your dataset. `map` streams generators; max_admitted bounds unfinished pipelines."""
     return [{"q": f"question-{i}"} for i in range(4)]
 
 
@@ -109,6 +109,11 @@ with Runner(store="runs/qa.db", pools=[pool], concurrency=8) as runner:
     print(report.summary())
     report.export_jsonl("runs/qa.jsonl")
 ```
+
+Streaming input uses `max_admitted` (default: `4 * concurrency`) to bound queued,
+running and retry-delayed pipelines together. This is a count limit, not a byte
+limit; task payloads, source buffers and Store retention also consume memory.
+The default `MemoryStore` retains results as data grows. See [RunConfig](docs/reference.md#runconfig).
 
 `ctx.acquire()` falls back to the task's declared `resource`, and `lease.report(ok=...)` feeds the pool's
 health and quota accounting.

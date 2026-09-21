@@ -461,6 +461,7 @@ def test_runner_artifact_backend_uri_spills_and_records_the_backend_name(tmp_pat
         # from the run record rather than only from the store object).
         assert run.config == {
             "concurrency": 4,
+            "max_admitted": 16,
             "journal": "full",
             "write_behind": True,
             "write_batch": 128,

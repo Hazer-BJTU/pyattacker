@@ -112,6 +112,8 @@ class RunConfig:
             only metadata, so a resumed pipeline must re-run from the beginning.
         concurrency: Max attempts in flight at once — not max pipelines in flight, since a
             pipeline waiting out a retry backoff is parked and does not occupy a worker slot.
+        max_admitted: Maximum queued, executing and delayed pipelines together. None
+            selects four times concurrency. Retries retain admission until terminal.
         run_id: Explicit run id; default is a timestamp+digest string.
         resume: When true, ``run_async`` calls ``interrupt_stale`` before scheduling, so pipelines
             abandoned by a dead run become resumable. It does *not* gate checkpoint restoration
@@ -180,6 +182,17 @@ class RunConfig:
     artifact_backend: Any = None
     meta: dict[str, Any] = field(default_factory=dict)
     max_handoffs: int = 1000
+    max_admitted: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_admitted is not None and (
+            type(self.max_admitted) is not int or self.max_admitted < 1
+        ):
+            raise ConfigError("max_admitted must be a positive integer or None")
+
+    @property
+    def admission_limit(self) -> int:
+        return self.max_admitted if self.max_admitted is not None else 4 * max(1, self.concurrency)
 
 
 @dataclass
@@ -579,6 +592,7 @@ class Runner:
         write_batch = int(getattr(self.store, "batch_size", 0))
         run_config = {
             "concurrency": cfg.concurrency,
+            "max_admitted": cfg.admission_limit,
             "journal": cfg.journal,
             "write_behind": bool(write_batch),
             "artifact_backend": getattr(getattr(self.store, "backend", None), "name", None),
@@ -635,17 +649,15 @@ class Runner:
         pump = asyncio.create_task(self._delays.pump(queue), name="pyattacker-timers")
         producer_error: BaseException | None = None
         try:
-            for spec in pipelines:
+            source = iter(pipelines)
+            # Wait before advancing the source: even a generator's next() can
+            # materialize a large seed. Retried states bypass this admission gate.
+            while await self._wait_for_admission():
+                try:
+                    spec = next(source)
+                except StopIteration:
+                    break
                 if self._stopping.is_set():
-                    break
-                if cfg.stop_after_s is not None and (self.clock.now() - started) > cfg.stop_after_s:
-                    self.stop("stop_after_s")
-                    break
-                if (
-                    cfg.stop_after_failures is not None
-                    and self._counters["pipelines_failed"] >= cfg.stop_after_failures
-                ):
-                    self.stop("stop_after_failures")
                     break
                 if spec.suite_id is not None:
                     admit = getattr(self.store, "admit", None)
@@ -736,7 +748,7 @@ class Runner:
         return report
 
     def _check_all_done(self) -> None:
-        """Re-check stop conditions and signal completion once every admitted pipeline is terminal.
+        """Re-check stop conditions and wake completion/admission waiters.
 
         Stop conditions must be evaluated here and not only in the producer loop: with a fast
         producer and slow pipelines, every spec can be admitted before the failure budget is
@@ -750,8 +762,31 @@ class Runner:
             self.stop("stop_after_failures")
         if self._all_done is None:
             return
-        if self._counters["pipelines_done"] >= self._counters["pipelines_admitted"]:
-            self._all_done.set()
+        # Every completion can free admission capacity, even before all finish.
+        self._all_done.set()
+
+    async def _wait_for_admission(self) -> bool:
+        """Bound all unfinished pipelines without blocking the retry pump."""
+        cfg = self.config
+        while not self._stopping.is_set():
+            if cfg.stop_after_s is not None and (
+                self.clock.now() - (self._live["started_at"] or 0)
+            ) > cfg.stop_after_s:
+                self.stop("stop_after_s")
+                return False
+            if cfg.stop_after_failures is not None and (
+                self._counters["pipelines_failed"] >= cfg.stop_after_failures
+            ):
+                self.stop("stop_after_failures")
+                return False
+            if self._counters["pipelines_admitted"] - self._counters["pipelines_done"] < cfg.admission_limit:
+                return True
+            assert self._all_done is not None
+            self._all_done.clear()
+            # Periodically re-check time budgets and cross-thread stop requests.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._all_done.wait(), timeout=0.5)
+        return False
 
     async def _hand_over(self, queue: "asyncio.Queue[Any]", item: Any) -> bool:
         """Put an item on the work queue, but stop waiting for room once a worker has died.
@@ -2631,6 +2666,8 @@ class Runner:
             "elapsed_s": round(elapsed, 3) if elapsed else None,
             "pools": {name: dataclasses.asdict(pool.stats()) for name, pool in self.pools.items()},
             "delayed_pipelines": len(self._delays),
+            "admitted_pipelines": self._counters["pipelines_admitted"] - self._counters["pipelines_done"],
+            "max_admitted": self.config.admission_limit,
             "buffered": self.store.buffer_stats() if hasattr(self.store, "buffer_stats") else None,
             "reported_metrics": [dataclasses.asdict(row) for row in read_reported_metrics(
                 self.store, run_id=self._run_id
