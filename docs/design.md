@@ -874,7 +874,7 @@ src/pyattacker/
   monitor.py      snapshot rendering + watch
   shard.py        deterministic shard assignment + per-shard store paths (M3)
   merge.py        join N shard stores: de-duplicate by pipeline_id, recompute statistics (M3)
-  export.py       row shapes (pipelines/tasks/attempts/events/artifacts) and formats (jsonl/json/csv) (M3)
+  export.py       row shapes (pipelines/tasks/attempts/events/artifacts/results) and formats (jsonl/json/csv) (M3)
   declarative.py  YAML/TOML → pools + pipeline + source (including ${ENV} expansion)
   plugins.py      entry-point discovery for tasks/algorithms/codecs/stores (M4)
   backends.py     where artifact payloads live: inline / content-addressed files / null (M4)
