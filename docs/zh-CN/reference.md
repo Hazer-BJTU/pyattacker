@@ -14,7 +14,7 @@
 * 签名按源码里的写法。签名里的 `*` 表示后面所有参数都是仅限关键字（keyword-only）参数。
 * **这里的默认值很重要。** 两个尤其容易踩坑：`Retrying(max_attempts=1)` 意味着除非你主动要求，否则*不重试*；`Runner(store=":memory:")` 意味着除非传路径，否则什么都不持久化。
 * **有些示例是完整程序。** 第一行是 `# reference/<name>.py` 的代码块会在每次测试时被写出并执行
-  （见 [`tests/test_docs_examples.py`](../../tests/test_docs_examples.py)）——README 和 CLI 文档共享这个约定。没标记的代码块是片段。
+  （见 [`tests/test_docs_examples.py`](https://github.com/Hazer-BJTU/pyattacker/blob/main/tests/test_docs_examples.py)）——README 和 CLI 文档共享这个约定。没标记的代码块是片段。
 
 ## 目录
 
@@ -1991,7 +1991,7 @@ print(PLUGINS.errors())        # {name: reason} for everything that failed to lo
 内置项先解析，导入时抛异常的插件记下来不传播——所以坏插件
 既不拖垮一次运行，也不静默失败。`pyattacker plugins` 打同样的
 信息。`PluginRegistry` 是类型；`PLUGINS` 是进程级实例。完整可用的示例包
-见 [`examples/plugin_package/`](../../examples/plugin_package/README.zh-CN.md)。
+见 [`examples/plugin_package/`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/plugin_package/README.zh-CN.md)。
 
 ---
 
@@ -2137,7 +2137,7 @@ runner.run(template.map(jsonl_source("dataset.jsonl", limit=500)))
 ### 应用汇报的指标
 
 应用可以在运行期间汇报实验指标的最新值。Pyattacker 只负责保存和展示，指标由应用计算。
-可运行的准确率示例见 [`examples/live_metrics.py`](../../examples/live_metrics.py)。
+可运行的准确率示例见 [`examples/live_metrics.py`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/live_metrics.py)。
 
 ```python
 runner.report_metric("evaluated", completed, label="Evaluated")
@@ -2229,7 +2229,7 @@ with StatsServer("runs/qa.db", port=8787) as server:
 | [`docs/tutorial.md`](tutorial.md) | 引导式路径：17 个可运行步骤 |
 | [`docs/cli.md`](cli.md) | 命令、flag、退出码、配置文件格式 |
 | [`docs/design.md`](design.md) | 模型、不变量，以及这些 API 背后的权衡 |
-| [`examples/`](../../examples) | 完整程序，包括对多种流水线形态的实测比较 |
+| [`examples/`](https://github.com/Hazer-BJTU/pyattacker/tree/main/examples) | 完整程序，包括对多种流水线形态的实测比较 |
 
 ## Suite API
 

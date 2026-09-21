@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block announce %}
+  {% if page and page.file.src_uri.startswith('zh-CN/') %}
+    开发版文档 · 对应 main 分支，可能包含尚未发布的功能。
+  {% else %}
+    Development documentation · Tracks main and may include unreleased features.
+  {% endif %}
+{% endblock %}

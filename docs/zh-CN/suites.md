@@ -19,7 +19,7 @@ uv run pyattacker export runs/suite-demo runs/all.jsonl --rows results
 uv run pyattacker export runs/suite-demo runs/exported --rows results --by-experiment
 ```
 
-完整配置见 [examples/suites/suite.json](../../examples/suites/suite.json)，成员配置见 [experiment.json](../../examples/suites/experiment.json)。成员文件仍然能通过普通 `run -c` 单独运行。JSON 和 TOML 不需要额外依赖，YAML 需要 `yaml` extra。
+完整配置见 [examples/suites/suite.json](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/suites/suite.json)，成员配置见 [experiment.json](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/suites/experiment.json)。成员文件仍然能通过普通 `run -c` 单独运行。JSON 和 TOML 不需要额外依赖，YAML 需要 `yaml` extra。
 
 ```json
 {

@@ -10,11 +10,11 @@
 
 * 每一步都是一个完整程序。先跑起来，看输出，再读解释。
 * 以 `# tutorial/step_NN_....py` 开头的代码块会被自动抽取成独立文件，在每次测试时由
-  [`tests/test_tutorial.py`](../../tests/test_tutorial.py) 实际执行。把其中一个保存成注释里指定的文件名，直接运行即可。
+  [`tests/test_tutorial.py`](https://github.com/Hazer-BJTU/pyattacker/blob/main/tests/test_tutorial.py) 实际执行。把其中一个保存成注释里指定的文件名，直接运行即可。
 * 所有示例都不访问网络。真实程序里该写 `await self.http.post(...)` 的地方，示例改用 `await asyncio.sleep(...)`——注释 `# <- your HTTP call` 标出了该位置。
 
 **其他文档：** [`docs/reference.md`](reference.md) 是完整 API 参考；
-[`docs/cli.md`](cli.md) 讲命令行用法；[`docs/design.md`](design.md) 解释框架为什么长这样；[`examples/`](../../examples) 有完整可运行的示例。
+[`docs/cli.md`](cli.md) 讲命令行用法；[`docs/design.md`](design.md) 解释框架为什么长这样；[`examples/`](https://github.com/Hazer-BJTU/pyattacker/tree/main/examples) 有完整可运行的示例。
 
 ## 找到你需要的内容
 
@@ -1360,7 +1360,7 @@ the grouped shape re-sent verdicts that were already persisted: 4 of 6 requests 
 > 如果一次请求很贵或很慢，就给它单独一个任务。如果一个步骤是在一堆廉价调用上 fanout，一个任务加一个检查点才更划算。
 
 把三个评委当三个任务（`C1 | C2 | C3`）检查点更细：同样的失败会在 `C2` 恢复，不重发任何已经成功的内容，代价是多两个流水线步骤。
-[`examples/llm_eval/`](../../examples/llm_eval/README.zh-CN.md) 在同一批任务上实现了两种形态并做了对比——一个评审端点宕机时，分组形态重发了 2 个已成功的请求，拆分形态重发了 0 个。
+[`examples/llm_eval/`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/llm_eval/README.zh-CN.md) 在同一批任务上实现了两种形态并做了对比——一个评审端点宕机时，分组形态重发了 2 个已成功的请求，拆分形态重发了 0 个。
 
 ---
 
@@ -1466,10 +1466,10 @@ blobs on disk: 3 files, [11, 27, 1536] bytes
 
 * **编解码器**要四个成员：`name`、`can_encode(obj)`、`dumps(obj) -> bytes`、`loads(bytes) -> obj`。用 `registry.register(codec, for_types=(MyType,))` 注册，把*同一个*注册表传给用于种子的 `pipeline(..., registry=...)` 和用于工件的 `Runner(registry=...)`。认领某类载荷的编解码器压过内置的 JSON 兜底。
 * **工件后端**决定载荷字节放哪：`None`/`"inline"` 留在数据库里，`"null"` 丢掉字节但留摘要，`"file:///data/blobs"`（或 `{"kind": "file", "root": ..., "min_bytes": 262144}`）溢到内容寻址的文件里，读取时再水合回来。上面的 `min_bytes=0` 什么都溢出去，所以工件行显示的是引用而不是字节。
-* **插件**是 `importlib.metadata` 入口点，分四组：`pyattacker.tasks`、`pyattacker.algorithms`、`pyattacker.codecs` 和 `pyattacker.stores`（按 URI scheme 索引，`store = "s3://bucket/runs.db"` 就能用）。内置项先解析，导入时报错的插件记下来不致命——`pyattacker plugins` 两者都列。完整示例包在 [`examples/plugin_package/`](../../examples/plugin_package/README.zh-CN.md)。
+* **插件**是 `importlib.metadata` 入口点，分四组：`pyattacker.tasks`、`pyattacker.algorithms`、`pyattacker.codecs` 和 `pyattacker.stores`（按 URI scheme 索引，`store = "s3://bucket/runs.db"` 就能用）。内置项先解析，导入时报错的插件记下来不致命——`pyattacker plugins` 两者都列。完整示例包在 [`examples/plugin_package/`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/plugin_package/README.zh-CN.md)。
 
 **监控正在跑的运行。** `pyattacker watch runs/qa.db` 让你从第二个进程看终端视图，`pyattacker serve runs/qa.db` 提供 HTTP 仪表盘，在 `/stats`、`/metrics`、`/events`、`/pipelines`、`/resources` 和 `/errors` 提供 JSON。两个都开只读连接，能和正在跑的任务并排用。HTTP 端点没认证，会把你的载荷给出来——只绑回环地址。
-需要实时实验准确率时，运行 [`examples/live_metrics.py`](../../examples/live_metrics.py)。示例的
+需要实时实验准确率时，运行 [`examples/live_metrics.py`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/live_metrics.py)。示例的
 完成回调解码最终产物、按 pipeline ID 去重，再通过 `runner.report_metric()` 汇报当前
 准确率；面板会随着汇报更新。
 * **监控**：`pyattacker serve runs/qa.db` 是零依赖的只读 HTTP 视图（`/`、
@@ -1863,9 +1863,9 @@ prune refused: cannot prune the selected snapshot
 | [`docs/reference.md`](reference.md) | 每个公开类和函数：签名、参数、示例 |
 | [`docs/cli.md`](cli.md) | 每个子命令和 flag、退出码、配置文件参考 |
 | [`docs/design.md`](design.md) | 概念模型、六条不变量、租约契约、数据模型、权衡 |
-| [`README.md`](../../README.zh-CN.md) | 精简导览：调度保证、分片、插件、不在范围内的内容 |
-| [`examples/quickstart.py`](../../examples/quickstart.py) | 60 行讲完 SDK，含一轮恢复 |
-| [`examples/llm_eval/`](../../examples/llm_eval/README.zh-CN.md) | 完整评测、两种流水线形态、实测的检查点粒度 |
-| [`examples/sharded.py`](../../examples/sharded.py) | 一个数据集分布在 N 个存储上，然后合并报告 |
-| [`examples/plugin_package/`](../../examples/plugin_package/README.zh-CN.md) | 可安装的插件：任务、一个算法、一个编解码器 |
-| [`examples/qa_eval.yaml`](../../examples/qa_eval.yaml) | 声明式路径，端到端 |
+| [`README.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/README.zh-CN.md) | 精简导览：调度保证、分片、插件、不在范围内的内容 |
+| [`examples/quickstart.py`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/quickstart.py) | 60 行讲完 SDK，含一轮恢复 |
+| [`examples/llm_eval/`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/llm_eval/README.zh-CN.md) | 完整评测、两种流水线形态、实测的检查点粒度 |
+| [`examples/sharded.py`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/sharded.py) | 一个数据集分布在 N 个存储上，然后合并报告 |
+| [`examples/plugin_package/`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/plugin_package/README.zh-CN.md) | 可安装的插件：任务、一个算法、一个编解码器 |
+| [`examples/qa_eval.yaml`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/qa_eval.yaml) | 声明式路径，端到端 |

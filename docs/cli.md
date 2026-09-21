@@ -398,7 +398,7 @@ Python examples, `HistoryArtifact` included.
 * [`docs/tutorial.md`](tutorial.md) — the guided path, with runnable programs
 * [`docs/reference.md`](reference.md) — every class and function the SDK exposes
 * [`docs/design.md`](design.md) — why the CLI has these commands and no others
-* [`README.md`](../README.md) — the compact tour
+* [`README.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/README.md) — the compact tour
 
 ## Suite commands
 

@@ -2,7 +2,7 @@
 
 [English](../releasing.md) | **简体中文**
 
-给有 push 权限的维护者看的。发布流程是自动化的：你推一个标签，[`.github/workflows/release.yml`](../../.github/workflows/release.yml) 搞定剩下所有事。
+给有 push 权限的维护者看的。发布流程是自动化的：你推一个标签，[`.github/workflows/release.yml`](https://github.com/Hazer-BJTU/pyattacker/blob/main/.github/workflows/release.yml) 搞定剩下所有事。
 
 ## 一次性设置：可信发布
 

@@ -12,14 +12,14 @@ request.
 
 * Every step is a complete program. Run it, read the output, then read the notes.
 * Code blocks starting with `# tutorial/step_NN_....py` are extracted from this file and executed by
-  [`tests/test_tutorial.py`](../tests/test_tutorial.py) on every test run. Save one as the file named in the
+  [`tests/test_tutorial.py`](https://github.com/Hazer-BJTU/pyattacker/blob/main/tests/test_tutorial.py) on every test run. Save one as the file named in the
   comment and run it directly.
 * Nothing here touches the network. Where a real program would `await self.http.post(...)`, these examples
   `await asyncio.sleep(...)` — the comment `# <- your HTTP call` marks the spot.
 
 **Other documents:** [`docs/reference.md`](reference.md) documents every class and function;
 [`docs/cli.md`](cli.md) covers the command line; [`docs/design.md`](design.md) explains why the framework
-is shaped this way; [`examples/`](../examples) holds complete programs.
+is shaped this way; [`examples/`](https://github.com/Hazer-BJTU/pyattacker/tree/main/examples) holds complete programs.
 
 ## Find what you need
 
@@ -1480,7 +1480,7 @@ That last point is the choice you have to make when a step branches:
 
 Three judges as three tasks (`C1 | C2 | C3`) makes the checkpoint finer: the same failure resumes at `C2` and
 re-sends nothing that succeeded, at the cost of two extra pipeline steps.
-[`examples/llm_eval/`](../examples/llm_eval/README.md) implements both shapes over the same tasks and measures
+[`examples/llm_eval/`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/llm_eval/README.md) implements both shapes over the same tasks and measures
 them — with one judge endpoint down, the grouped shape re-sent 2 already-successful requests and the split
 shape re-sent 0.
 
@@ -1600,13 +1600,13 @@ blobs on disk: 3 files, [11, 27, 1536] bytes
   `pyattacker.algorithms`, `pyattacker.codecs`, and `pyattacker.stores` (keyed by URI scheme, so
   `store = "s3://bucket/runs.db"` works). Built-ins resolve first, and a plugin that raises on import is
   recorded rather than fatal — `pyattacker plugins` shows both. A complete worked package is
-  [`examples/plugin_package/`](../examples/plugin_package/README.md).
+  [`examples/plugin_package/`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/plugin_package/README.md).
 
 **Monitoring a run in progress.** `pyattacker watch runs/qa.db` gives you a terminal view from a second
 process, and `pyattacker serve runs/qa.db` an HTTP dashboard plus JSON at `/stats`, `/metrics`, `/events`, `/pipelines`,
 `/resources` and `/errors`. Both open read-only connections, so they are safe beside a live run. The HTTP
 endpoint has no authentication and serves your payloads — keep it on loopback.
-For live experiment accuracy, run [`examples/live_metrics.py`](../examples/live_metrics.py). Its
+For live experiment accuracy, run [`examples/live_metrics.py`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/live_metrics.py). Its
 completion callback decodes final artifacts, deduplicates by pipeline ID, and reports the current
 accuracy through `runner.report_metric()`; the dashboard displays the value as it changes.
 * **Monitoring**: `pyattacker serve runs/qa.db` is a zero-dependency read-only HTTP view (`/`,
@@ -2110,9 +2110,9 @@ near the top.
 | [`docs/reference.md`](reference.md) | every public class and function: signatures, parameters, examples |
 | [`docs/cli.md`](cli.md) | every subcommand and flag, exit codes, the config file reference |
 | [`docs/design.md`](design.md) | conceptual model, six invariants, lease contract, data model, tradeoffs |
-| [`README.md`](../README.md) | the compact tour: scheduling guarantees, sharding, plugins, out of scope |
-| [`examples/quickstart.py`](../examples/quickstart.py) | the SDK in 60 lines, with a resume round |
-| [`examples/llm_eval/`](../examples/llm_eval/README.md) | the full evaluation, two pipeline shapes, measured checkpoint granularity |
-| [`examples/sharded.py`](../examples/sharded.py) | one dataset across N stores, then a merged report |
-| [`examples/plugin_package/`](../examples/plugin_package/README.md) | an installable plugin: tasks, an algorithm, a codec |
-| [`examples/qa_eval.yaml`](../examples/qa_eval.yaml) | the declarative path, end to end |
+| [`README.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/README.md) | the compact tour: scheduling guarantees, sharding, plugins, out of scope |
+| [`examples/quickstart.py`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/quickstart.py) | the SDK in 60 lines, with a resume round |
+| [`examples/llm_eval/`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/llm_eval/README.md) | the full evaluation, two pipeline shapes, measured checkpoint granularity |
+| [`examples/sharded.py`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/sharded.py) | one dataset across N stores, then a merged report |
+| [`examples/plugin_package/`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/plugin_package/README.md) | an installable plugin: tasks, an algorithm, a codec |
+| [`examples/qa_eval.yaml`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/qa_eval.yaml) | the declarative path, end to end |
