@@ -112,3 +112,9 @@ addopts = "-q --strict-markers"
 markers = [
     "requires_yaml: drives the declarative layer through a .yaml file, so it needs the optional `yaml` extra (pyyaml)",
 ]
+
+# Keep lockfile download URLs portable across local machines and GitHub runners.
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
