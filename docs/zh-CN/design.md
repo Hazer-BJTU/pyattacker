@@ -236,6 +236,10 @@ REVOKED ◀── explicit revoke / revoked from within a task
 定时器走可注入的 `Clock`，`interruptible_sleep` 让 `clock.sleep` 和唤醒事件赛跑，提供两种行为：真实时钟下，新推的更早定时器会截断长等待；假时钟下，pump 立刻推进虚拟时间（测试保持确定性）。
 
 **只追加的事实按批写。** `WriteBehindStore` 缓冲尝试和事件，按批刷（大小阈值、时间间隔、任何读 API、运行心跳、运行结束）。状态写入——`pipelines`、`tasks`、`artifacts`——永远直接落盘，因为还没落盘的检查点不算检查点。所以 `SIGKILL` 可能丢最后一批历史，所有检查点完好；`--no-write-behind` 用吞吐换每次尝试立即提交。
+SQLite 把一批尝试和事件放在同一个事务中提交，成功后才回填行 ID。批次失败则回滚，缓冲保留供重试。
+Suite 按数据库分别提交批次，不跨子库组成事务。不支持原子 `write_facts` 的旧存储逐条确认；
+一旦抛出异常，框架无法判断该条是否已经提交，因此包装器会阻止自动重放。
+恢复契约见[事实批次与失败恢复](reference.md#事实批次与失败恢复)。
 
 ### 4.6 监控：运行状态与应用汇报
 
@@ -438,7 +442,7 @@ SELECT * FROM events    WHERE pipeline_id = ? ORDER BY event_id;-- structured lo
 
 `journal` 模式：`full` 存 artifact 载荷（**恢复的前提**）；`summary` 只存摘要和元数据（省空间，代价是中间 artifact 没法复用，恢复只能重跑整条流水线，留一个 `pipeline.checkpoint_missing` 事件）。
 
-**写入策略**：所有存储方法都是同步的——像"尝试开始前记 running 行"这种关键写入不被取消打断。批处理写 / write-behind 合并是后续优化，不改接口。
+**写入策略**：所有存储方法都是同步的——像"尝试开始前记 running 行"这种关键写入不被取消打断。write-behind 通过可选的原子 `write_facts` 能力合并只追加的尝试和事件；状态写入仍同步执行，必需的 `Store` 接口不变。
 
 **读取策略**：上面的列表查询可以物化结果——报告本来就需要一个列表。必须保持有界的整类读取（比如导出大存储）走可选的分页迭代扩展：按键集分批读 `ITER_BATCH_SIZE` 行，排序键以唯一列结尾，批次边界不漏不重；嵌套的 `pipelines` 行物化一条流水线，这就是文档化的内存单位。键单调时（`event_id`、`attempt_id`），迭代器以启动时拿的高水位为界，对活跃存储的导出不追不断移动的尾巴；`pipelines`/`tasks`/`artifacts` 没有单调键，文档里说成对活跃存储的尽力遍历。`Store` 不变，只实现列表 API 的第三方存储还是完整的，只是内存不再有界——见[存储参考](reference.md#分页读取与第三方存储)。
 

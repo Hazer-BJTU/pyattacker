@@ -318,6 +318,11 @@ short, and with a fake clock the pump advances virtual time instantly (so tests 
 `pipelines`, `tasks`, `artifacts` — always go straight through, because a checkpoint that is not durable yet
 is not a checkpoint. A `SIGKILL` can therefore lose the last batch of history while every checkpoint stays
 intact; `--no-write-behind` trades throughput for an immediate commit per attempt.
+SQLite commits a whole attempts/events batch in one transaction, publishing row IDs only after success.
+A failed batch rolls back and remains buffered for retry. Suite stores batch per database, not across
+all child databases. Legacy stores without atomic `write_facts` acknowledge one row at a time; after
+an exception, the wrapper blocks automatic replay because that call may already have committed.
+See [fact batch capability](reference.md#fact-batches-and-failure-recovery) for the recovery contract.
 
 ### 4.6 Monitoring: Operational State and Application Reports
 
@@ -655,8 +660,9 @@ digests and metadata (saves space, at the cost that intermediate artifacts canno
 rerun the whole pipeline, and it leaves a `pipeline.checkpoint_missing` event behind).
 
 **Write policy**: all store methods are synchronous — this keeps critical writes such as "record a running row
-before the attempt starts" from being interrupted by cancellation. Batched writes / write-behind merging is a
-later optimization and does not affect the interface.
+before the attempt starts" from being interrupted by cancellation. Write-behind combines append-only
+attempts/events through the optional atomic `write_facts` capability; state writes remain synchronous
+and the required `Store` interface is unchanged.
 
 **Read policy**: the list queries above may materialize their result — a report wants a list. A whole-kind
 read that must stay bounded (an export of a large store) goes through the optional paged-iteration

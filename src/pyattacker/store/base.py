@@ -3,7 +3,7 @@
 Conventions:
 * **All store methods are synchronous** (no awaits inside). That is safe under a single event loop,
   and it keeps critical writes such as persisting a running record before an attempt starts from being interrupted by cancellation.
-  Batched writes / write-behind is a later optimization and does not affect the interface.
+  Optional fact batches combine attempts/events in one transaction without changing state writes.
 * Facts live on three levels: ``pipelines`` (state) / ``tasks``+``attempts`` (history) / ``artifacts`` (state carriers).
 * `journal` modes: ``full`` keeps the artifact payload (**the precondition for resume**);
   ``summary`` keeps only the summary and metadata, in which case intermediate artifacts cannot be reused and resume can only re-run whole pipelines.
@@ -16,7 +16,7 @@ Conventions:
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -30,6 +30,7 @@ __all__ = [
     "EventRecord",
     "HandoffRecord",
     "Store",
+    "FactBatchStore",
     "PagedStore",
     "PIPELINE_STATES",
     "TASK_STATES",
@@ -297,6 +298,21 @@ class HandoffRecord:
     from_visit: int = 0
     to_visit: int | None = None
     transition_version: int | None = None
+
+
+@runtime_checkable
+class FactBatchStore(Protocol):
+    """Optional atomic append capability; not required by :class:`Store`.
+
+    Success commits all records and assigns their IDs. An exception must leave no
+    batch rows committed and all input IDs unchanged, so the batch can be retried.
+    Implementations must not expose this capability if a failed call can have an
+    ambiguous commit outcome. Calls own their transaction, never a caller's.
+    """
+
+    def write_facts(
+        self, attempts: Sequence[AttemptRecord], events: Sequence[EventRecord]
+    ) -> None: ...
 
 
 @runtime_checkable

@@ -15,7 +15,7 @@ import json
 import os
 import sqlite3
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -674,9 +674,28 @@ class SqliteStore(VisitStore):
         return int(cur.lastrowid)
 
     def record_attempt(self, record: AttemptRecord) -> AttemptRecord:
-        record.attempt_id = self._write_attempt(record)
+        attempt_id = self._write_attempt(record)
         self._conn.commit()
+        record.attempt_id = attempt_id
         return record
+
+    def write_facts(
+        self, attempts: Sequence[AttemptRecord], events: Sequence[EventRecord]
+    ) -> None:
+        """Commit an attempts/events batch atomically, then publish the assigned IDs.
+
+        BEGIN rejects an already active transaction before any batch work happens;
+        this method must never commit or roll back a caller's pending state writes.
+        """
+        if not attempts and not events:
+            return
+        with self._visit_atomic(""):
+            attempt_ids = [self._write_attempt(record) for record in attempts]
+            event_ids = [self._write_event(event) for event in events]
+        for record, attempt_id in zip(attempts, attempt_ids, strict=True):
+            record.attempt_id = attempt_id
+        for event, event_id in zip(events, event_ids, strict=True):
+            event.event_id = event_id
 
     # -------------------------------------------------------------- handoffs
     def _has_handoffs(self) -> bool:
@@ -826,7 +845,8 @@ class SqliteStore(VisitStore):
         return [_to_handoff(r) for r in reversed(rows)]
 
     # ---------------------------------------------------------------- events
-    def emit_event(self, event: EventRecord) -> None:
+    def _write_event(self, event: EventRecord) -> int:
+        """The event INSERT without a commit or mutation of the caller's record."""
         cur = self._conn.execute(
             "INSERT INTO events (ts,scope,kind,run_id,pipeline_id,task_run_id,pool,resource_id,data_json) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
@@ -835,8 +855,12 @@ class SqliteStore(VisitStore):
                 event.pool, event.resource_id, _dumps(event.data),
             ),
         )
+        return int(cur.lastrowid)
+
+    def emit_event(self, event: EventRecord) -> None:
+        event_id = self._write_event(event)
         self._conn.commit()
-        event.event_id = cur.lastrowid
+        event.event_id = event_id
 
     def upsert_reported_metric(self, row: Any) -> None:
         self._conn.execute(

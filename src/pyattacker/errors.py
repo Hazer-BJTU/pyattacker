@@ -133,12 +133,15 @@ class RunInterrupted(PyAttackerError):
 
 
 class StoreUnavailable(PyAttackerError):
-    """The store itself failed while the framework was trying to record a terminal state.
+    """The store cannot safely continue recording facts or terminal state.
 
     Raised when even the internal-error recovery path (persisting a pipeline as ``failed``
     after a framework-level surprise) cannot reach the store: at that point the run's own
     durability guarantees can no longer be trusted, so the run stops instead of continuing on
     unrecorded state.
+
+    Also raised by WriteBehindStore after a legacy, non-atomic fact write failed:
+    its commit outcome is unknown, so reads/flushes must not automatically replay it.
     """
 
 
