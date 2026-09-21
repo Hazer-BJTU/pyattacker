@@ -6,7 +6,8 @@ The kernel records facts; this module decides how to lay them out for whoever co
 * ``tasks`` / ``attempts`` — one row per unit, so retries and error classes are directly
   groupable (this is what you want in pandas);
 * ``events`` — the structured log;
-* ``artifacts`` — the persisted state of each step.
+* ``artifacts`` — the persisted state of each step;
+* ``results`` — one compact pipeline result, including its key, repeat, state, final payload and error.
 
 Every kind is exported in full unless an explicit ``limit`` says otherwise, and rows stream out of
 the store in bounded batches — see :func:`iter_rows` for the order and limit rule.
@@ -162,7 +163,8 @@ def iter_rows(
     * ``tasks`` — ``pipeline_id``, then ``seq``, then ``task_run_id``;
     * ``attempts`` — ``attempt_id`` (insertion order, oldest first);
     * ``events`` — ``event_id`` (insertion order, oldest first);
-    * ``artifacts`` — pipeline order (as above), then ``seq``, then ``artifact_id``.
+    * ``artifacts`` — pipeline order (as above), then ``seq``, then ``artifact_id``;
+    * ``results`` — ``created_at``, then ``pipeline_id`` (the same order as ``pipelines``).
 
     ``tasks`` and ``artifacts`` need that last component: the tables are keyed by ``task_run_id`` /
     ``artifact_id``, so ``(pipeline_id, seq)`` and ``seq`` are not unique by contract and a cursor
@@ -178,7 +180,8 @@ def iter_rows(
     iterator cannot chase a moving tail. ``pipelines``, ``tasks`` and ``artifacts`` have no
     monotonic key, so they are a **best-effort traversal** of the live store: a row inserted ahead
     of the cursor can appear, one inserted behind it cannot. Nothing here is a long-lived read
-    transaction or a point-in-time snapshot of the whole store.
+    transaction or a point-in-time snapshot of the whole store. ``results`` uses the pipeline
+    iterator and therefore has the same best-effort traversal semantics as ``pipelines``.
 
     Rows stream out of the store: no kind is materialized whole. With ``kind="pipelines"`` a single
     row nests that pipeline's tasks and artifacts, so one pipeline is the memory unit; the other

@@ -791,7 +791,8 @@ children can never fight over one file. Each child also gets `PYATACKER_SHARD=I/
 can record its own provenance.
 
 **Row shapes** (`--rows`) for whatever consumes the results: `pipelines` (nested, the default), `tasks`,
-`attempts` (with the retry `decision`), `events`, `artifacts`. **Formats** (`--format`): `jsonl`, `json`, `csv`.
+`attempts` (with the retry `decision`), `events`, `artifacts`, and `results` (one compact row per pipeline,
+with its key, repeat, status, final payload and error; failed/interrupted rows are retained). **Formats** (`--format`): `jsonl`, `json`, `csv`.
 CSV takes its header from the first `header_rows` rows and folds anything introduced later into an `extra`
 column, which keeps memory flat without silently dropping fields. Every kind is exported in full — `events`
 used to stop at the newest 100 000 rows — and read in bounded batches; see
@@ -873,7 +874,7 @@ src/pyattacker/
   monitor.py      snapshot rendering + watch
   shard.py        deterministic shard assignment + per-shard store paths (M3)
   merge.py        join N shard stores: de-duplicate by pipeline_id, recompute statistics (M3)
-  export.py       row shapes (pipelines/tasks/attempts/events/artifacts) and formats (jsonl/json/csv) (M3)
+  export.py       row shapes (pipelines/tasks/attempts/events/artifacts/results) and formats (jsonl/json/csv) (M3)
   declarative.py  YAML/TOML → pools + pipeline + source (including ${ENV} expansion)
   plugins.py      entry-point discovery for tasks/algorithms/codecs/stores (M4)
   backends.py     where artifact payloads live: inline / content-addressed files / null (M4)

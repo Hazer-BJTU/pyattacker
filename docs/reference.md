@@ -1888,6 +1888,7 @@ One row per kind, in the order `limit` truncates:
 | `attempts` | attempt, including each retry `decision` | `attempt_id` (write order) |
 | `events` | structured event | `event_id` (write order, oldest first) |
 | `artifacts` | artifact, intermediate ones included | pipeline order, then `seq`, then `artifact_id` |
+| `results` | pipeline result: key, repeat, state, final payload and error; failed/interrupted rows included | `created_at`, then `pipeline_id` |
 
 `limit` means the same thing for every kind — it counts rows of that kind, including `artifacts`,
 where it used to count pipelines:

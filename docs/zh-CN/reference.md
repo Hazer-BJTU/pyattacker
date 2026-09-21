@@ -1806,6 +1806,7 @@ ID，但 Runner 在跳过或恢复**之前**查已存的规格和种子摘要。
 | `attempts` | 一次尝试，含每次重试的 `decision` | `attempt_id`（写入顺序） |
 | `events` | 一条结构化事件 | `event_id`（写入顺序，最旧在前） |
 | `artifacts` | 一个工件，含中间工件 | 流水线顺序，然后是 `seq`，再是 `artifact_id` |
+| `results` | 流水线结果：key、repeat、状态、最终 payload 和错误；保留失败或中断的记录 | `created_at`，然后是 `pipeline_id` |
 
 `limit` 对所有 kind 含义相同——它数的是该 kind 的行数，`artifacts` 也一样，
 而过去这里数的是流水线：
