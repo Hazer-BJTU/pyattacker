@@ -29,6 +29,7 @@ from .base import (
     PipelineRecord,
     RunRecord,
     TaskRecord,
+    _validate_limit,
     handoff_row,
 )
 from .visits import (
@@ -1103,6 +1104,7 @@ class SqliteStore(VisitStore):
     def tasks(
         self, pipeline_id: str | None = None, *, run_id: str | None = None, limit: int | None = None
     ) -> list[TaskRecord]:
+        _validate_limit(limit)
         sql = "SELECT * FROM tasks WHERE 1=1"
         args: list[Any] = []
         if pipeline_id:
@@ -1112,7 +1114,7 @@ class SqliteStore(VisitStore):
             sql += " AND run_id=?"
             args.append(run_id)
         sql += " ORDER BY pipeline_id, seq, visit, task_run_id"
-        if limit:
+        if limit is not None:
             sql += " LIMIT ?"
             args.append(limit)
         return [_to_task(r) for r in self._conn.execute(sql, args).fetchall()]

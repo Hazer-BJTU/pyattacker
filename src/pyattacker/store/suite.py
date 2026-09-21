@@ -7,6 +7,7 @@ source state and admission history, never a second copy of a pipeline checkpoint
 from __future__ import annotations
 
 import dataclasses
+import heapq
 import json
 import os
 import tempfile
@@ -14,6 +15,7 @@ import time
 from collections import Counter, OrderedDict
 from collections.abc import Iterator, Sequence
 from itertools import islice
+from operator import itemgetter
 from pathlib import Path
 from typing import Any
 
@@ -22,9 +24,13 @@ from ..backends import FileBackend
 from ..errors import ConfigError
 from ..reported_metrics import ReportedMetric, report_metric
 from ..suite import namespace, validate_id
-from .base import PipelineRecord
-from .sqlite import SqliteStore, _to_pipeline, _to_task
+from .base import PipelineRecord, _validate_limit
+from .sqlite import SqliteStore, _to_event, _to_handoff, _to_pipeline, _to_task
 from .writebehind import WriteBehindStore
+
+# Namespace length comes from the identity function, not a duplicated digest width.
+# This exact expression is shared by indexes and predicates for combined layouts.
+_PREFIX_SQL = f"substr(pipeline_id,1,{len(namespace('', ''))})"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS suite_experiments (
@@ -125,6 +131,17 @@ def _install_outcomes(store: SqliteStore) -> None:
     for operation in ("INSERT", "UPDATE"):
         conn.execute(f"""CREATE TRIGGER IF NOT EXISTS suite_task_{operation.lower()} AFTER {operation} ON tasks BEGIN
             INSERT OR REPLACE INTO suite_task_runs ({names}) VALUES ({values}); END""")
+    # Suite recent-history views sort by event time, not insertion order. Keep
+    # these indexes Suite-only so ordinary stores do not pay their write cost.
+    for table, key in (("events", "event_id"), ("handoffs", "handoff_id")):
+        for suffix, columns in (
+            ("time", f"ts,{key}"),
+            ("run_time", f"run_id,ts,{key}"),
+            ("member_time", f"{_PREFIX_SQL},ts,{key}"),
+            ("member_run_time", f"{_PREFIX_SQL},run_id,ts,{key}"),
+        ):
+            conn.execute(f"CREATE INDEX IF NOT EXISTS suite_{table}_{suffix} ON {table}({columns})")
+    conn.execute("CREATE INDEX IF NOT EXISTS suite_events_pipeline_time ON events(pipeline_id,ts,event_id)")
     conn.commit()
 
 
@@ -710,29 +727,33 @@ class SuiteStore:
             )
         return True
 
+    def _pipeline_query(self, inner, run_id):
+        table = "pipelines" if run_id is None else "suite_pipeline_runs"
+        if not self._has_table(inner, table):
+            return None
+        # Current checkpoints are cumulative; only historical rows filter run_id.
+        where, args = self._filters(run_id=run_id)
+        if run_id is not None:
+            where.append(
+                "EXISTS (SELECT 1 FROM suite_admissions AS a "
+                f"WHERE a.run_id=? AND a.pipeline_id={table}.pipeline_id)"
+            )
+            args.append(run_id)
+        return table, where, args
+
     def iter_pipelines(self, *, run_id: str | None = None, state: str | None = None) -> Iterator[Any]:
         for _, store in self._stores():
-            if run_id is None:
-                records = store.iter_pipelines(state=state)
-            else:
-                inner = getattr(store, "inner", store)
-                exists = inner._conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE name='suite_pipeline_runs'"
-                ).fetchone()
-                records = (
-                    (
-                        _to_pipeline(row)
-                        for row in inner._conn.execute(
-                            "SELECT * FROM suite_pipeline_runs WHERE run_id=? ORDER BY created_at,pipeline_id",
-                            (run_id,),
-                        )
-                    )
-                    if exists
-                    else iter(())
-                )
-            for row in records:
-                if (state is None or row.state == state) and self._selected_pid(row.pipeline_id, run_id):
-                    yield row
+            inner = getattr(store, "inner", store)
+            query = self._pipeline_query(inner, run_id)
+            if query is None:
+                continue
+            table, where, args = query
+            if state is not None:
+                where.append("state=?")
+                args.append(state)
+            yield from inner._iter_keyset(
+                table, where, args, columns=("created_at", "pipeline_id"), mapper=_to_pipeline
+            )
 
     def pipelines(self, *, limit: int | None = None, **kwargs: Any) -> list[Any]:
         return list(islice(self.iter_pipelines(**kwargs), limit))
@@ -750,22 +771,53 @@ class SuiteStore:
                 if self._selected_pid(row.pipeline_id):
                     yield row
 
+    def _query_stores(self, pipeline_id: str | None = None, *, include_catalog: bool = False):
+        if pipeline_id is not None:
+            self.flush()
+            yield self._child(self._eid(pipeline_id))
+        else:
+            for _, store in self._stores(include_catalog=include_catalog):
+                yield store
+
+    def _filters(self, *, pipeline_id=None, run_id=None, kind=None):
+        where, args = [], []
+        if pipeline_id is not None:
+            where.append("pipeline_id=?")
+            args.append(pipeline_id)
+        elif self.experiment is not None:
+            where.append(f"{_PREFIX_SQL}=?")
+            args.append(self._members[self.experiment]["prefix"])
+        if run_id is not None:
+            where.append("run_id=?")
+            args.append(run_id)
+        if kind is not None:
+            where.append("kind=?")
+            args.append(kind)
+        return where, args
+
+    @staticmethod
+    def _where(filters):
+        return " WHERE " + " AND ".join(filters) if filters else ""
+
     def iter_tasks(self, pipeline_id: str | None = None, *, run_id: str | None = None) -> Iterator[Any]:
-        if run_id is None:
-            yield from self._iter_facts("tasks", pipeline_id=pipeline_id)
-            return
-        stores = [(None, self._child(self._eid(pipeline_id)))] if pipeline_id else self._stores()
-        for _, store in stores:
+        table = "tasks" if run_id is None else "suite_task_runs"
+        for store in self._query_stores(pipeline_id):
             inner = getattr(store, "inner", store)
-            if not inner._conn.execute("SELECT 1 FROM sqlite_master WHERE name='suite_task_runs'").fetchone():
+            if not self._has_table(inner, table):
                 continue
-            for row in inner._conn.execute(
-                "SELECT * FROM suite_task_runs WHERE run_id=? ORDER BY pipeline_id,seq,task_run_id", (run_id,)
-            ):
-                if (pipeline_id is None or row["pipeline_id"] == pipeline_id) and self._selected_pid(
-                    row["pipeline_id"]
-                ):
-                    yield _to_task(row)
+            where, args = self._filters(pipeline_id=pipeline_id, run_id=run_id)
+            yield from inner._iter_keyset(
+                table, where, args, columns=("pipeline_id", "seq", "task_run_id"), mapper=_to_task
+            )
+
+    @staticmethod
+    def _has_table(inner, table):
+        return (
+            inner._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            is not None
+        )
 
     def iter_run_artifacts(self, *, pipeline_id: str, run_id: str) -> Iterator[Artifact]:
         # Payloads are checkpoints, not versioned history. Never label a later
@@ -780,41 +832,100 @@ class SuiteStore:
     def iter_events(self, **kwargs: Any) -> Iterator[Any]:
         return self._iter_facts("events", **kwargs)
 
-    def tasks(self, pipeline_id: str | None = None, **kwargs: Any) -> list[Any]:
-        return list(self.iter_tasks(pipeline_id, **kwargs))
+    def tasks(
+        self, pipeline_id: str | None = None, *, run_id: str | None = None, limit: int | None = None
+    ) -> list[Any]:
+        _validate_limit(limit)
+        if limit == 0:
+            return []
+        table = "tasks" if run_id is None else "suite_task_runs"
+        rows = self._query_rows(
+            table,
+            "pipeline_id,seq,visit,task_run_id",
+            pipeline_id=pipeline_id,
+            run_id=run_id,
+            limit=limit,
+        )
+        key = itemgetter("pipeline_id", "seq", "visit", "task_run_id")
+        selected = sorted(rows, key=key) if limit is None else heapq.nsmallest(limit, rows, key=key)
+        return [_to_task(row) for row in selected]
 
     def attempts(self, *, limit: int | None = None, **kwargs: Any) -> list[Any]:
         return list(islice(self.iter_attempts(**kwargs), limit))
 
-    def events(self, *, limit: int = 200, **kwargs: Any) -> list[Any]:
-        import heapq
+    def _query_rows(self, table, order, *, pipeline_id=None, run_id=None, kind=None, limit=None):
+        # Consume each connection before opening the next: the bounded cache may
+        # evict it. Only N candidates per database cross into Python when limited.
+        for store in self._query_stores(pipeline_id, include_catalog=table == "events"):
+            inner = getattr(store, "inner", store)
+            if not self._has_table(inner, table):
+                continue
+            where, args = self._filters(pipeline_id=pipeline_id, run_id=run_id, kind=kind)
+            sql = f"SELECT * FROM {table}{self._where(where)} ORDER BY {order}"
+            if limit is not None:
+                sql += " LIMIT ?"
+                args.append(limit)
+            yield from inner._conn.execute(sql, args)
 
-        # IDs are local to each database. Timestamp plus pipeline/id gives a stable
-        # recent-events view without materializing the full multi-store log.
-        return sorted(
-            heapq.nlargest(limit, self.iter_events(**kwargs), key=lambda e: (e.ts, e.event_id or 0)),
-            key=lambda e: (e.ts, e.event_id or 0),
+    def events(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        run_id: str | None = None,
+        kind: str | None = None,
+        limit: int | None = 200,
+    ) -> list[Any]:
+        _validate_limit(limit)
+        if limit == 0:
+            return []
+        rows = self._query_rows(
+            "events",
+            "ts DESC,event_id DESC",
+            pipeline_id=pipeline_id,
+            run_id=run_id,
+            kind=kind,
+            limit=limit,
         )
+        # IDs are local to each database. Ties keep database traversal order,
+        # matching the previous stable nlargest selection.
+        key = itemgetter("ts", "event_id")
+        selected = sorted(rows, key=key) if limit is None else heapq.nlargest(limit, rows, key=key)
+        return [_to_event(row) for row in sorted(selected, key=key)]
 
-    def count_events(self, **kwargs: Any) -> int:
-        return sum(1 for _ in self.iter_events(**kwargs))
+    def _count(self, table, *, pipeline_id=None, run_id=None, kind=None):
+        total = 0
+        for store in self._query_stores(pipeline_id, include_catalog=table == "events"):
+            inner = getattr(store, "inner", store)
+            if self._has_table(inner, table):
+                where, args = self._filters(pipeline_id=pipeline_id, run_id=run_id, kind=kind)
+                total += inner._conn.execute(
+                    f"SELECT COUNT(*) FROM {table}{self._where(where)}", args
+                ).fetchone()[0]
+        return total
+
+    def count_events(self, *, pipeline_id=None, run_id=None, kind=None) -> int:
+        return self._count("events", pipeline_id=pipeline_id, run_id=run_id, kind=kind)
 
     def handoffs(
         self, *, pipeline_id: str | None = None, run_id: str | None = None, limit: int | None = None
     ) -> list[Any]:
-        if pipeline_id:
+        _validate_limit(limit)
+        if limit == 0:
+            return []
+        if pipeline_id is not None:
+            # Recovery asks for the latest committed transition by ID, not wall
+            # time. Preserve that point-query contract when clocks move backwards.
             return self._child(self._eid(pipeline_id)).handoffs(
                 pipeline_id=pipeline_id, run_id=run_id, limit=limit
             )
-        rows = []
-        for _, store in self._stores():
-            rows.extend(
-                row
-                for row in store.handoffs(run_id=run_id, limit=limit)
-                if self._selected_pid(row.pipeline_id)
-            )
-        rows.sort(key=lambda row: (row.ts, row.handoff_id or 0))
-        return rows[-limit:] if limit is not None else rows
+        rows = self._query_rows("handoffs", "ts DESC,handoff_id DESC", run_id=run_id, limit=limit)
+        key = itemgetter("ts", "handoff_id")
+        if limit is None:
+            return [_to_handoff(row) for row in sorted(rows, key=key)]
+        # The previous sorted(...)[-N:] chose the later database on exact ties.
+        selected = heapq.nlargest(limit, enumerate(rows), key=lambda pair: (*key(pair[1]), pair[0]))
+        selected.sort(key=lambda pair: (*key(pair[1]), pair[0]))
+        return [_to_handoff(row) for _, row in selected]
 
     def export_rows(self, *, run_id: str | None = None) -> Iterator[dict[str, Any]]:
         for _, store in self._stores():
@@ -856,13 +967,42 @@ class SuiteStore:
         )
         return [dataclasses.asdict(row) for row in records]
 
+    def _pipeline_aggregates(self, run_id, *, with_durations=False):
+        counts: dict[str, Counter] = {}
+        attempts_total = 0
+        durations = []
+        for _, store in self._stores():
+            inner = getattr(store, "inner", store)
+            query = self._pipeline_query(inner, run_id)
+            if query is None:
+                continue
+            table, where, args = query
+            clause = self._where(where)
+            for row in inner._conn.execute(
+                f"SELECT experiment_id,state,COUNT(*) AS n,SUM(attempts_total) AS attempts "
+                f"FROM {table}{clause} GROUP BY experiment_id,state",
+                args,
+            ):
+                counts.setdefault(row["experiment_id"], Counter())[row["state"]] += row["n"]
+                attempts_total += row["attempts"] or 0
+            if with_durations:
+                time_where = [*where, "finished_at IS NOT NULL", "started_at IS NOT NULL"]
+                durations.extend(
+                    row[0] * 1000
+                    for row in inner._conn.execute(
+                        f"SELECT finished_at-started_at FROM {table}{self._where(time_where)}", args
+                    )
+                )
+        return counts, attempts_total, durations
+
     def experiments(self, run_id: str | None = None) -> list[dict[str, Any]]:
+        counts, _, _ = self._pipeline_aggregates(run_id)
+        return self._experiments(run_id, counts)
+
+    def _experiments(self, run_id, counts):
         table = "suite_experiments" if run_id is None else "suite_experiment_runs"
         where, args = (" WHERE run_id=?", [run_id]) if run_id else ("", [])
         rows = [dict(row) for row in self.catalog._conn.execute(f"SELECT * FROM {table}{where}", args)]
-        counts: dict[str, Counter] = {}
-        for pipe in self.iter_pipelines(run_id=run_id):
-            counts.setdefault(pipe.experiment_id, Counter())[pipe.state] += 1
         for row in rows:
             eid = row["experiment_id"]
             by_state = dict(counts.get(eid, {}))
@@ -894,14 +1034,10 @@ class SuiteStore:
         return [row for row in rows if self.experiment is None or row["experiment_id"] == self.experiment]
 
     def stats(self, run_id: str | None = None) -> dict[str, Any]:
+        counts, invocation_attempts, durations = self._pipeline_aggregates(run_id, with_durations=True)
         states: Counter = Counter()
-        durations = []
-        invocation_attempts = 0
-        for row in self.iter_pipelines(run_id=run_id):
-            states[row.state] += 1
-            invocation_attempts += row.attempts_total
-            if row.finished_at is not None and row.started_at is not None:
-                durations.append((row.finished_at - row.started_at) * 1000)
+        for by_state in counts.values():
+            states.update(by_state)
         durations.sort()
 
         def pct(p: float) -> float | None:
@@ -909,19 +1045,45 @@ class SuiteStore:
 
         tasks: Counter = Counter()
         attempts: Counter = Counter()
-        if run_id is None:
-            for row in self.iter_tasks():
-                tasks[row.name] += 1
-                attempts[row.name] += row.attempts_used
-        else:
-            seen = set()
-            for row in self.iter_attempts(run_id=run_id):
-                attempts[row.task_name] += 1
-                key = (row.pipeline_id, row.task_run_id)
-                if key not in seen:
-                    tasks[row.task_name] += 1
-                    seen.add(key)
-        experiments = self.experiments(run_id)
+        totals = Counter()
+        for eid, store in self._stores(include_catalog=True):
+            inner = getattr(store, "inner", store)
+            where, args = self._filters(run_id=run_id)
+            clause = self._where(where)
+            tables = (
+                ("events",)
+                if self.layout == "by_experiment" and eid is None
+                else ("events", "attempts", "handoffs")
+            )
+            for table in tables:
+                if self._has_table(inner, table):
+                    totals[table] += inner._conn.execute(
+                        f"SELECT COUNT(*) FROM {table}{clause}", args
+                    ).fetchone()[0]
+            if tables == ("events",):
+                continue
+            if run_id is None:
+                for row in inner._conn.execute(
+                    f"SELECT name,COUNT(*) AS n,SUM(attempts_used) AS attempts FROM tasks{clause} GROUP BY name",
+                    args,
+                ):
+                    tasks[row["name"]] += row["n"]
+                    attempts[row["name"]] += row["attempts"] or 0
+            else:
+                for row in inner._conn.execute(
+                    f"SELECT task_name,COUNT(*) AS n FROM attempts{clause} GROUP BY task_name", args
+                ):
+                    attempts[row["task_name"]] += row["n"]
+                # Match the old first-attempt-per-slot counting, including its name.
+                for row in inner._conn.execute(
+                    "SELECT first.task_name,COUNT(*) AS n FROM attempts AS first JOIN "
+                    f"(SELECT MIN(attempt_id) AS first_id FROM attempts{clause} "
+                    "GROUP BY pipeline_id,task_run_id) AS slots ON first.attempt_id=slots.first_id "
+                    "GROUP BY first.task_name",
+                    args,
+                ):
+                    tasks[row["task_name"]] += row["n"]
+        experiments = self._experiments(run_id, counts)
         return {
             "suite_id": self.suite_id,
             "scope": "run" if run_id else "suite",
@@ -932,11 +1094,9 @@ class SuiteStore:
                 "duration_ms": {"p50": pct(0.5), "p95": pct(0.95), "max": pct(1)},
             },
             "tasks": {"by_name": dict(tasks), "attempts_by_name": dict(attempts)},
-            "attempts_total": invocation_attempts
-            if run_id is not None
-            else sum(1 for _ in self.iter_attempts()),
-            "events_total": self.count_events(run_id=run_id),
-            "handoffs_total": len(self.handoffs(run_id=run_id)),
+            "attempts_total": invocation_attempts if run_id is not None else totals["attempts"],
+            "events_total": totals["events"],
+            "handoffs_total": totals["handoffs"],
             "source_errors": sum(bool(row["source_error"]) for row in experiments),
         }
 
