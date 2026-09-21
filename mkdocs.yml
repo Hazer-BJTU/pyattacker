@@ -1,0 +1,97 @@
+site_name: pyattacker
+site_description: Resumable Python pipelines, shared resource pools, and experiment suites.
+site_url: https://hazer-bjtu.github.io/pyattacker/
+repo_url: https://github.com/Hazer-BJTU/pyattacker
+repo_name: Hazer-BJTU/pyattacker
+edit_uri: edit/main/docs/
+strict: true
+
+theme:
+  name: material
+  custom_dir: docs/overrides
+  language: en
+  font: false
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+
+hooks:
+  - docs/hooks.py
+
+plugins:
+  - search:
+      lang: [en, zh]
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+
+exclude_docs: |
+  /overrides/
+  /hooks.py
+
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+    absolute_links: warn
+  links:
+    not_found: warn
+    anchors: warn
+    unrecognized_links: warn
+
+nav:
+  - English:
+      - Overview: index.md
+      - Learn:
+          - Tutorial: tutorial.md
+          - Experiment suites: suites.md
+      - Reference:
+          - Python API: reference.md
+          - CLI and configuration: cli.md
+      - Understand:
+          - Architecture and guarantees: design.md
+          - Benchmarking: benchmark.md
+      - Contribute:
+          - Documentation: documentation.md
+          - Releasing: releasing.md
+  - 简体中文:
+      - 概览: zh-CN/index.md
+      - 学习:
+          - 教程: zh-CN/tutorial.md
+          - 实验套件: zh-CN/suites.md
+      - 参考:
+          - Python API: zh-CN/reference.md
+          - CLI 与配置: zh-CN/cli.md
+      - 深入理解:
+          - 架构与保证: zh-CN/design.md
+          - 基准测试: zh-CN/benchmark.md
+      - 参与贡献:
+          - 文档维护: zh-CN/documentation.md
+          - 发布: zh-CN/releasing.md

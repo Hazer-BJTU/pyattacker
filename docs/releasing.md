@@ -3,7 +3,7 @@
 **English** | [简体中文](zh-CN/releasing.md)
 
 Written for maintainers with push access. Publishing is automated: you push a tag, and
-[`.github/workflows/release.yml`](../.github/workflows/release.yml) does the rest.
+[`.github/workflows/release.yml`](https://github.com/Hazer-BJTU/pyattacker/blob/main/.github/workflows/release.yml) does the rest.
 
 ## One-time setup: trusted publishing
 

@@ -19,7 +19,7 @@ shaped this way.
 * **Defaults matter here.** Two in particular surprise people: `Retrying(max_attempts=1)` means *no retries*
   unless you ask, and `Runner(store=":memory:")` means nothing is persisted unless you give it a path.
 * **Some examples are complete programs.** A block whose first line is `# reference/<name>.py` is written out
-  and executed by [`tests/test_docs_examples.py`](../tests/test_docs_examples.py) on every test run — the
+  and executed by [`tests/test_docs_examples.py`](https://github.com/Hazer-BJTU/pyattacker/blob/main/tests/test_docs_examples.py) on every test run — the
   README and the CLI document share that contract. Blocks without a marker are fragments on purpose.
 
 ## Contents
@@ -2083,7 +2083,7 @@ print(PLUGINS.errors())        # {name: reason} for everything that failed to lo
 Built-ins resolve first, and a plugin that raises on import is recorded rather than propagated — so a broken
 plugin cannot take a run down, and it cannot fail silently either. `pyattacker plugins` prints the same
 information. `PluginRegistry` is the type; `PLUGINS` is the process-wide instance. A complete worked package
-is in [`examples/plugin_package/`](../examples/plugin_package/README.md).
+is in [`examples/plugin_package/`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/plugin_package/README.md).
 
 ---
 
@@ -2230,7 +2230,7 @@ runner.run(template.map(jsonl_source("dataset.jsonl", limit=500)))
 
 An application can publish its latest experiment values while a run is active. Pyattacker stores
 and displays the values; the application computes them. For a runnable accuracy example, see
-[`examples/live_metrics.py`](../examples/live_metrics.py).
+[`examples/live_metrics.py`](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/live_metrics.py).
 
 ```python
 runner.report_metric("evaluated", completed, label="Evaluated")
@@ -2326,7 +2326,7 @@ command line.
 | [`docs/tutorial.md`](tutorial.md) | the guided path: seventeen runnable steps |
 | [`docs/cli.md`](cli.md) | commands, flags, exit codes, config file format |
 | [`docs/design.md`](design.md) | the model, the invariants, and the tradeoffs behind these APIs |
-| [`examples/`](../examples) | complete programs, including a measured comparison of pipeline shapes |
+| [`examples/`](https://github.com/Hazer-BJTU/pyattacker/tree/main/examples) | complete programs, including a measured comparison of pipeline shapes |
 
 ## Suite API
 

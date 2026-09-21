@@ -29,7 +29,7 @@ Homepage = "https://github.com/Hazer-BJTU/pyattacker"
 Repository = "https://github.com/Hazer-BJTU/pyattacker"
 Issues = "https://github.com/Hazer-BJTU/pyattacker/issues"
 Changelog = "https://github.com/Hazer-BJTU/pyattacker/blob/main/CHANGELOG.md"
-Documentation = "https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/tutorial.md"
+Documentation = "https://hazer-bjtu.github.io/pyattacker/"
 Design = "https://github.com/Hazer-BJTU/pyattacker/blob/main/docs/design.md"
 
 [project.scripts]
@@ -43,6 +43,10 @@ dev = [
     # as well. The CI job that installs the base package only deselects the tests marked
     # `requires_yaml` (below) instead of relying on them to skip.
     "pyyaml>=6.0",
+]
+docs = [
+    "mkdocs>=1.6,<2",
+    "mkdocs-material>=9.6,<10",
 ]
 
 [tool.ruff]
@@ -93,6 +97,7 @@ include = [
     "LICENSE",
     "pyproject.toml",
     "uv.lock",
+    "mkdocs.yml",
     ".github/workflows",
 ]
 
@@ -107,3 +112,9 @@ addopts = "-q --strict-markers"
 markers = [
     "requires_yaml: drives the declarative layer through a .yaml file, so it needs the optional `yaml` extra (pyyaml)",
 ]
+
+# Keep lockfile download URLs portable across local machines and GitHub runners.
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true

@@ -292,7 +292,7 @@ pipeline:
 * [`docs/tutorial.md`](tutorial.md) —— 引导式教程，带可运行程序
 * [`docs/reference.md`](reference.md) —— SDK 暴露的每个类和函数
 * [`docs/design.md`](design.md) —— 为什么 CLI 是这些命令、没有别的
-* [`README.md`](../../README.zh-CN.md) —— 简明导览
+* [`README.md`](https://github.com/Hazer-BJTU/pyattacker/blob/main/README.zh-CN.md) —— 简明导览
 
 ## Suite 命令
 

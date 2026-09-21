@@ -15,3 +15,5 @@ runs/
 .pyattacker/
 
 .scratch/
+
+site/

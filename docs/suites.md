@@ -23,8 +23,8 @@ uv run pyattacker export runs/suite-demo runs/all.jsonl --rows results
 uv run pyattacker export runs/suite-demo runs/exported --rows results --by-experiment
 ```
 
-The complete configuration is [examples/suites/suite.json](../examples/suites/suite.json).
-The member is [experiment.json](../examples/suites/experiment.json), which still works with
+The complete configuration is [examples/suites/suite.json](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/suites/suite.json).
+The member is [experiment.json](https://github.com/Hazer-BJTU/pyattacker/blob/main/examples/suites/experiment.json), which still works with
 ordinary `run -c`. JSON and TOML need no extra dependency; YAML requires the `yaml` extra.
 
 ```json

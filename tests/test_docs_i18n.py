@@ -31,6 +31,8 @@ ROOT = Path(__file__).resolve().parents[1]
 # English document -> Chinese counterpart. The Chinese documents live in docs/zh-CN/ so that a
 # reader who lands on the English tree never has to guess which files are translations.
 PAIRS: dict[str, str] = {
+    "docs/index.md": "docs/zh-CN/index.md",
+    "docs/documentation.md": "docs/zh-CN/documentation.md",
     "README.md": "README.zh-CN.md",
     "docs/suites.md": "docs/zh-CN/suites.md",
     "docs/tutorial.md": "docs/zh-CN/tutorial.md",
