@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import ClassVar
 
 import pytest
+from helpers import open_local_url
 
 from pyattacker import SqliteStore
 from pyattacker.cli import main
@@ -372,9 +373,8 @@ def test_serve_binds_the_requested_port_and_stops_cleanly(tmp_path, capsys):
     server = StatsServer(str(db), host="127.0.0.1", port=0).start()
     try:
         assert server.port > 0
-        import urllib.request
 
-        with urllib.request.urlopen(f"{server.url}/healthz", timeout=5.0) as response:
+        with open_local_url(f"{server.url}/healthz", timeout=5.0) as response:
             assert response.status == 200
     finally:
         server.stop()

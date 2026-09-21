@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import urllib.request
 from collections.abc import Coroutine
 from typing import Any
 
@@ -48,3 +49,11 @@ def make_pool(
 def run(coro: Coroutine[Any, Any, Any]) -> Any:
     """Tests all use asyncio.run uniformly, to avoid pulling in pytest-asyncio."""
     return asyncio.run(coro)
+
+
+def open_local_url(url: str, *, timeout: float = 5.0) -> Any:
+    """Open a test server directly, independently of environment/system proxies.
+
+    Keep the opener local so tests do not change urllib's global networking behavior.
+    """
+    return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(url, timeout=timeout)
