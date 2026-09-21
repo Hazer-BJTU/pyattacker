@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import urllib.request
 
 import pytest
+from helpers import open_local_url
 
 from pyattacker import Handoff, MemoryStore, Runner, SqliteStore, pipeline, task
 from pyattacker.errors import ConfigError, StoreFeatureUnsupported
@@ -43,7 +43,7 @@ def test_live_accuracy_is_application_owned_and_visible_through_read_only_server
         assert {row["name"]: row["value"] for row in body["rows"]} == {
             "accuracy": 0.5, "evaluated": 2,
         }
-        with urllib.request.urlopen(f"{server.url}/metrics?run_id={run_id}") as response:
+        with open_local_url(f"{server.url}/metrics?run_id={run_id}") as response:
             assert json.load(response)["rows"][0]["name"] == "accuracy"
         assert runner.stats()["reported_metrics"]
         pipeline_id = next(pid for pid, correct in scores.items() if correct)

@@ -19,10 +19,10 @@ from __future__ import annotations
 import json
 import threading
 import urllib.error
-import urllib.request
 from typing import Any
 
 import pytest
+from helpers import open_local_url
 
 from pyattacker import MemoryStore, Runner, SqliteStore, boom, echo, pipeline
 from pyattacker.server import StatsServer
@@ -48,7 +48,7 @@ def _seed_store(db: str) -> tuple[str, str]:
 
 
 def _fetch(server: StatsServer, path: str, *, timeout: float = 5.0) -> tuple[int, str, bytes]:
-    with urllib.request.urlopen(f"{server.url}{path}", timeout=timeout) as response:
+    with open_local_url(f"{server.url}{path}", timeout=timeout) as response:
         return response.status, response.headers.get("Content-Type", ""), response.read()
 
 
@@ -453,3 +453,13 @@ def test_wait_returns_once_the_server_is_stopped(tmp_path):
         assert _fetch_json(rebound, "/healthz") == (200, {"ok": True})
     finally:
         rebound.stop()
+
+
+def test_local_requests_ignore_environment_proxies(seeded, monkeypatch):
+    db, _, _ = seeded
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:1")
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    with StatsServer(db, port=0) as server:
+        assert _fetch_json(server, "/healthz") == (200, {"ok": True})
