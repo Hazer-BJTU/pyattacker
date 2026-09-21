@@ -554,7 +554,7 @@ pyattacker export runs/qa.shard*of4.db runs/tasks.csv --rows tasks --format csv
 
 `--shard I/N` 原样用显式给的 `--store`；没显式给时，`run.store` 加 `.shardIofN` 后缀，两个子进程绝不抢同一个文件。每个子进程的环境里带 `PYATACKER_SHARD=I/N`，任务可以记自己的来源。
 
-**行形态**（`--rows`）给消费结果的人用：`pipelines`（嵌套，默认）、`tasks`、`attempts`（带重试 `decision`）、`events`、`artifacts`。**格式**（`--format`）：`jsonl`、`json`、`csv`。CSV 表头取最前面的 `header_rows` 行，之后才出现的字段折进 `extra` 列，内存平稳，不悄丢字段。每种类型完整导出——`events` 过去在最新 10 万行处截断——读取按有界批次；见[导出参考](reference.md#导出)。
+**行形态**（`--rows`）给消费结果的人用：`pipelines`（嵌套，默认）、`tasks`、`attempts`（带重试 `decision`）、`events`、`artifacts`、`results`（每条流水线一行精简结果，包含 key、repeat、状态、最终 payload 和错误；失败或中断的记录也保留）。**格式**（`--format`）：`jsonl`、`json`、`csv`。CSV 表头取最前面的 `header_rows` 行，之后才出现的字段折进 `extra` 列，内存平稳，不悄丢字段。每种类型完整导出——`events` 过去在最新 10 万行处截断——读取按有界批次；见[导出参考](reference.md#导出)。
 
 ### 6.4 插件、后端与监控端点（M4）
 

@@ -6,7 +6,8 @@ The kernel records facts; this module decides how to lay them out for whoever co
 * ``tasks`` / ``attempts`` — one row per unit, so retries and error classes are directly
   groupable (this is what you want in pandas);
 * ``events`` — the structured log;
-* ``artifacts`` — the persisted state of each step.
+* ``artifacts`` — the persisted state of each step;
+* ``results`` — one compact pipeline result, including its key, repeat, state, final payload and error.
 
 Every kind is exported in full unless an explicit ``limit`` says otherwise, and rows stream out of
 the store in bounded batches — see :func:`iter_rows` for the order and limit rule.
