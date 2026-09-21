@@ -6,6 +6,45 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-09-21
+
+### Fixed
+
+* **Dashboard HTML injection** (#78): render event and card values as text rather than
+  interpolating untrusted values into HTML.
+* **Atomic write-behind batches** (#79): SQLite commits attempts and events in one transaction
+  and assigns IDs only after commit. Failed batches remain recoverable; legacy stores stop
+  accepting fact writes after an uncertain failure. Suite eviction and shutdown preserve
+  failure boundaries and close remaining resources.
+* **Suite query correctness and cost** (#80): apply experiment/run filters before handoff
+  limits, support task limits consistently across built-in stores, and select recent events
+  using timestamp indexes. Counts and grouped statistics avoid decoding full history while
+  preserving historical run outcomes. Read-only older databases remain supported.
+* Loopback HTTP tests bypass environment proxies (#76).
+
+### Added
+
+* **Bounded pipeline admission** (#81): `max_admitted` limits queued, executing and delayed
+  pipelines together, while due retries retain their admission. Configure it through Runner,
+  the run configuration or `--max-admitted`; Suite members share one Runner budget. Live
+  statistics and persisted run configuration expose the effective limit.
+* **Bilingual documentation website** (#82): tutorials, Python API and CLI references at
+  <https://hazer-bjtu.github.io/pyattacker/>, with search, strict link checks and automated
+  GitHub Pages publishing. The site tracks main and identifies itself as development documentation.
+
+### Changed
+
+* Admission is bounded by default to `4 * concurrency`; a positive `max_admitted` overrides
+  this. Long retry backoffs can now pause input consumption. This bounds scheduler state
+  counts, not payload bytes or total memory; MemoryStore still retains accumulated data.
+* `tasks(limit=0)` returns an empty list; negative and non-integer task limits are rejected.
+  Suite timestamp indexes add disk/write and first-writer migration cost. Exact duration
+  percentiles still read and sort matching pipeline durations.
+* English and Chinese export documentation now covers the `results` row type (#77), and
+  streaming-memory claims describe admission and store retention separately (#81).
+* Development and documentation lockfile downloads use official PyPI URLs for portable CI
+  installation, without changing artifact hashes or adding library runtime dependencies (#82).
+
 ## [0.3.2] — 2026-09-21
 
 ### Changed
@@ -613,6 +652,7 @@ hard limit; asyncio tasks only (wrap blocking code with `asyncio.to_thread`); on
 balance is statistical; a merged report is a union, not a sum; a pipeline is a linear chain; the HTTP endpoint
 is unauthenticated.
 
+[0.3.3]: https://github.com/Hazer-BJTU/pyattacker/releases/tag/v0.3.3
 [0.3.0]: https://github.com/Hazer-BJTU/pyattacker/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Hazer-BJTU/pyattacker/releases/tag/v0.2.0
 [0.1.1]: https://github.com/Hazer-BJTU/pyattacker/releases/tag/v0.1.1
